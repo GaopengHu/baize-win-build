@@ -113,7 +113,7 @@
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "^6.0.3",
     "@vitest/coverage-v8": "4.1.5",
     "app-builder-bin": "4.2.0",
     "autoprefixer": "^10.5.0",
