@@ -31,6 +31,9 @@ jobs:
       - name: Build native modules for tests
         run: npm rebuild better-sqlite3
 
+      - name: Install Electron for tests
+        run: node node_modules/electron/install.js
+
       - name: Lint
         run: npm run lint
 
