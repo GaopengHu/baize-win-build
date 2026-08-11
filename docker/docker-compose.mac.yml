@@ -1,0 +1,64 @@
+# 今点通 macOS (.dmg) 一键构建
+#
+# 基于 Dockerfile.mac (Ubuntu 22.04)，在 Linux 上交叉编译 macOS 安装包。
+# 使用命名卷隔离 macOS .node 二进制（与 Linux .node 不兼容）。
+# 构建产物直接写入宿主 release/ 目录。
+#
+# 用法:
+#   docker-compose -f docker/docker-compose.mac.yml build
+#   docker-compose -f docker/docker-compose.mac.yml run --rm build
+#
+
+services:
+  build:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mac
+    image: zhinengti-mac-builder:latest
+    container_name: zhinengti-mac-build
+    working_dir: /app
+    user: 1000:1000
+    volumes:
+      # 项目源码 (挂载宿主目录, 构建产物写入宿主 release/)
+      - ..:/app
+      # node_modules: 使用宿主目录（macOS .node 二进制由 download-mac-better-sqlite3 脚本下载覆盖）
+      # npm 缓存 (加速重复构建)
+      - zhinengti-npm-cache:/home/builder/.npm
+      # npm prebuilds (better-sqlite3 等平台二进制)
+      - zhinengti-npm-prebuilds:/home/builder/.npm/_prebuilds
+      # Electron 缓存
+      - zhinengti-electron-cache:/home/builder/.cache/electron
+      # electron-builder 缓存
+      - zhinengti-builder-cache:/home/builder/.cache/electron-builder
+      # 宿主 /tmp 中的预下载 better-sqlite3 二进制 (只读)
+      - /tmp:/host-tmp:ro
+    network_mode: host
+    environment:
+      - INSIDE_DOCKER=true
+      - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+      - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+      # 使用宿主提供的 dmgbuild 包装脚本（基于 genisoimage 的 DMG 创建，支持 Linux 交叉编译）
+      - CUSTOM_DMGBUILD_PATH=/host-tmp/dmgbuild
+    command: >
+      sh -c "
+        echo '=== 今点通 macOS Build Container ===' &&
+        echo 'Step 1: npm install (skip postinstall — rebuild is for Linux, not needed for macOS cross-compile)' &&
+        npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
+        echo 'Step 2: Apply patches' &&
+        npx patch-package &&
+        echo 'Step 3: Download Node.js binaries' &&
+        node scripts/download-node.js &&
+        echo 'Step 4: Download macOS better-sqlite3 binaries' &&
+        node scripts/download-mac-better-sqlite3.mjs &&
+        echo 'Step 5: Create dmg-license stub (native macOS module, cannot compile on Linux)' &&
+        mkdir -p /app/node_modules/dmg-license && echo '{\"main\":\"index.js\"}' > /app/node_modules/dmg-license/package.json && echo 'exports.dmgLicenseFromJSON = async () => {};' > /app/node_modules/dmg-license/index.js &&
+        echo 'Step 6: Build .dmg package' &&
+        node scripts/build-macos.mjs &&
+        echo 'Done! Package at release/今点通-*-mac-*.dmg'
+      "
+
+volumes:
+  zhinengti-npm-cache:
+  zhinengti-npm-prebuilds:
+  zhinengti-electron-cache:
+  zhinengti-builder-cache:

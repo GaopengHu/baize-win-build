@@ -1,0 +1,55 @@
+# 今点通 Windows 7/8 构建环境
+#
+# 用法:
+#   docker compose -f docker/docker-compose.yml build
+#   docker compose -f docker/docker-compose.yml run --rm build
+#
+
+services:
+  build:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zhinengti-winbuilder:latest
+    container_name: zhinengti-build
+    working_dir: /app
+    # Windows 构建因 NSIS 跨编译需要 root 权限（electron-builder 限制）
+    user: 0:0
+    volumes:
+      # 项目源码 (挂载宿主目录)
+      - ..:/app
+      # node_modules: 使用宿主目录（Windows .node 二进制由 prebuild:win 脚本下载覆盖）
+      # npm 缓存 (加速重复构建)
+      - baize-npm-cache:/home/builder/.npm
+      # npm prebuilds (better-sqlite3等平台二进制)
+      - baize-npm-prebuilds:/home/builder/.npm/_prebuilds
+      # Electron 缓存
+      - baize-electron-cache:/home/builder/.cache/electron
+      # electron-builder 缓存
+      - baize-builder-cache:/home/builder/.cache/electron-builder
+    environment:
+      - INSIDE_DOCKER=true
+      - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+      - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+      - WINEDEBUG=-all
+    command: >
+      sh -c "
+        echo '--- 今点通 Win7 Build Container ---' &&
+        echo 'Step 1: npm install (skip postinstall)' &&
+        npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
+        echo 'Step 2: Apply patches' &&
+        npx patch-package &&
+        echo 'Step 3: Download Node.js binaries' &&
+        node scripts/download-node.js &&
+        echo 'Step 4: Download Windows better-sqlite3' &&
+        npm run prebuild:win &&
+        echo 'Step 5: Build installer' &&
+        npm run build:win7 &&
+        echo 'Done! Installer at release/今点通-*-win-x64.exe'
+      "
+
+volumes:
+  baize-npm-cache:
+  baize-npm-prebuilds:
+  baize-electron-cache:
+  baize-builder-cache:

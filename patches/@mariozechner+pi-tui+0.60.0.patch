@@ -1,0 +1,27 @@
+diff --git a/node_modules/@mariozechner/pi-tui/dist/utils.js b/node_modules/@mariozechner/pi-tui/dist/utils.js
+index 7e675fe..7e795e1 100644
+--- a/node_modules/@mariozechner/pi-tui/dist/utils.js
++++ b/node_modules/@mariozechner/pi-tui/dist/utils.js
+@@ -24,9 +24,8 @@ function couldBeEmoji(segment) {
+     );
+ }
+ // Regexes for character classification (same as string-width library)
+-const zeroWidthRegex = /^(?:\p{Default_Ignorable_Code_Point}|\p{Control}|\p{Mark}|\p{Surrogate})+$/v;
+-const leadingNonPrintingRegex = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Mark}\p{Surrogate}]+/v;
+-const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
++const zeroWidthRegex = /^(?:\p{Default_Ignorable_Code_Point}|\p{Control}|\p{Mark}|\p{Surrogate})+$/u;
++const leadingNonPrintingRegex = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Mark}\p{Surrogate}]+/u;
+ // Cache for non-ASCII strings
+ const WIDTH_CACHE_SIZE = 512;
+ const widthCache = new Map();
+@@ -40,8 +39,8 @@ function graphemeWidth(segment) {
+     if (zeroWidthRegex.test(segment)) {
+         return 0;
+     }
+-    // Emoji check with pre-filter
+-    if (couldBeEmoji(segment) && rgiEmojiRegex.test(segment)) {
++    // Emoji check with pre-filter (rgiEmojiRegex omitted: \p{RGI_Emoji}/v unsupported in Node 16)
++    if (couldBeEmoji(segment)) {
+         return 2;
+     }
+     // Get base visible codepoint

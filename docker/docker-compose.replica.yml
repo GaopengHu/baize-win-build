@@ -1,0 +1,41 @@
+# 今点通 Windows 7/8 一键构建 (基于本地环境复刻)
+#
+# 用法:
+#   docker compose -f docker/docker-compose.replica.yml build
+#   docker compose -f docker/docker-compose.replica.yml run --rm build
+#
+
+services:
+  build:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.replica
+      args:
+        UID: 1000
+        GID: 1000
+    image: zhinengti-winbuilder:replica
+    container_name: zhinengti-build
+    working_dir: /app
+    user: 1000:1000
+    volumes:
+      # 项目源码 (挂载宿主目录, 构建产物直接写入宿主 release/)
+      - ..:/app
+      # npm 缓存 (共享宿主 ~/.npm, 避免重复下载)
+      - ~/.npm:/home/builder/.npm
+      # Electron 二进制缓存 (共享宿主 ~/.cache/electron)
+      - ~/.cache/electron:/home/builder/.cache/electron
+      # electron-builder 缓存 (NSIS工具链等)
+      - ~/.cache/electron-builder:/home/builder/.cache/electron-builder
+    environment:
+      - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+      - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+      - WINEDEBUG=-all
+    command: >
+      sh -c "
+        echo '=== 今点通 Win7 Build Container ===' &&
+        echo 'Step 1: npm install (applies patches)' &&
+        npm install --no-fund --no-audit --legacy-peer-deps &&
+        echo 'Step 2: Build Windows installer' &&
+        node scripts/build-win7.mjs &&
+        echo 'Done! Installer at release/今点通-*-win-x64.exe'
+      "
