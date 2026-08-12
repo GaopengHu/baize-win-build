@@ -1,0 +1,93 @@
+# 今点通 UOS/统信/Kylin/麒麟 ARM64 .deb 交叉编译环境
+#
+# 基于 Debian 10 (buster, GLIBC 2.28)，与 UOS 20 GLIBC 完全兼容。
+# 独立构建环境（与 x86_64 镜像无关），内置 ARM64 交叉编译工具链。
+# better-sqlite3 通过 node-gyp 交叉编译为 ARM64 (飞腾/鲲鹏/腾锐)。
+#
+# ARM64 交叉编译工具链 .deb 由宿主机从 UOS 官方源预下载
+# （见 docker-compose.uos-arm.yml 注释），构建时本地 dpkg 安装，
+# 不依赖容器内慢速网络。
+#
+# 镜像构建:
+#   docker-compose -f docker/docker-compose.uos-arm.yml build
+#
+# 一键构建:
+#   docker-compose -f docker/docker-compose.uos-arm.yml run --rm build
+
+FROM debian:10-slim
+
+LABEL maintainer="Baize Team <dev@baize.app>"
+LABEL description="Cross-compile environment for 今点通 UOS/Kylin ARM64 .deb packages"
+
+ARG UID=1000
+ARG GID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Debian 10 (buster) 已归档，使用 archive.debian.org
+RUN echo "deb http://archive.debian.org/debian/ buster main contrib non-free" > /etc/apt/sources.list \
+    && echo "deb http://archive.debian.org/debian-security buster/updates main contrib non-free" >> /etc/apt/sources.list \
+    && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+
+# Step 1: ca-certificates (用于后续 HTTPS 下载 Node.js)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Step 2: 系统依赖 (编译工具 + Electron 运行时库)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3 \
+    git \
+    curl \
+    xz-utils \
+    p7zip-full \
+    file \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Step 3: ARM64 交叉编译工具链 (GCC 8.3, GLIBC 2.28)
+# .deb 包由宿主机预下载 (docker/debs-arm64/ 或 .build-cache/debs-arm64/),
+# 构建时 COPY 进镜像本地安装
+COPY .build-cache/debs-arm64/ /debs-arm64/
+RUN for f in /debs-arm64/*.txt; do mv "$f" "${f%.txt}"; done; \
+    dpkg -i /debs-arm64/*.deb 2>/dev/null || true; \
+    rm -rf /debs-arm64
+
+# Step 4: Node.js 22.22.0 + npm 11.11.1 (中国镜像)
+RUN curl -fsSL https://npmmirror.com/mirrors/node/v22.22.0/node-v22.22.0-linux-x64.tar.xz \
+    | tar -xJ -C /usr/local --strip-components=1 \
+    && npm install -g npm@11.11.1 --registry=https://registry.npmmirror.com
+
+# Step 5: 非 root 构建用户 (匹配宿主 UID/GID)
+RUN groupadd -g ${GID} builder \
+    && useradd -m -u ${UID} -g ${GID} -s /bin/bash builder
+
+# Step 6: 缓存目录 (与宿主共享，避免重复下载)
+RUN mkdir -p /home/builder/.cache/electron \
+       /home/builder/.cache/electron-builder \
+       /home/builder/.npm \
+    && chown -R builder:builder /home/builder
+
+# Step 7: 中国镜像环境变量
+ENV ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+ENV ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+ENV npm_config_registry=https://registry.npmmirror.com
+ENV NODE_OPTIONS=--max-old-space-size=4096
+
+WORKDIR /app
+
+USER builder
+
+CMD ["node", "scripts/build-linux-arm64.mjs"]

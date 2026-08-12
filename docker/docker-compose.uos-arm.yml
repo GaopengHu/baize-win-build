@@ -1,0 +1,75 @@
+# 今点通 UOS/统信/Kylin/麒麟 ARM64 .deb 一键构建
+#
+# 基于 Dockerfile.uos-arm (Debian 10, GLIBC 2.28 + ARM64 交叉编译工具链)。
+# 使用命名卷隔离 ARM64 .node 二进制（与 x86_64 .node 不兼容）。
+# 构建产物直接写入宿主 release/ 目录。
+#
+# 宿主机预下载 ARM64 工具链 .deb（首次，网络较快的一次性操作）:
+#   mkdir -p .build-cache/debs-arm64 && cd .build-cache/debs-arm64
+#   apt-get download \
+#     gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+#     gcc-8-cross-base gcc-8-aarch64-linux-gnu-base cpp-8-aarch64-linux-gnu \
+#     cpp-aarch64-linux-gnu gcc-8-aarch64-linux-gnu g++-8-aarch64-linux-gnu \
+#     binutils-aarch64-linux-gnu binutils-common \
+#     libc6-arm64-cross libc6-dev-arm64-cross \
+#     libgcc1-arm64-cross libgcc-8-dev-arm64-cross \
+#     libstdc++6-arm64-cross libstdc++-8-dev-arm64-cross \
+#     libgomp1-arm64-cross libitm1-arm64-cross libatomic1-arm64-cross \
+#     libasan5-arm64-cross liblsan0-arm64-cross libtsan0-arm64-cross \
+#     libubsan1-arm64-cross linux-libc-dev-arm64-cross
+#   for f in *.deb; do mv "$f" "${f%.deb}.deb.txt"; done
+#
+# 用法:
+#   # 首次或 Docker 镜像更新后
+#   docker-compose -f docker/docker-compose.uos-arm.yml build
+#
+#   # 构建（重复构建跳过镜像层，速度更快）
+#   docker-compose -f docker/docker-compose.uos-arm.yml run --rm build
+#
+
+services:
+  build:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.uos-arm
+      args:
+        UID: 1000
+        GID: 1000
+    image: zhinengti-linux-builder:uos-arm
+    container_name: zhinengti-linux-build-arm
+    working_dir: /app
+    user: 1000:1000
+    volumes:
+      # 项目源码 (挂载宿主目录, 构建产物写入宿主 release/)
+      - ..:/app
+      # node_modules: 命名卷隔离 ARM64 .node 二进制（不污染宿主 x64 node_modules）
+      - zhinengti-uos-arm-node-modules:/app/node_modules
+      # npm 全局缓存 (共享宿主 ~/.npm)
+      - ~/.npm:/home/builder/.npm
+      # Electron 二进制缓存 (共享宿主 ~/.cache/electron)
+      - ~/.cache/electron:/home/builder/.cache/electron
+      # electron-builder 缓存 (linux 工具链)
+      - ~/.cache/electron-builder:/home/builder/.cache/electron-builder
+    # 使用宿主网络，解决容器内 DNS 解析慢的问题（同 mac 方案）
+    network_mode: host
+    environment:
+      - INSIDE_DOCKER=true
+      - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+      - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+    command: >
+      bash -c "
+        echo '=== 今点通 UOS/Kylin ARM64 .deb Build Container ===' &&
+        echo 'Step 1: npm install' &&
+        npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
+        echo 'Step 2: Apply patches' &&
+        npx patch-package &&
+        echo 'Step 3: Download Node.js binaries (incl. linux-arm64)' &&
+        OPEN_COWORK_DOWNLOAD_ALL_NODE_BINARIES=1 node scripts/download-node.js &&
+        echo 'Step 4: Cross-compile better-sqlite3 for ARM64' &&
+        node scripts/cross-compile-better-sqlite3.mjs &&
+        echo 'Step 5: Build .deb for ARM64' &&
+        node scripts/build-linux-arm64.mjs
+      "
+
+volumes:
+  zhinengti-uos-arm-node-modules:

@@ -103,6 +103,9 @@ website/.vitepress/cache/
 # Temp directories
 .tmp/
 
+# Cross-compile toolchain .deb packages (downloaded from UOS official repo)
+docker/debs-arm64/
+
 # Screenshots (debug/review)
 *.png
 !src/renderer/assets/*.png
@@ -110,3 +113,8 @@ website/.vitepress/cache/
 !website/public/*.png
 !resources/social-preview.png
 package/windows/
+
+# Installer packages (distributed separately)
+package/*.deb
+package/*.exe
+package/*.dmg

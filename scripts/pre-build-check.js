@@ -111,8 +111,8 @@ function buildCheckList(platform, arch) {
     );
   } else if (platform === 'linux') {
     checks.push({
-      label: 'Node.js directory for Linux x64',
-      relPath: 'resources/node/linux-x64',
+      label: `Node.js directory for Linux ${arch}`,
+      relPath: `resources/node/linux-${arch}`,
       type: 'dir',
       severity: 'fatal',
     });
@@ -185,7 +185,12 @@ function main() {
 
   console.log('\nRunning pre-build checks...\n');
 
-  const { passed, warnings, failed, hasFatal } = runChecks(PROJECT_ROOT, process.platform);
+  const requestedArch = process.argv[2] || undefined;
+  const { passed, warnings, failed, hasFatal } = runChecks(
+    PROJECT_ROOT,
+    process.platform,
+    requestedArch
+  );
 
   console.log(
     `\nPre-build check: ${passed} passed, ${warnings} warnings, ${failed} failed`

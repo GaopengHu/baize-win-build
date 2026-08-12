@@ -16,6 +16,7 @@ const PLATFORMS = {
   },
   linux: {
     x64: `node-${NODE_VERSION}-linux-x64`,
+    arm64: `node-${NODE_VERSION}-linux-arm64`,
   },
 };
 
@@ -49,7 +50,10 @@ function applyNpxFix(extractDir) {
   // bin/npx is typically a symlink to lib/node_modules/npm/bin/npx-cli.js.
   // We must remove the symlink first, otherwise writing to bin/npx would
   // overwrite the real npx-cli.js through the symlink.
-  const isSymlink = fs.lstatSync(npxBinPath).isSymbolicLink();
+  let isSymlink = false;
+  if (fs.existsSync(npxBinPath)) {
+    isSymlink = fs.lstatSync(npxBinPath).isSymbolicLink();
+  }
   if (isSymlink) {
     fs.unlinkSync(npxBinPath);
   }

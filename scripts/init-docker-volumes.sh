@@ -13,7 +13,10 @@ WIN_VOLUMES="baize-win-node-modules baize-npm-cache baize-npm-prebuilds baize-el
 # macOS 构建 volume
 MAC_VOLUMES="zhinengti-mac-node-modules zhinengti-npm-cache zhinengti-npm-prebuilds zhinengti-electron-cache zhinengti-builder-cache"
 
-for vol in $WIN_VOLUMES $MAC_VOLUMES; do
+# UOS/麒麟 ARM64 构建 volume
+ARM_VOLUMES="zhinengti-uos-arm-node-modules"
+
+for vol in $WIN_VOLUMES $MAC_VOLUMES $ARM_VOLUMES; do
   if docker volume inspect "$vol" >/dev/null 2>&1; then
     echo "修复: $vol"
     docker run --rm -v "$vol":/data alpine chown -R 1000:1000 /data

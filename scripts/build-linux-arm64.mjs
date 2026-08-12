@@ -21,13 +21,34 @@
  *   CROSS_COMPILE=1 node scripts/build-linux-arm64.mjs
  */
 
-import { existsSync, readFileSync, statSync } from 'fs';
+import { existsSync, readFileSync, statSync, mkdirSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
+
+// ============================================================
+// Docker-only 强制检测
+// 禁止在本地环境直接运行构建脚本，所有构建必须在 Docker 容器中进行
+// ============================================================
+function isInsideDocker() {
+  try {
+    return require('fs').existsSync('/.dockerenv');
+  } catch {
+    return false;
+  }
+}
+if (!isInsideDocker() && process.env.INSIDE_DOCKER !== 'true') {
+  console.error('\n\x1b[31m错误：禁止在本地环境直接构建安装包！\x1b[0m');
+  console.error('所有构建必须在 Docker 容器中执行。\n');
+  console.error('用法:');
+  console.error('  \x1b[36mdocker-compose -f docker/docker-compose.uos-arm.yml build\x1b[0m');
+  console.error('  \x1b[36mdocker-compose -f docker/docker-compose.uos-arm.yml run --rm build\x1b[0m\n');
+  process.exit(1);
+}
+// ============================================================
 
 function log(msg) {
   process.stdout.write(`[build:arm64] ${msg}\n`);
@@ -103,31 +124,16 @@ async function main() {
   log('=== Baize ARM64 (.deb) Build ===');
   log(`Host: ${process.platform}-${process.arch}`);
 
-  if (process.arch !== 'arm64' && !process.env.CROSS_COMPILE) {
-    log('');
-    log('WARNING: Not running on ARM64 architecture.');
-    log('Set CROSS_COMPILE=1 if using Docker/qemu for cross-compilation.');
-    log('Otherwise, build directly on an ARM64 machine (飞腾/鲲鹏).');
-    log('');
-    if (!process.env.CROSS_COMPILE) {
-      log('Aborting. Set CROSS_COMPILE=1 to force cross-compile mode.');
-      process.exit(1);
-    }
-  }
-
   // 1. Check ARM64 resources
   prepareArm64Resources();
 
   // 2. Install/check ARM64 native modules
-  if (process.arch === 'arm64') {
-    log('Native ARM64 build — checking native modules...');
-    // node_modules should already contain ARM64 binaries from npm install
-    const sqlite3 = resolve(ROOT, 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
-    if (existsSync(sqlite3)) {
-      log('better-sqlite3 native module found');
-    } else {
-      log('better-sqlite3 native module not found — will be built by electron-builder');
-    }
+  // Docker 环境已经通过 node-gyp 重建了 ARM64 二进制
+  const sqlite3 = resolve(ROOT, 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
+  if (existsSync(sqlite3)) {
+    log('better-sqlite3 native module found');
+  } else {
+    log('better-sqlite3 native module not found — will be built by electron-builder');
   }
 
   // 3. Build the application
@@ -135,22 +141,38 @@ async function main() {
   run('npx tsc', { timeout: 120000 });
   run('npx vite build', { timeout: 300000 });
 
-  // 4. Pre-build check
-  log('Running pre-build check...');
-  run('node scripts/pre-build-check.js');
+  // 3.5 Build MCP server bundles (.bundle-resources/mcp/)
+  log('Building MCP server bundles...');
+  run('node scripts/bundle-mcp.js', { timeout: 300000 });
 
-  // 5. Run electron-builder (ARM64)
+  // 4. Pre-build check (ARM64)
+  log('Running pre-build check...');
+  run('node scripts/pre-build-check.js arm64');
+
+  // 5. Write platform config for ARM64
+  const platformConfig = {
+    platform: 'linux',
+    prettyName: 'uos-arm64',
+    shell: '/bin/bash',
+  };
+  const resourcesDir = resolve(ROOT, 'resources');
+  if (!existsSync(resourcesDir)) {
+    mkdirSync(resourcesDir, { recursive: true });
+  }
+  const configPath = resolve(resourcesDir, 'platform-config.json');
+  writeFileSync(configPath, JSON.stringify(platformConfig, null, 2));
+  log(`Platform config written: ${configPath} -> ${JSON.stringify(platformConfig)}`);
+
+  // 6. Run electron-builder (ARM64)
   log('Running electron-builder (linux deb arm64)...');
   const env = {
     ...process.env,
     ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/',
     ELECTRON_BUILDER_BINARIES_MIRROR: process.env.ELECTRON_BUILDER_BINARIES_MIRROR || 'https://npmmirror.com/mirrors/electron-builder-binaries/',
   };
+  run('npx electron-builder --linux deb --arm64', { env, timeout: 1200000 });
 
-  // For ARM64, we need to pass --arm64 flag
-  run('npx electron-builder --linux deb --arm64', { env, timeout: 600000 });
-
-  // 6. Verify
+  // 7. Verify
   const productName = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8')).productName;
   const version = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8')).version;
   const debName = `${productName}-${version}-linux-arm64.deb`;

@@ -758,11 +758,13 @@ DB + `claude_session_id` 清理 + `session.update` 事件（原有逻辑不变�
 ## 2026-08-09: 权限确认优化（分类器 + 会话级 allowAll + 弹窗分级）
 
 ### 目标
+
 工作目录内普通读写/命令免确认；仅高级权限（sudo/安装/系统目录/危险命令）、
 删除、工作目录外文件需人工确认；弹窗新增「允许本会话全部操作」（不豁免高级
 权限与删除），信任仅当前会话生效。
 
 ### 方案（spec: docs/superpowers/specs/2026-08-09-permission-classifier-design.md）
+
 - 四类权限：advanced / delete / outside / normal，优先级 advanced > delete > outside > normal
 - `resolvePermissionGate(kind, ruleDecision, sessionAllowAll)`：deny 永远赢；
   advanced/delete 永远 ask；outside 受会话 flag 控制；normal 跟随规则
@@ -770,12 +772,13 @@ DB + `claude_session_id` 清理 + `session.update` 事件（原有逻辑不变�
 - 会话 flag 在会话删除/批量删除时清理
 
 ### 主要修改
+
 1. `src/main/utils/permission-classifier.ts`（新增）— 纯函数分类器：
    - 跨平台命令表 UNION（Linux/macOS/Windows 的提权/安装/危险命令/删除）
    - 平台推断：cwd 为盘符/UNC 视为 win32（测试与生产一致）
    - 系统目录写入（/etc、C:\Windows 等）→ advanced（仅 write 类工具）；
      read 按工作目录边界判定（不误报系统目录读）
-   - `rm -rf`/rm -r* 指向系统目录 → advanced；普通 rm → delete
+   - `rm -rf`/rm -r\* 指向系统目录 → advanced；普通 rm → delete
    - `isPathInside`：符号链接 realpath 兜底 + Windows 大小写/盘符/UNC 兼容
    - 控制字符路径 / 解析失败 → 保守 outside；从不抛异常
    - `classifyPermission`（cwd 推断平台）+ `classifyPermissionForPlatform`（显式）+ `resolvePermissionGate`
@@ -794,6 +797,7 @@ DB + `claude_session_id` 清理 + `session.update` 事件（原有逻辑不变�
    advanced/delete 三按钮（无 allowAll），其余四按钮；i18n zh/en
 
 ### 测试
+
 - 新增 `src/tests/permission-classifier.test.ts`：37 项（分类表/优先级/错误处理/
   resolvePermissionGate 5 项）
 - `permission-rules-store.test.ts`：bash/write 默认断言 ask → allow
@@ -804,16 +808,19 @@ DB + `claude_session_id` 清理 + `session.update` 事件（原有逻辑不变�
   agent-runner 集成（374469b）、PermissionDialog 三/四按钮（b4e18d2）
 
 ### 计划与规格
+
 - spec: `docs/superpowers/specs/2026-08-09-permission-classifier-design.md`
 - plan: `docs/superpowers/plans/2026-08-09-permission-classifier.md`
 
 ## 2026-08-09: 权限确认弹窗友好化（自然语言摘要 + 按钮统一）
 
 ### 目标
+
 非技术人员可读权限确认：一句话自然语言摘要（无命令/JSON）；「允许本会话全部操作」
 改为全宽描边按钮；「始终允许」文案友好化 + 确认框 i18n；Windows/macOS/Linux 三平台覆盖。
 
 ### 主要修改
+
 1. `src/shared/permission-patterns.ts`（新增）：三平台提权/安装/危险/删除/系统目录
    模式表与 unions，无 node 依赖，主进程分类器与渲染层摘要器共用
 2. `src/main/utils/permission-classifier.ts`：删除本地表改为 import（行为不变，
@@ -824,12 +831,139 @@ DB + `claude_session_id` 清理 + `session.update` 事件（原有逻辑不变�
 4. PermissionDialog：摘要替换技术区块；「查看详细信息」折叠展示工具名+JSON；
    「允许本会话全部操作」→ 全宽 btn-secondary；「始终允许」改「以后类似操作不再询问」，
    确认卡 i18n（zh/en）
-5. i18n：permission.summary.* / detailsExpand / detailsCollapse / alwaysAllow*
+5. i18n：permission.summary._ / detailsExpand / detailsCollapse / alwaysAllow_
 
 ### 验证
+
 - typecheck ✅；全部 tests ✅；vite build ✅
 - 提交：7f4a379 refactor: extract shared permission pattern tables
   383a363 feat: natural-language permission summary (TDD)
   1317d67 feat: i18n add permission summary/detail/always-allow copy
   c5510cc feat: permission dialog natural-language summary with collapsible details
   21c661b docs: record permission dialog friendly optimization
+
+## 2026-08-11: 对话语言修复 + 三平台构建
+
+### 问题
+
+新建对话后，AI 默认用英文回复，之前一直用中文。
+
+### 根因分析
+
+系统提示词一直是英文：`You are an 今点通 assistant. Be concise, accurate, and tool-capable.`
+
+品牌重命名过程中（白泽 → 综合办公智能体 → 金电综合办公智能体 → 今点通），只替换了品牌名称，未添加中文提示或语言匹配规则。
+
+### 修复方案
+
+1. 系统提示词改为中文：`你是今点通智能助手，请用中文回复用户。`
+2. 新增语言匹配规则（CRITICAL BEHAVIORAL RULES 第 2 条）：
+   - `LANGUAGE: Always respond in the same language as the user's input. If the user asks in Chinese, reply in Chinese. If the user asks in English, reply in English.`
+
+### 修改文件
+
+- `src/main/claude/agent-runner.ts:2118-2126` — 系统提示词 + 规则
+
+### 构建产物
+
+| 平台                | 文件                         | 大小   | 构建时间         |
+| ------------------- | ---------------------------- | ------ | ---------------- |
+| Linux               | 今点通-3.3.1-linux-amd64.deb | 183 MB | 2026-08-11 10:58 |
+| Windows             | 今点通-3.3.1-win-x64.exe     | 189 MB | 2026-08-11 11:43 |
+| macOS Intel         | 今点通-3.3.1-mac-x64.dmg     | 492 MB | 2026-08-11 12:02 |
+| macOS Apple Silicon | 今点通-3.3.1-mac-arm64.dmg   | 487 MB | 2026-08-11 12:04 |
+
+### 构建过程
+
+1. **Linux .deb**：首次构建成功（13.4 min），包含中文提示词修改
+2. **Windows .exe**：构建成功（18.2 min），NSIS 打包需要 root 权限
+3. **macOS .dmg**：
+   - 首次失败：`/tmp/dmgbuild` 包装脚本被系统清理
+   - 修复：`cp scripts/dmgbuild-wrapper.sh /tmp/dmgbuild && chmod +x /tmp/dmgbuild`
+   - 二次失败：权限问题（Windows 构建创建的 dist/ 目录）
+   - 修复：`docker run --rm -v ... alpine rm -rf dist dist-electron`
+   - 最终成功（8.8 min，同时构建 x64 + arm64）
+
+### 提交
+
+`451468f` — fix: 修改系统提示词为中文，新增语言匹配规则
+
+## 2026-08-12: UOS/统信 ARM64 .deb 交叉编译构建成功
+
+### 背景
+
+用户需要统信/UOS ARM64 系统（飞腾 FT-2000 / 鲲鹏 920 / 腾锐 S2500）的安装包。
+上次会话已创建构建环境（Dockerfile.uos-arm、docker-compose.uos-arm.yml、工具链 .deb
+预下载、交叉编译脚本），本次会话完成构建并修复途中问题。
+
+### 构建环境
+
+- `docker/Dockerfile.uos-arm`：Debian 10 (GLIBC 2.28) + aarch64-linux-gnu 交叉工具链
+  （GCC 8.3，.deb 预下载到 `.build-cache/debs-arm64/`，`*.deb.txt` 后缀防 npm 扫描）
+- `docker/docker-compose.uos-arm.yml`：命名卷 `zhinengti-uos-arm-node-modules` 隔离
+  ARM64 .node 二进制（不污染宿主 x64 node_modules），`user: 1000:1000`，host 网络
+- 构建流程：npm install → patch-package → download-node（含 linux-arm64）→
+  cross-compile better-sqlite3 → build-linux-arm64.mjs（tsc → vite → bundle-mcp →
+  pre-build-check → electron-builder --linux deb --arm64）
+
+### 本次修复的问题
+
+1. **命名卷权限 EACCES**（首次构建失败）
+   - 现象：`EACCES: permission denied, mkdir '/app/node_modules/@alloc'`
+   - 根因：首次创建的命名卷属 root，容器以 UID 1000 运行
+   - 修复：`docker run --rm -v docker_zhinengti-uos-arm-node-modules:/data alpine chown -R 1000:1000 /data`
+   - 同时把 ARM 卷加入 `scripts/init-docker-volumes.sh`（新增 ARM_VOLUMES）
+
+2. **download-node.js applyNpxFix 崩溃**（非致命，但报错）
+   - 现象：`ENOENT: lstat '/app/resources/node/darwin-x64/bin/npx'`
+   - 根因：宿主 `resources/node/darwin-x64` 缓存不完整（缺 bin/npx），
+     `lstatSync` 在文件不存在时抛错
+   - 修复：`scripts/download-node.js:53` lstatSync 前加 `existsSync` 判断
+
+3. **交叉编译验证依赖 `file` 命令**（致命，导致首次构建中止）
+   - 现象：`/bin/sh: 1: file: not found` → 无法验证产物格式
+   - 根因：镜像内无 `file`（Dockerfile 虽有安装但镜像未包含）
+   - 修复：`scripts/cross-compile-better-sqlite3.mjs` 验证逻辑改为：优先 `file` 命令，
+     失败则直接解析 ELF header（e_ident[4] class + offset 18 e_machine，0xB7=AArch64），
+     不依赖外部工具
+
+4. **pre-build-check 失败：gui-operate-server.js 缺失 + 硬编码 linux-x64**
+   - 现象：`.bundle-resources/mcp/gui-operate-server.js` 不存在（旧缓存只有
+     software-dev-server-example.js）；且 linux 分支硬编码检查 `resources/node/linux-x64`
+   - 修复：
+     - `scripts/build-linux-arm64.mjs` 在 tsc/vite 后新增 `node scripts/bundle-mcp.js`
+       （esbuild 打包 MCP server 并 stage 到 .bundle-resources/mcp/）
+     - `scripts/pre-build-check.js`：linux 分支按 `arch` 参数检查
+       `resources/node/linux-${arch}`；CLI 支持 `node scripts/pre-build-check.js arm64`
+
+### 构建产物验证
+
+| 项目                | 结果                                                              |
+| ------------------- | ----------------------------------------------------------------- |
+| 产出物              | `release/今点通-3.3.1-linux-arm64.deb`（154.7 MB，12.9 min）      |
+| .deb 格式           | Debian binary package format 2.0 ✅                               |
+| 主二进制            | ELF64 **AArch64**，GLIBC 2.17 ✅                                  |
+| better_sqlite3.node | ELF header e_machine=0xB7 (**EM_AARCH64**) ✅，GLIBC 最高 2.28 ✅ |
+| 宿主 node_modules   | 未被污染（仍为 x86-64）✅（命名卷隔离生效）                       |
+
+### 遗留事项
+
+- `resources/python/linux-arm64` 不存在（warn 级别，不阻塞；GUI 自动化 Python
+  运行时需在 ARM64 真机上运行 `node scripts/prepare-python.js` 生成）
+- 全部新文件尚未提交（docker/Dockerfile.uos-arm、docker-compose.uos-arm.yml、
+  scripts/cross-compile-better-sqlite3.mjs、scripts/download-linux-arm64-better-sqlite3.mjs、
+  build-linux-arm64.mjs、pre-build-check.js、download-node.js、init-docker-volumes.sh 变更）
+- ARM64 构建需 QEMU binfmt 时使用 `docker run --rm --privileged tonistiigi/binfmt --install all`
+
+### 构建命令
+
+```bash
+# 首次构建或工具链更新后
+docker-compose -f docker/docker-compose.uos-arm.yml build
+
+# 构建（重复构建跳过镜像层）
+docker-compose -f docker/docker-compose.uos-arm.yml run --rm build
+
+# 若命名卷权限丢失，先执行
+bash scripts/init-docker-volumes.sh
+```

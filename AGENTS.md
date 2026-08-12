@@ -12,7 +12,7 @@
 
 ## 构建命令
 
-### UOS/麒麟 .deb 构建
+### UOS/麒麟 .deb 构建（x64）
 
 ```bash
 cd /home/JDJT/hgp/code/test_0624/opencode/2024-06-30
@@ -22,6 +22,24 @@ docker-compose -f docker/docker-compose.uos.yml build
 
 # 构建（重复构建跳过镜像层，速度更快）
 docker-compose -f docker/docker-compose.uos.yml run --rm build
+```
+
+### UOS/麒麟 .deb 构建（ARM64）
+
+```bash
+cd /home/JDJT/hgp/code/test_0624/opencode/2024-06-30
+
+# 首次或 Docker 镜像更新后
+docker-compose -f docker/docker-compose.uos-arm.yml build
+
+# 构建（支持飞腾 FT-2000 / 鲲鹏 920 / 腾锐 S2500）
+docker-compose -f docker/docker-compose.uos-arm.yml run --rm build
+```
+
+**注意**：ARM64 构建需要 QEMU 模拟器支持。首次构建前，需要注册 binfmt_misc：
+
+```bash
+docker run --rm --privileged tonistiigi/binfmt --install all
 ```
 
 ### Windows 7/8 .exe 构建
@@ -46,7 +64,8 @@ docker-compose -f docker/docker-compose.mac.yml run --rm build
 
 ### 产出物
 
-- `.deb`: `release/今点通-*-linux-amd64.deb`
+- `.deb` (x64): `release/今点通-*-linux-amd64.deb`
+- `.deb` (ARM64): `release/今点通-*-linux-arm64.deb`
 - `.exe`: `release/今点通-*-win-x64.exe`
 - `.dmg`: `release/今点通-*-mac-{x64,arm64}.dmg`
 
