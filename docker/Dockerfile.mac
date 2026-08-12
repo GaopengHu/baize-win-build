@@ -1,0 +1,67 @@
+# 今点通 macOS (.dmg) 交叉构建环境
+#
+# 基于 Ubuntu 22.04，在 Linux 上交叉编译 macOS x64 + arm64 安装包。
+# 使用预编译原生模块（better-sqlite3 等），无需 macOS SDK。
+# DMG 创建依赖 dmgbuild (Python) + genisoimage。
+#
+# 镜像构建:
+#   docker-compose -f docker/docker-compose.mac.yml build
+#
+# 一键构建:
+#   docker-compose -f docker/docker-compose.mac.yml run --rm build
+
+FROM ubuntu:22.04
+
+LABEL maintainer="Baize Team <dev@zhinengti.ai>"
+LABEL description="Cross-compilation environment for 今点通 macOS .dmg packages"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG UID=1000
+ARG GID=1000
+
+# Step 1: 系统依赖（编译工具 + DMG 创建工具）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3 \
+    python3-pip \
+    git \
+    curl \
+    xz-utils \
+    genisoimage \
+    libnss3 \
+    libnspr4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Step 2: 安装 dmgbuild（electron-builder 依赖它创建 .dmg）
+RUN pip3 install dmgbuild 2>/dev/null \
+    || PIP_REQUIRE_VIRTUALENV=0 pip3 install dmgbuild
+
+# Step 3: Node.js 22.22.0 + npm 11.11.1（中国镜像）
+RUN curl -fsSL https://npmmirror.com/mirrors/node/v22.22.0/node-v22.22.0-linux-x64.tar.xz \
+    | tar -xJ -C /usr/local --strip-components=1 \
+    && npm install -g npm@11.11.1 --registry=https://registry.npmmirror.com
+
+# Step 4: Non-root builder user (matching host UID/GID)
+RUN groupadd -g ${GID} builder \
+    && useradd -m -u ${UID} -g ${GID} -s /bin/bash builder
+
+# Step 5: 缓存目录（归 builder 用户所有）
+RUN mkdir -p /home/builder/.cache/electron \
+       /home/builder/.cache/electron-builder \
+       /home/builder/.npm/_prebuilds \
+    && chown -R builder:builder /home/builder
+
+# Step 6: 中国镜像环境变量
+ENV ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+ENV ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+ENV npm_config_registry=https://registry.npmmirror.com
+ENV NODE_OPTIONS=--max-old-space-size=4096
+
+WORKDIR /app
+
+# 以非 root 用户运行
+USER builder
+
+# 默认入口：构建脚本
+CMD ["node", "scripts/build-macos.mjs"]

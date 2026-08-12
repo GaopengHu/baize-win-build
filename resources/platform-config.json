@@ -1,0 +1,5 @@
+{
+  "platform": "linux",
+  "prettyName": "uos-arm64",
+  "shell": "/bin/bash"
+}

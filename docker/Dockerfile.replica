@@ -1,0 +1,72 @@
+# 今点通 Windows 7/8 本地环境复刻 Docker 镜像
+#
+# 复刻本地构建环境 (Node.js 22, npm 11, Wine 4, 中国镜像)
+# 以非 root 用户运行，避免宿主目录产生 root 属主文件
+#
+# 构建:
+#   docker compose -f docker/docker-compose.replica.yml build
+#
+# 一键构建:
+#   docker compose -f docker/docker-compose.replica.yml run --rm build
+
+FROM ubuntu:22.04
+
+LABEL maintainer="Baize Team <dev@baize.app>"
+LABEL description="Local-environment replica for Baize Windows 7/8 cross-compilation"
+
+ARG UID=1000
+ARG GID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ca-certificates → TUNA mirror
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list \
+    && sed -i 's|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list
+
+# System dependencies (matching local env: Wine + build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3 \
+    git \
+    curl \
+    wget \
+    xz-utils \
+    wine64 \
+    p7zip-full \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22.22.0 + npm 11.11.1 (same versions as local host)
+RUN curl -fsSL https://npmmirror.com/mirrors/node/v22.22.0/node-v22.22.0-linux-x64.tar.xz \
+    | tar -xJ -C /usr/local --strip-components=1 \
+    && npm install -g npm@11.11.1 --registry=https://registry.npmmirror.com
+
+# Non-root builder user (matching host UID/GID 1000:1000)
+RUN groupadd -g ${GID} builder \
+    && useradd -m -u ${UID} -g ${GID} -s /bin/bash builder
+
+# Pre-create cache directories (owned by builder)
+RUN mkdir -p /home/builder/.cache/electron \
+       /home/builder/.cache/electron-builder \
+       /home/builder/.npm \
+    && chown -R builder:builder /home/builder
+
+# China mirror registries
+ENV ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+ENV ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+ENV npm_config_registry=https://registry.npmmirror.com
+ENV NODE_OPTIONS=--max-old-space-size=4096
+
+# Headless Wine config
+ENV WINEDEBUG=-all
+ENV WINEPREFIX=/home/builder/.wine
+ENV WINEARCH=win64
+
+RUN wine wineboot --init 2>/dev/null || true
+
+WORKDIR /app
+
+USER builder
+
+CMD ["node", "scripts/build-win7.mjs"]

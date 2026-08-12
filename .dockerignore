@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Build output
+dist/
+dist-electron/
+dist-mcp/
+dist-wsl-agent/
+dist-lima-agent/
+.bundle-resources/
+release/
+*.exe
+*.deb
+*.dmg
+*.AppImage
+
+# Dependencies
+node_modules/
+
+# Cache
+.build-cache/
+.npm/
+# 但保留 ARM64 交叉编译工具链 .deb 包（uos-arm 镜像构建需要）
+!.build-cache/debs-arm64/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker/

@@ -1,0 +1,65 @@
+# 今点通 UOS/统信/Kylin/麒麟 .deb 一键构建
+#
+# 基于 Dockerfile.uos (Debian 10, GLIBC 2.28)。
+# 构建产物直接写入宿主 release/ 目录。
+#
+# 用法:
+#   docker-compose -f docker/docker-compose.uos.yml build
+#   docker-compose -f docker/docker-compose.uos.yml run --rm build
+#
+
+services:
+  build:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.uos
+      args:
+        UID: 1000
+        GID: 1000
+    image: zhinengti-linux-builder:uos
+    container_name: zhinengti-linux-build
+    working_dir: /app
+    user: 1000:1000
+    volumes:
+      # 项目源码 (挂载宿主目录, 构建产物写入宿主 release/)
+      - ..:/app
+      # node_modules: 使用宿主目录（同为 Linux x64，无需隔离）
+      # npm 全局缓存 (共享宿主 ~/.npm)
+      - ~/.npm:/home/builder/.npm
+      # Electron 二进制缓存 (共享宿主 ~/.cache/electron)
+      - ~/.cache/electron:/home/builder/.cache/electron
+      # electron-builder 缓存 (linux 工具链)
+      - ~/.cache/electron-builder:/home/builder/.cache/electron-builder
+    environment:
+      - INSIDE_DOCKER=true
+      - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+      - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
+      # 覆盖 Dockerfile 中的 REBUILD_NATIVE=1，使用 Step 2 手动 rebuild
+      - REBUILD_NATIVE=
+    command: >
+      bash -c "
+        echo '=== 今点通 UOS/Kylin .deb Build Container ===' &&
+        echo 'Step 1: npm install' &&
+        npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
+        echo 'Step 2: Apply patches' &&
+        npx patch-package &&
+        echo 'Step 3: Download Node.js binaries' &&
+        node scripts/download-node.js &&
+        echo 'Step 4: Verify and rebuild better-sqlite3' &&
+        NODE_FILE=/app/node_modules/better-sqlite3/build/Release/better_sqlite3.node &&
+        NEED_REBUILD=1 &&
+        if [ -f \"$$NODE_FILE\" ]; then
+          if file \"$$NODE_FILE\" | grep -q 'ELF.*x86-64'; then
+            echo 'Valid binary found, skipping rebuild' &&
+            NEED_REBUILD=0;
+          fi;
+        fi &&
+        if [ \"$$NEED_REBUILD\" = \"1\" ] || [ \"$$FORCE_REBUILD\" = \"1\" ]; then
+          echo 'Rebuilding better-sqlite3' &&
+          cd /app/node_modules/better-sqlite3 &&
+          npx node-gyp rebuild --runtime=electron --target=22.3.27 --arch=x64 --disturl=https://electronjs.org/headers &&
+          cd /app;
+        fi &&
+        echo 'Step 5: Build .deb' &&
+        node scripts/build-linux-deb.mjs
+      "
