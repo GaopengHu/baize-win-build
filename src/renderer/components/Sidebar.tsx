@@ -62,6 +62,7 @@ export function Sidebar() {
   const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
   const [renameTitle, setRenameTitle] = useState('');
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
 
   const normalizedQuery = useMemo(() => searchQuery.trim().toLowerCase(), [searchQuery]);
   const filteredSessions = useMemo(() => {
@@ -224,28 +225,74 @@ export function Sidebar() {
     setContextMenu({ sessionId, x: e.clientX, y: e.clientY });
   };
 
-  const handleRenameClick = () => {
+  const closeContextMenu = useCallback(() => {
+    setContextMenu(null);
+  }, []);
+
+  const handleRenameClick = useCallback(() => {
     if (!contextMenu) return;
     const session = sessions.find((s) => s.id === contextMenu.sessionId);
     if (!session) return;
     setRenameSessionId(contextMenu.sessionId);
     setRenameTitle(session.title);
-    setContextMenu(null);
-  };
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu, sessions]);
 
-  const handleRenameSubmit = () => {
-    if (!renameSessionId || !renameTitle.trim()) return;
-    updateSession(renameSessionId, { title: renameTitle.trim() });
+  const cancelRename = useCallback(() => {
     setRenameSessionId(null);
     setRenameTitle('');
-  };
+  }, []);
+
+  const handleRenameSubmit = useCallback(() => {
+    if (!renameSessionId) return;
+
+    const nextTitle = renameTitle.trim();
+    if (!nextTitle) return;
+
+    updateSession(renameSessionId, { title: nextTitle });
+    cancelRename();
+    closeContextMenu();
+  }, [cancelRename, closeContextMenu, renameSessionId, renameTitle, updateSession]);
+
+  useEffect(() => {
+    if (!renameSessionId) return;
+
+    renameInputRef.current?.focus();
+    renameInputRef.current?.select();
+  }, [renameSessionId]);
+
+  useEffect(() => {
+    if (!contextMenu && !renameSessionId) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && contextMenuRef.current?.contains(target)) {
+        return;
+      }
+      if (target && renameInputRef.current?.contains(target)) {
+        return;
+      }
+
+      if (renameSessionId) {
+        cancelRename();
+      }
+      if (contextMenu) {
+        closeContextMenu();
+      }
+    };
+
+    window.addEventListener('pointerdown', handlePointerDown);
+    return () => window.removeEventListener('pointerdown', handlePointerDown);
+  }, [cancelRename, closeContextMenu, contextMenu, renameSessionId]);
 
   const handleRenameKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
+      e.preventDefault();
       handleRenameSubmit();
     } else if (e.key === 'Escape') {
-      setRenameSessionId(null);
-      setRenameTitle('');
+      e.preventDefault();
+      cancelRename();
+      closeContextMenu();
     }
   };
 
@@ -319,7 +366,7 @@ export function Sidebar() {
 
   return (
     <>
-    <aside className="w-[17.5rem] bg-surface/96 border-r border-border-muted flex flex-col overflow-hidden">
+      <aside className="w-[17.5rem] bg-surface/96 border-r border-border-muted flex flex-col overflow-hidden">
       <div className="px-4 pt-5 pb-4 border-b border-border-muted">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex items-center gap-3">
@@ -441,7 +488,10 @@ export function Sidebar() {
                                 type="text"
                                 value={renameTitle}
                                 onChange={(e) => setRenameTitle(e.target.value)}
-                                onBlur={handleRenameSubmit}
+                                onBlur={() => {
+                                  cancelRename();
+                                  closeContextMenu();
+                                }}
                                 onKeyDown={handleRenameKeyDown}
                                 onClick={(e) => e.stopPropagation()}
                                 className="w-full text-[13px] font-medium leading-5 text-text-primary bg-surface-active border border-accent rounded px-1.5 py-0.5 outline-none focus:ring-1 focus:ring-accent"
@@ -561,9 +611,9 @@ export function Sidebar() {
     {/* Context Menu */}
     {contextMenu && (
       <div
+        ref={contextMenuRef}
         className="fixed z-50 min-w-[120px] bg-surface border border-border rounded-lg shadow-lg py-1"
         style={{ left: contextMenu.x, top: contextMenu.y }}
-        onClick={() => setContextMenu(null)}
       >
         <button
           onClick={handleRenameClick}

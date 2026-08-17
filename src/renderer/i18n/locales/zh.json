@@ -22,7 +22,7 @@
     "pastedImageAlt": "粘贴图片 {{index}}"
   },
   "welcome": {
-    "title": "今天我能为您做些什么？",
+    "title": "今天就点，一通百通！",
     "placeholder": "描述你想做的事情...",
     "createFile": "创建文件",
     "crunchData": "处理数据",
@@ -644,6 +644,7 @@
     "stepsWillShow": "步骤将随任务展开而显示。",
     "noArtifactsYet": "尚无产物",
     "revealFailed": "无法定位文件，请检查路径是否存在",
+    "downloadSuccess": "文件已下载到本地下载目录",
     "fileCreated": "文件已创建",
     "callNumber": "调用 #{{number}}",
     "input": "输入：",

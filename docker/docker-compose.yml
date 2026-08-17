@@ -29,6 +29,7 @@ services:
       - baize-builder-cache:/home/builder/.cache/electron-builder
     environment:
       - INSIDE_DOCKER=true
+      - HOME=/home/builder
       - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
       - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
       - WINEDEBUG=-all
@@ -43,7 +44,9 @@ services:
         node scripts/download-node.js &&
         echo 'Step 4: Download Windows better-sqlite3' &&
         npm run prebuild:win &&
-        echo 'Step 5: Build installer' &&
+        echo 'Step 5: Build MCP bundles' &&
+        npm run build:mcp &&
+        echo 'Step 6: Build installer' &&
         npm run build:win7 &&
         echo 'Done! Installer at release/今点通-*-win-x64.exe'
       "

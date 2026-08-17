@@ -49,35 +49,49 @@ export const ContentBlockView = memo(function ContentBlockView({
 
   const resolveFilePath = (value: string) => resolvePathAgainstWorkspace(value, currentWorkingDir);
 
+  const handleDownloadFile = async (filePath: string) => {
+    if (typeof window === 'undefined' || !window.electronAPI?.saveFileToDownloads) {
+      return;
+    }
+
+    const resolvedPath = resolveFilePath(filePath);
+    try {
+      const result = await window.electronAPI.saveFileToDownloads(
+        resolvedPath,
+        currentWorkingDir ?? undefined
+      );
+      if (!result?.success) {
+        setGlobalNotice({
+          id: `message-card-download-failed-${Date.now()}`,
+          type: 'warning',
+          message: result?.error || t('context.revealFailed'),
+        });
+        return;
+      }
+
+      setGlobalNotice({
+        id: `message-card-download-success-${Date.now()}`,
+        type: 'success',
+        message: result.savedPath
+          ? `已下载到 ${result.savedPath}`
+          : t('messageCard.downloadSuccess'),
+      });
+    } catch (error) {
+      setGlobalNotice({
+        id: `message-card-download-failed-${Date.now()}`,
+        type: 'warning',
+        message:
+          error instanceof Error && error.message ? error.message : t('context.revealFailed'),
+      });
+    }
+  };
+
   const renderFileButton = (value: string, key?: string) => (
     <button
       key={key}
       type="button"
-      onClick={async () => {
-        if (typeof window === 'undefined' || !window.electronAPI?.showItemInFolder) {
-          return;
-        }
-        const resolvedPath = resolveFilePath(value);
-        try {
-          const revealed = await window.electronAPI.showItemInFolder(
-            resolvedPath,
-            currentWorkingDir ?? undefined
-          );
-          if (!revealed) {
-            setGlobalNotice({
-              id: `message-card-reveal-failed-${Date.now()}`,
-              type: 'warning',
-              message: t('context.revealFailed'),
-            });
-          }
-        } catch (error) {
-          setGlobalNotice({
-            id: `message-card-reveal-failed-${Date.now()}`,
-            type: 'warning',
-            message:
-              error instanceof Error && error.message ? error.message : t('context.revealFailed'),
-          });
-        }
+      onClick={() => {
+        void handleDownloadFile(value);
       }}
       className={getFileLinkButtonClassName()}
       title={resolveFilePath(value)}
@@ -118,32 +132,8 @@ export const ContentBlockView = memo(function ContentBlockView({
           return (
             <button
               type="button"
-              onClick={async () => {
-                if (typeof window === 'undefined' || !window.electronAPI?.showItemInFolder) {
-                  return;
-                }
-                try {
-                  const revealed = await window.electronAPI.showItemInFolder(
-                    localFilePath,
-                    currentWorkingDir ?? undefined
-                  );
-                  if (!revealed) {
-                    setGlobalNotice({
-                      id: `message-card-reveal-failed-${Date.now()}`,
-                      type: 'warning',
-                      message: t('context.revealFailed'),
-                    });
-                  }
-                } catch (error) {
-                  setGlobalNotice({
-                    id: `message-card-reveal-failed-${Date.now()}`,
-                    type: 'warning',
-                    message:
-                      error instanceof Error && error.message
-                        ? error.message
-                        : t('context.revealFailed'),
-                  });
-                }
+              onClick={() => {
+                void handleDownloadFile(localFilePath);
               }}
               className={getFileLinkButtonClassName()}
               title={localFilePath}
@@ -354,7 +344,9 @@ export const ContentBlockView = memo(function ContentBlockView({
       );
 
     case 'thinking':
-      return <ThinkingBlock block={block as { type: 'thinking'; thinking: string }} />;
+      return (
+        <ThinkingBlock block={block as { type: 'thinking'; thinking: string }} compact={false} />
+      );
 
     default:
       return null;

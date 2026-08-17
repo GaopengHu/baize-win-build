@@ -12,8 +12,6 @@ export function partitionBlocks(blocks: ContentBlock[]) {
     processBlocks: blocks.filter(isProcessBlock),
   };
 }
-
-/** Merge all thinking blocks into a single block, keeping the rest in place. */
 export function mergeThinkingBlocks(blocks: ContentBlock[]): ContentBlock[] {
   const allThinking: string[] = [];
   const nonThinking: ContentBlock[] = [];

@@ -14,7 +14,7 @@
  */
 import './stream-shim';
 import { app, BrowserWindow, ipcMain, dialog, shell, Menu, nativeTheme, Tray } from 'electron';
-import { join, resolve, dirname, isAbsolute, basename } from 'path';
+import { join, resolve, dirname, isAbsolute, basename, extname } from 'path';
 import * as fs from 'fs';
 import { execFileSync } from 'child_process';
 import { config } from 'dotenv';
@@ -997,11 +997,11 @@ app
             throw new Error(result.error || 'Failed to update working directory');
           }
         }
-        await sessionManager.continueSession(sessionId, prompt, content);
+        sessionManager.continueSession(sessionId, prompt, content);
       },
       stopSession: async (sessionId) => {
         if (!sessionManager) throw new Error('Session manager not initialized');
-        await sessionManager.stopSession(sessionId);
+        sessionManager.stopSession(sessionId);
       },
       validateWorkingDirectory: async (cwd) => {
         const unsupportedReason = getWorkspacePathUnsupportedReason(cwd);
@@ -1244,6 +1244,69 @@ ipcMain.handle('shell.openExternal', async (_event, url: string) => {
   return shell.openExternal(url);
 });
 
+function inferSourcePath(filePath: string, cwd?: string): string | null {
+  const dir = dirname(filePath);
+  const baseName = basename(filePath, extname(filePath));
+  const candidates = [
+    filePath,
+    join(dir, `${baseName}.json`),
+    join(dir, `${baseName}.jsonl`),
+    join(dir, `${baseName}.md`),
+    join(dir, `${baseName}.txt`),
+    join(dir, `${baseName}.csv`),
+    join(dir, `${baseName}.tsv`),
+    join(dir, `${baseName}.html`),
+    cwd ? join(cwd, basename(filePath)) : null,
+  ].filter((value): value is string => Boolean(value));
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function buildUniqueTargetPath(targetPath: string): string {
+  if (!fs.existsSync(targetPath)) {
+    return targetPath;
+  }
+
+  const dir = dirname(targetPath);
+  const ext = extname(targetPath);
+  const base = basename(targetPath, ext);
+  let counter = 1;
+  while (counter < 1000) {
+    const suffix = ` (${counter})`;
+    const candidate = join(dir, `${base}${suffix}${ext}`);
+    if (!fs.existsSync(candidate)) {
+      return candidate;
+    }
+    counter += 1;
+  }
+
+  return join(dir, `${base}-${Date.now()}${ext}`);
+}
+
+async function saveFileToDownloads(filePath: string, cwd?: string): Promise<{ success: boolean; savedPath?: string; error?: string }> {
+  try {
+    const sourcePath = inferSourcePath(filePath, cwd);
+    if (!sourcePath) {
+      return { success: false, error: 'Source file not found' };
+    }
+
+    const downloadsDir = app.getPath('downloads');
+    const targetPath = buildUniqueTargetPath(join(downloadsDir, basename(sourcePath)));
+    fs.copyFileSync(sourcePath, targetPath);
+    return { success: true, savedPath: targetPath };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logError('[shell.saveFileToDownloads] failed:', error);
+    return { success: false, error: message };
+  }
+}
+
 async function revealFileInFolder(filePath: string, cwd?: string): Promise<boolean> {
   if (!filePath) {
     return false;
@@ -1406,6 +1469,10 @@ async function revealFileInFolder(filePath: string, cwd?: string): Promise<boole
 
 ipcMain.handle('shell.showItemInFolder', async (_event, filePath: string, cwd?: string) => {
   return revealFileInFolder(filePath, cwd);
+});
+
+ipcMain.handle('shell.saveFileToDownloads', async (_event, filePath: string, cwd?: string) => {
+  return saveFileToDownloads(filePath, cwd);
 });
 
 ipcMain.handle(
