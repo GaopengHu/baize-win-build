@@ -22,7 +22,7 @@
     "pastedImageAlt": "Pasted {{index}}"
   },
   "welcome": {
-    "title": "How can I help you today?",
+    "title": "Click today, and all will click!",
     "placeholder": "Describe what you'd like to do...",
     "createFile": "Create a file",
     "crunchData": "Crunch data",
@@ -644,6 +644,7 @@
     "stepsWillShow": "Steps will show as the task unfolds.",
     "noArtifactsYet": "No artifacts yet",
     "revealFailed": "Unable to locate the file. Please check whether the path exists.",
+    "downloadSuccess": "File downloaded to your Downloads folder.",
     "fileCreated": "File created",
     "callNumber": "Call #{{number}}",
     "input": "Input:",

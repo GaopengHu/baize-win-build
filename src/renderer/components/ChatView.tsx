@@ -15,7 +15,7 @@ import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
 import { ProcessPanel } from './message/ProcessPanel';
 import { ContentBlockView } from './message/ContentBlockView';
-import { mergeThinkingBlocks, partitionBlocks } from '../utils/content-block-partition';
+import { isProcessBlock, mergeThinkingBlocks } from '../utils/content-block-partition';
 import type { Message, ContentBlock } from '../types';
 import { Send, Square, Plus, Loader2, Plug, X, Clock } from 'lucide-react';
 
@@ -732,14 +732,11 @@ export function ChatView() {
             </div>
           ) : (
             groupMessagesIntoRounds(displayedMessages).map((round, roundIndex) => {
-              // Aggregate process blocks from all assistant messages in this round
-              const roundProcessBlocks: ContentBlock[] = [];
-              for (const assistantMessage of round.assistantMessages) {
+              const roundProcessBlocks = round.assistantMessages.flatMap((assistantMessage) => {
                 const blocks = getMessageContentBlocks(assistantMessage);
                 const merged = mergeThinkingBlocks(blocks);
-                const { processBlocks } = partitionBlocks(merged);
-                roundProcessBlocks.push(...processBlocks);
-              }
+                return merged.some(isProcessBlock) ? merged : [];
+              });
 
               return (
                 <div key={roundIndex} className="space-y-5">
@@ -759,11 +756,18 @@ export function ChatView() {
                           typeof message.id === 'string' && message.id.startsWith('partial-');
                         const blocks = getMessageContentBlocks(message);
                         const merged = mergeThinkingBlocks(blocks);
-                        const { resultBlocks } = partitionBlocks(merged);
-                        if (resultBlocks.length === 0) return null;
+                        const hasProcessContent = merged.some(isProcessBlock);
+                        const visibleBlocks = hasProcessContent
+                          ? merged.filter(
+                              (block) =>
+                                !isProcessBlock(block) && block.type !== 'text'
+                            )
+                          : merged;
+                        if (visibleBlocks.length === 0) return null;
+
                         return (
                           <div key={message.id} className="space-y-1.5">
-                            {resultBlocks.map((block, index) => (
+                            {visibleBlocks.map((block, index) => (
                               <ContentBlockView
                                 key={
                                   'id' in block
@@ -896,7 +900,7 @@ export function ChatView() {
                 onKeyDown={(e) => {
                   // Enter to send, Shift+Enter for new line
                   if (e.key === 'Enter' && !e.shiftKey) {
-                    if (e.nativeEvent.isComposing || isComposingRef.current || e.keyCode === 229) {
+                    if (e.nativeEvent.isComposing || isComposingRef.current) {
                       return;
                     }
                     e.preventDefault();
