@@ -14,6 +14,7 @@ import {
   resolveLocalFilePathFromHref,
 } from '../../utils/markdown-local-link';
 import { normalizeLatexDelimiters } from '../../utils/latex-delimiters';
+import { appendDownloadLinks } from '../../utils/artifact-links';
 import type { ToolUseContent, ToolResultContent, FileAttachmentContent } from '../../types';
 import { FileText } from 'lucide-react';
 import { CodeBlock } from './CodeBlock';
@@ -96,7 +97,8 @@ export const ContentBlockView = memo(function ContentBlockView({
       className={getFileLinkButtonClassName()}
       title={resolveFilePath(value)}
     >
-      {value}
+      <span className="truncate">{value}</span>
+      <span className="text-[11px] opacity-80 whitespace-nowrap">下载</span>
     </button>
   );
 
@@ -248,12 +250,14 @@ export const ContentBlockView = memo(function ContentBlockView({
       const normalizedText = normalizeCitationMarkdownLinks(
         normalizeLocalFileMarkdownLinks(normalizeLatexDelimiters(text))
       );
+      const augmentedText = appendDownloadLinks(normalizedText, currentWorkingDir);
 
       if (!text) {
         return <span className="text-text-muted italic">{t('messageCard.emptyText')}</span>;
       }
 
       // Simple text display for user messages, Markdown for assistant
+      // Non-user text blocks should render as normal assistant output, not as process-only content.
       if (isUser) {
         return (
           <p className="text-text-primary whitespace-pre-wrap break-words text-left">
@@ -268,14 +272,14 @@ export const ContentBlockView = memo(function ContentBlockView({
           name="MessageMarkdown"
           fallback={
             <div className="prose-chat max-w-none text-text-primary whitespace-pre-wrap break-words">
-              {normalizedText}
+              {augmentedText}
             </div>
           }
         >
           <Suspense
             fallback={
               <div className="prose-chat max-w-none text-text-primary whitespace-pre-wrap break-words">
-                {normalizedText}
+                {augmentedText}
               </div>
             }
           >

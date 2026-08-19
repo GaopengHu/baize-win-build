@@ -48,7 +48,11 @@ import { setMaxListeners } from 'node:events';
 import { getSandboxAdapter } from '../sandbox/sandbox-adapter';
 import { pathConverter } from '../sandbox/wsl-bridge';
 import { SandboxSync } from '../sandbox/sandbox-sync';
-import { extractArtifactsFromText, buildArtifactTraceSteps } from '../utils/artifact-parser';
+import {
+  extractArtifactsFromText,
+  buildArtifactTraceSteps,
+  buildArtifactCompletionText,
+} from '../utils/artifact-parser';
 import { getDefaultShell } from '../utils/shell-resolver';
 import { detectCommandTools, formatDetectedTools } from '../utils/detect-command-tools';
 import { PluginRuntimeService } from '../skills/plugin-runtime-service';
@@ -2159,6 +2163,24 @@ Tool routing:
 - If user explicitly asks to use Chrome/browser/web navigation, prioritize Chrome MCP tools (mcp__Chrome__*) over generic WebSearch/WebFetch.
 - Use WebSearch/WebFetch only when Chrome MCP is unavailable or the user explicitly asks for generic web search.
 </tool_behavior>`,
+        `<document_generation_rules>
+When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), follow these EFFICIENCY rules:
+
+1. MINIMIZE TOOL CALLS: Plan the entire document content BEFORE writing any code. Write ONE script that generates the complete document in a single execution. Do NOT write, test, debug, and rewrite scripts iteratively.
+
+2. DO NOT READ SKILL DOCS IN FULL: When using docx/pptx/xlsx skills, do NOT read the entire SKILL.md, html2pptx.md, css.md, ooxml.md, or other documentation files. Instead:
+   - For PPTX: Use PptxGenJS directly. Write a single Node.js script that creates all slides programmatically. Do NOT use the html2pptx workflow (it requires writing HTML, then converting — too many steps).
+   - For DOCX: Use the docx npm package directly. Write a single Node.js script.
+   - For XLSX: Use the exceljs or xlsx npm package directly. Write a single Node.js script.
+
+3. ONE SCRIPT, ONE EXECUTION: Write the complete generation script in one file, execute it once. If it fails, read the error, fix the script, and re-run — but do NOT start over from scratch. Maximum 2 retry attempts.
+
+4. NO ITERATIVE REFINEMENT: Do not generate the document incrementally (e.g., one slide at a time, one section at a time). Generate ALL content in a single script execution.
+
+5. CONTENT FIRST: Focus on delivering the document content the user asked for. Do not spend time on elaborate styling, custom fonts, or complex visual designs unless the user explicitly requests them. Use default templates and simple, clean formatting.
+
+6. TIME BUDGET: Document generation should complete within 3-5 tool calls total (read skill reference if needed → write script → execute → done). If you find yourself making more than 8 tool calls for a single document generation task, STOP, finalize what you have, and deliver the result.
+</document_generation_rules>`,
         this.getBundledPathHints(),
       ]
         .filter((section): section is string => Boolean(section && section.trim()))
@@ -2740,6 +2762,10 @@ Tool routing:
                     if (artifacts.length > 0) {
                       for (const step of buildArtifactTraceSteps(artifacts)) {
                         this.sendTraceStep(session.id, step);
+                      }
+                      const completionText = buildArtifactCompletionText(artifacts);
+                      if (completionText) {
+                        contentBlocks.push({ type: 'text', text: completionText });
                       }
                     }
                   } else if (block.type === 'toolCall') {

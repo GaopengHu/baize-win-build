@@ -2,8 +2,8 @@ import { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../store';
 import { resolveArtifactPath } from '../utils/artifact-path';
-import { extractFilePathFromToolInput, extractFilePathFromToolOutput } from '../utils/tool-output-path';
-import { getArtifactLabel, getArtifactIconComponent, getArtifactSteps } from '../utils/artifact-steps';
+import { normalizeArtifactPathValue } from '../utils/tool-output-path';
+import { getArtifactLabel, getArtifactIconComponent, filterPrimaryArtifacts, collectArtifactPaths, extractRequestedFormats } from '../utils/artifact-steps';
 import { useIPC } from '../hooks/useIPC';
 import {
   ChevronDown,
@@ -51,7 +51,7 @@ export function ContextPanel() {
   const [mcpServers, setMcpServers] = useState<MCPServerInfo[]>([]);
   const [copiedPath, setCopiedPath] = useState(false);
   const [isChangingDir, setIsChangingDir] = useState(false);
-  const [recentWorkspaceFiles, setRecentWorkspaceFiles] = useState<Array<{
+  const [, setRecentWorkspaceFiles] = useState<Array<{
     path: string;
     modifiedAt: number;
     size: number;
@@ -77,7 +77,6 @@ export function ContextPanel() {
   const steps = ss?.traceSteps ?? EMPTY_STEPS;
   const activeSession = activeSessionId ? sessions.find(s => s.id === activeSessionId) : null;
   const currentWorkingDir = activeSession?.cwd || workingDir;
-  const { displayArtifactSteps } = getArtifactSteps(steps);
   const canShowItemInFolder = typeof window !== 'undefined' && !!window.electronAPI?.showItemInFolder;
 
   // Session info computations
@@ -85,6 +84,8 @@ export function ContextPanel() {
     () => (activeSessionId ? sessionStates[activeSessionId]?.messages || [] : []),
     [activeSessionId, sessionStates]
   );
+  const requestedFormats = useMemo(() => extractRequestedFormats(messages), [messages]);
+  const artifactPaths = useMemo(() => collectArtifactPaths(steps, messages), [steps, messages]);
   const messageCount = messages.length;
   const toolCallCount = steps.filter((s) => s.type === 'tool_call').length;
   const modelName = activeSession?.model || appConfig?.model || '—';
@@ -207,45 +208,32 @@ export function ContextPanel() {
   ]);
 
   const displayArtifacts = useMemo(() => {
+    const allCandidates: string[] = [];
     const seenPaths = new Set<string>();
-    const items: Array<{ label: string; path: string }> = [];
 
-    for (const step of displayArtifactSteps) {
-      const fallbackPath = extractFilePathFromToolOutput(step.toolOutput)
-        || extractFilePathFromToolInput(step.toolInput);
-      if (!fallbackPath) {
-        continue;
-      }
-
-      const resolvedPath = resolveArtifactPath(fallbackPath, currentWorkingDir);
-      const key = resolvedPath.trim();
-      if (!key || seenPaths.has(key)) {
-        continue;
-      }
-
-      seenPaths.add(key);
-      items.push({
-        label: getArtifactLabel(fallbackPath),
-        path: resolvedPath,
-      });
+    for (const path of artifactPaths) {
+      const resolvedPath = normalizeArtifactPathValue(resolveArtifactPath(path, currentWorkingDir));
+      if (seenPaths.has(resolvedPath)) continue;
+      seenPaths.add(resolvedPath);
+      allCandidates.push(resolvedPath);
     }
 
-    for (const file of recentWorkspaceFiles) {
-      const resolvedPath = resolveArtifactPath(file.path, currentWorkingDir);
-      const key = resolvedPath.trim();
-      if (!key || seenPaths.has(key)) {
-        continue;
-      }
+    const filteredPaths = filterPrimaryArtifacts(allCandidates, requestedFormats);
+    const dedupedByName = new Map<string, string>();
 
-      seenPaths.add(key);
-      items.push({
-        label: getArtifactLabel(file.path),
-        path: resolvedPath,
-      });
+    for (const path of filteredPaths) {
+      const normalized = normalizeArtifactPathValue(path).replace(/\\/g, '/');
+      const nameKey = (normalized.split('/').pop() || normalized).toLowerCase();
+      if (!dedupedByName.has(nameKey)) {
+        dedupedByName.set(nameKey, path);
+      }
     }
 
-    return items;
-  }, [currentWorkingDir, displayArtifactSteps, recentWorkspaceFiles]);
+    return Array.from(dedupedByName.values()).map((path) => ({
+      label: getArtifactLabel(path),
+      path,
+    }));
+  }, [artifactPaths, currentWorkingDir, requestedFormats]);
 
   useEffect(() => {
     if (contextPanelCollapsed) {
