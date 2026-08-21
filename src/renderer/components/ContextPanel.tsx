@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../store';
 import { resolveArtifactPath } from '../utils/artifact-path';
 import { normalizeArtifactPathValue } from '../utils/tool-output-path';
-import { getArtifactLabel, getArtifactIconComponent, filterPrimaryArtifacts, collectArtifactPaths, extractRequestedFormats } from '../utils/artifact-steps';
+import { getArtifactLabel, getArtifactIconComponent, collectArtifactPaths, shouldDisplayArtifactPath } from '../utils/artifact-steps';
 import { useIPC } from '../hooks/useIPC';
 import {
   ChevronDown,
@@ -84,7 +84,6 @@ export function ContextPanel() {
     () => (activeSessionId ? sessionStates[activeSessionId]?.messages || [] : []),
     [activeSessionId, sessionStates]
   );
-  const requestedFormats = useMemo(() => extractRequestedFormats(messages), [messages]);
   const artifactPaths = useMemo(() => collectArtifactPaths(steps, messages), [steps, messages]);
   const messageCount = messages.length;
   const toolCallCount = steps.filter((s) => s.type === 'tool_call').length;
@@ -218,10 +217,12 @@ export function ContextPanel() {
       allCandidates.push(resolvedPath);
     }
 
-    const filteredPaths = filterPrimaryArtifacts(allCandidates, requestedFormats);
+    // Filter out non-deliverable files (.js, .json, .py, sidecars, etc.)
+    // and deduplicate by filename so the same file only appears once.
     const dedupedByName = new Map<string, string>();
 
-    for (const path of filteredPaths) {
+    for (const path of allCandidates) {
+      if (!shouldDisplayArtifactPath(path)) continue;
       const normalized = normalizeArtifactPathValue(path).replace(/\\/g, '/');
       const nameKey = (normalized.split('/').pop() || normalized).toLowerCase();
       if (!dedupedByName.has(nameKey)) {
@@ -233,7 +234,7 @@ export function ContextPanel() {
       label: getArtifactLabel(path),
       path,
     }));
-  }, [artifactPaths, currentWorkingDir, requestedFormats]);
+  }, [artifactPaths, currentWorkingDir]);
 
   useEffect(() => {
     if (contextPanelCollapsed) {

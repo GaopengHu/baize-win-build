@@ -14,7 +14,7 @@ import {
   resolveLocalFilePathFromHref,
 } from '../../utils/markdown-local-link';
 import { normalizeLatexDelimiters } from '../../utils/latex-delimiters';
-import { appendDownloadLinks } from '../../utils/artifact-links';
+import { appendFolderOpenLinks } from '../../utils/artifact-links';
 import type { ToolUseContent, ToolResultContent, FileAttachmentContent } from '../../types';
 import { FileText } from 'lucide-react';
 import { CodeBlock } from './CodeBlock';
@@ -50,36 +50,27 @@ export const ContentBlockView = memo(function ContentBlockView({
 
   const resolveFilePath = (value: string) => resolvePathAgainstWorkspace(value, currentWorkingDir);
 
-  const handleDownloadFile = async (filePath: string) => {
-    if (typeof window === 'undefined' || !window.electronAPI?.saveFileToDownloads) {
+  const openContainingFolder = async (filePath: string) => {
+    if (typeof window === 'undefined' || !window.electronAPI?.showItemInFolder) {
       return;
     }
 
     const resolvedPath = resolveFilePath(filePath);
     try {
-      const result = await window.electronAPI.saveFileToDownloads(
+      const revealed = await window.electronAPI.showItemInFolder(
         resolvedPath,
         currentWorkingDir ?? undefined
       );
-      if (!result?.success) {
+      if (!revealed) {
         setGlobalNotice({
-          id: `message-card-download-failed-${Date.now()}`,
+          id: `message-card-reveal-failed-${Date.now()}`,
           type: 'warning',
-          message: result?.error || t('context.revealFailed'),
+          message: t('context.revealFailed'),
         });
-        return;
       }
-
-      setGlobalNotice({
-        id: `message-card-download-success-${Date.now()}`,
-        type: 'success',
-        message: result.savedPath
-          ? `已下载到 ${result.savedPath}`
-          : t('messageCard.downloadSuccess'),
-      });
     } catch (error) {
       setGlobalNotice({
-        id: `message-card-download-failed-${Date.now()}`,
+        id: `message-card-reveal-failed-${Date.now()}`,
         type: 'warning',
         message:
           error instanceof Error && error.message ? error.message : t('context.revealFailed'),
@@ -92,13 +83,12 @@ export const ContentBlockView = memo(function ContentBlockView({
       key={key}
       type="button"
       onClick={() => {
-        void handleDownloadFile(value);
+        void openContainingFolder(value);
       }}
       className={getFileLinkButtonClassName()}
       title={resolveFilePath(value)}
     >
       <span className="truncate">{value}</span>
-      <span className="text-[11px] opacity-80 whitespace-nowrap">下载</span>
     </button>
   );
 
@@ -135,7 +125,7 @@ export const ContentBlockView = memo(function ContentBlockView({
             <button
               type="button"
               onClick={() => {
-                void handleDownloadFile(localFilePath);
+                void openContainingFolder(localFilePath);
               }}
               className={getFileLinkButtonClassName()}
               title={localFilePath}
@@ -250,7 +240,7 @@ export const ContentBlockView = memo(function ContentBlockView({
       const normalizedText = normalizeCitationMarkdownLinks(
         normalizeLocalFileMarkdownLinks(normalizeLatexDelimiters(text))
       );
-      const augmentedText = appendDownloadLinks(normalizedText, currentWorkingDir);
+      const augmentedText = appendFolderOpenLinks(normalizedText, currentWorkingDir);
 
       if (!text) {
         return <span className="text-text-muted italic">{t('messageCard.emptyText')}</span>;

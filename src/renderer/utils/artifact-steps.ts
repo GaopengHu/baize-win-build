@@ -182,64 +182,9 @@ function isLikelySidecarArtifact(pathValue: string): boolean {
   return false;
 }
 
-function scoreArtifactCandidate(pathValue: string): number {
-  const ext = getFileExtension(pathValue);
-  const stem = getFileStem(pathValue).toLowerCase();
-  let score = 0;
+// Keep only final deliverables, but do not collapse different file extensions.
+// Example: .docx and .pptx should both remain visible if both exist.
 
-  if (FINAL_DELIVERABLE_EXTENSIONS.has(ext)) score += 100;
-  if (/\.(docx|pptx|xlsx|pdf|txt|md|markdown|rtf|odt|ods|odp)$/i.test(pathValue)) score += 30;
-  if (/^[\w\u4e00-\u9fff\u3000-\u303f.\-_]+$/.test(stem)) score += 20;
-  if (/^\*+/.test(pathValue)) score -= 80;
-  if (/^(?:draft|temp|tmp|output|export|render|preview|slide|slides|chart|test|sample)[-_\d]/i.test(stem)) score -= 50;
-  if (isLikelySidecarArtifact(pathValue)) score -= 100;
-
-  return score;
-}
-
-function shouldPreferCandidate(nextPath: string, currentPath: string): boolean {
-  const nextScore = scoreArtifactCandidate(nextPath);
-  const currentScore = scoreArtifactCandidate(currentPath);
-  if (nextScore !== currentScore) {
-    return nextScore > currentScore;
-  }
-  // Prefer the shorter/cleaner path when scores tie.
-  return nextPath.length < currentPath.length;
-}
-
-// Map user-requested format keywords to the primary deliverable extension.
-// When the user asks for "PPT", only .pptx/.ppt files are treated as primary.
-const PRIMARY_FORMAT_MAP: Record<string, string[]> = {
-  ppt: ['pptx', 'ppt'],
-  pptx: ['pptx', 'ppt'],
-  doc: ['docx', 'doc'],
-  docx: ['docx', 'doc'],
-  word: ['docx', 'doc'],
-  xls: ['xlsx', 'xls', 'csv'],
-  xlsx: ['xlsx', 'xls', 'csv'],
-  excel: ['xlsx', 'xls', 'csv'],
-  pdf: ['pdf'],
-  txt: ['txt'],
-  text: ['txt'],
-  md: ['md', 'markdown'],
-  markdown: ['md', 'markdown'],
-};
-
-function getPrimaryExtensions(requestedFormats: Set<string>): Set<string> {
-  const primary = new Set<string>();
-  for (const fmt of requestedFormats) {
-    const exts = PRIMARY_FORMAT_MAP[fmt.toLowerCase()];
-    if (exts) {
-      for (const ext of exts) {
-        primary.add(ext);
-      }
-    } else {
-      // If it's already a direct extension, add it
-      primary.add(fmt.toLowerCase());
-    }
-  }
-  return primary;
-}
 
 export function shouldDisplayArtifactPath(pathValue: string): boolean {
   const ext = getFileExtension(pathValue);
@@ -260,40 +205,15 @@ export function shouldDisplayArtifactPath(pathValue: string): boolean {
 
 /**
  * Given all artifact candidates, return only the ones that should appear in
- * the right-side artifacts panel. When the user requested a specific format
- * (e.g. pptx), intermediate files (html, json, png, etc.) are filtered out
- * and only the primary deliverable is shown. When no specific format was
- * requested, all deliverable files pass through.
+ * the right-side artifacts panel. Intermediate files (html, json, png, etc.)
+ * are filtered out; all deliverable files (docx, pptx, xlsx, pdf, etc.) pass through.
  */
 export function filterPrimaryArtifacts(
   paths: string[],
-  requestedFormats?: Set<string>
+  _requestedFormats?: Set<string>
 ): string[] {
-  // First pass: remove obviously invalid paths
-  const valid = paths.filter((p) => shouldDisplayArtifactPath(p));
-  if (valid.length === 0) return [];
-
-  // If no specific formats requested, show all valid files
-  if (!requestedFormats || requestedFormats.size === 0) {
-    return valid;
-  }
-
-  const primaryExts = getPrimaryExtensions(requestedFormats);
-  if (primaryExts.size === 0) {
-    return valid;
-  }
-
-  // Check if any of the valid files match the primary format
-  const primaryFiles = valid.filter((p) => primaryExts.has(getFileExtension(p)));
-
-  // If we found primary deliverables, only return those and filter out
-  // intermediate files (html, json, png, etc.)
-  if (primaryFiles.length > 0) {
-    return primaryFiles;
-  }
-
-  // No primary format files found — show all valid files as fallback
-  return valid;
+  // Remove obviously invalid paths (non-deliverable extensions, sidecars, etc.)
+  return paths.filter((p) => shouldDisplayArtifactPath(p));
 }
 
 type ArtifactStepResult = {
@@ -444,31 +364,11 @@ function buildArtifactCandidateMap(
   messages?: Message[]
 ): Map<string, ArtifactCandidate> {
   const candidateMap = new Map<string, ArtifactCandidate>();
-  const latestCandidateByPrefix = new Map<string, string>();
-
-  const pathPrefixKey = (path: string): string => {
-    const normalized = normalizeArtifactPathValue(path).replace(/\\/g, '/');
-    return normalized.split('/').slice(0, -1).join('/').toLowerCase();
-  };
 
   const addCandidate = (path: string, source: ArtifactCandidate['source'], step?: TraceStep) => {
     const key = normalizeArtifactPathValue(path);
     if (!key) {
       return;
-    }
-
-    const prefix = pathPrefixKey(key);
-    const existingKey = latestCandidateByPrefix.get(prefix);
-    if (existingKey && existingKey !== key) {
-      const existing = candidateMap.get(existingKey);
-      if (existing && shouldPreferCandidate(key, existing.path)) {
-        candidateMap.delete(existingKey);
-        latestCandidateByPrefix.set(prefix, key);
-      } else {
-        return;
-      }
-    } else {
-      latestCandidateByPrefix.set(prefix, key);
     }
 
     if (!candidateMap.has(key)) {

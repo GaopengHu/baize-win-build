@@ -140,7 +140,10 @@ async function main() {
   // 3. Build the application (TypeScript + Vite)
   log('Building TypeScript + Vite...');
   run('npx tsc', { timeout: 120000 });
-  run('npx vite build', { timeout: 300000 });
+  // Vite builds both the renderer and Electron main/preload bundles. On
+  // Docker Desktop with a bind-mounted workspace, the main bundle can take
+  // longer than five minutes while transforming dependencies.
+  run('npx vite build', { timeout: 900000 });
 
   // 4. Pre-build check
   log('Running pre-build check...');
