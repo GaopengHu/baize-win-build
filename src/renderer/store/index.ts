@@ -189,6 +189,39 @@ interface AppState {
   setSystemDarkMode: (dark: boolean) => void;
 }
 
+const SETTINGS_STORAGE_KEY = 'nowlink.renderer.settings.v1';
+
+function clampFontScale(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return 1;
+  return Math.min(1.2, Math.max(0.85, numeric));
+}
+
+function loadPersistedSettings(): Partial<Settings> | null {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<Settings>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      ...parsed,
+      fontScale: clampFontScale(parsed.fontScale),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistSettings(settings: Settings): void {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    /* ignore */
+  }
+}
+
 const defaultSettings: Settings = {
   theme: 'light',
   defaultTools: [
@@ -217,6 +250,7 @@ const defaultSettings: Settings = {
   globalSkillsPath: '',
   memoryStrategy: 'auto',
   maxContextTokens: 180000,
+  fontScale: 1,
 };
 
 export const useAppStore = create<AppState>((set) => ({
@@ -231,7 +265,7 @@ export const useAppStore = create<AppState>((set) => ({
   settingsTab: null,
   pendingPermission: null,
   pendingSudoPassword: null,
-  settings: defaultSettings,
+  settings: { ...defaultSettings, ...loadPersistedSettings() },
   appConfig: null,
   isConfigured: false,
   showConfigModal: false,
@@ -553,9 +587,11 @@ export const useAppStore = create<AppState>((set) => ({
 
   // Settings actions
   setSettings: (updates) =>
-    set((state) => ({
-      settings: { ...state.settings, ...updates },
-    })),
+    set((state) => {
+      const next = { ...state.settings, ...updates };
+      persistSettings(next);
+      return { settings: next };
+    }),
   updateSettings: (updates) => {
     if (typeof window !== 'undefined' && window.electronAPI) {
       window.electronAPI.send({
@@ -563,9 +599,11 @@ export const useAppStore = create<AppState>((set) => ({
         payload: updates as Record<string, unknown>,
       });
     }
-    set((state) => ({
-      settings: { ...state.settings, ...updates },
-    }));
+    set((state) => {
+      const next = { ...state.settings, ...updates };
+      persistSettings(next);
+      return { settings: next };
+    });
   },
 
   // Config actions

@@ -25,7 +25,6 @@ import {
   Loader2,
   Plug,
   Wrench,
-  MessageSquare,
   Cpu,
   Copy,
   Layers,
@@ -85,9 +84,15 @@ export function ContextPanel() {
     [activeSessionId, sessionStates]
   );
   const artifactPaths = useMemo(() => collectArtifactPaths(steps, messages), [steps, messages]);
-  const messageCount = messages.length;
-  const toolCallCount = steps.filter((s) => s.type === 'tool_call').length;
-  const modelName = activeSession?.model || appConfig?.model || '—';
+  const activeConfigSet = appConfig?.configSets?.find(
+    (set) => set.id === appConfig.activeConfigSetId
+  );
+  const activeConfigSetModel = activeConfigSet
+    ? activeConfigSet.profiles[activeConfigSet.activeProfileKey]?.model
+    : undefined;
+  const modelName = activeConfigSet
+    ? `${activeConfigSet.name}：${activeConfigSetModel || '—'}`
+    : activeSession?.model || appConfig?.model || '—';
 
   // Token usage aggregation
   const tokenUsage = useMemo(() => {
@@ -236,6 +241,42 @@ export function ContextPanel() {
     }));
   }, [artifactPaths, currentWorkingDir]);
 
+  // Only show artifacts that actually exist on disk. Text scans can produce
+  // phantom candidates (URLs, code samples, example filenames); existence
+  // checking keeps the panel to real deliverables.
+  const [existingArtifacts, setExistingArtifacts] = useState<
+    Array<{ label: string; path: string }>
+  >([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const checkExistence = async () => {
+      if (!window.electronAPI?.artifacts?.checkPaths) {
+        setExistingArtifacts(displayArtifacts);
+        return;
+      }
+      try {
+        const paths = displayArtifacts.map((a) => a.path);
+        const existing = await window.electronAPI.artifacts.checkPaths(
+          paths,
+          currentWorkingDir ?? undefined
+        );
+        if (cancelled) return;
+        const existingSet = new Set(existing);
+        setExistingArtifacts(displayArtifacts.filter((a) => existingSet.has(a.path)));
+      } catch (error) {
+        console.error('Failed to check artifact paths:', error);
+        if (!cancelled) {
+          setExistingArtifacts(displayArtifacts);
+        }
+      }
+    };
+    void checkExistence();
+    return () => {
+      cancelled = true;
+    };
+  }, [displayArtifacts, currentWorkingDir]);
+
   useEffect(() => {
     if (contextPanelCollapsed) {
       return;
@@ -292,19 +333,11 @@ export function ContextPanel() {
           </div>
           <div className="flex items-center gap-3 text-xs text-text-muted pl-5">
             <span className="flex items-center gap-1">
-              <MessageSquare className="w-3 h-3" />
-              {messageCount}
+              {t('context.inputTokens')} {formatTokenCount(tokenUsage.input)}
             </span>
             <span className="flex items-center gap-1">
-              <Wrench className="w-3 h-3" />
-              {toolCallCount}
+              {t('context.outputTokens')} {formatTokenCount(tokenUsage.output)}
             </span>
-            {tokenUsage.total > 0 && (
-              <span className="ml-auto text-text-muted/70">
-                {t('context.inputTokens')} {formatTokenCount(tokenUsage.input)} ·{' '}
-                {t('context.outputTokens')} {formatTokenCount(tokenUsage.output)}
-              </span>
-            )}
           </div>
         </div>
       )}
@@ -361,14 +394,14 @@ export function ContextPanel() {
 
         {artifactsOpen && (
           <div className="pb-2 max-h-64 overflow-y-auto">
-            {displayArtifacts.length === 0 ? (
+            {existingArtifacts.length === 0 ? (
               <div className="flex items-center gap-2 px-4 py-2 text-xs text-text-muted">
                 <Layers className="w-3.5 h-3.5 shrink-0" />
                 <span>{t('context.noArtifactsYet')}</span>
               </div>
             ) : (
               <div>
-                {displayArtifacts.map((artifact, index) => {
+                {existingArtifacts.map((artifact, index) => {
                   const label = artifact.label || t('context.fileCreated');
                   const artifactPath = artifact.path;
                   const canClick = Boolean(artifactPath && canShowItemInFolder);

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
@@ -9,11 +9,11 @@ import {
   BarChart3,
   FolderOpen,
   ArrowRight,
-  Mail,
   X,
   Paperclip,
-  BookOpen,
-  FileSearch,
+  Cpu,
+  ChevronDown,
+  Check,
 } from 'lucide-react';
 
 type AttachedFile = {
@@ -39,12 +39,54 @@ export function WelcomeView() {
   const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { startSession, changeWorkingDir, isElectron } = useIPC();
+  const appConfig = useAppStore((state) => state.appConfig);
+  const setAppConfig = useAppStore((state) => state.setAppConfig);
+  const setIsConfigured = useAppStore((state) => state.setIsConfigured);
   const workingDir = useAppStore((state) => state.workingDir);
   const setGlobalNotice = useAppStore((state) => state.setGlobalNotice);
   const isConfigured = useAppStore((state) => state.isConfigured);
   const setShowSettings = useAppStore((state) => state.setShowSettings);
   const setSettingsTab = useAppStore((state) => state.setSettingsTab);
   const canSubmit = prompt.trim().length > 0 || pastedImages.length > 0 || attachedFiles.length > 0;
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const quickSwitchModels = useMemo(() => {
+    return (appConfig?.configSets ?? []).map((set) => {
+      const activeProfile = set.profiles[set.activeProfileKey];
+      const modelName =
+        activeProfile?.model ||
+        set.profiles.anthropic?.model ||
+        set.profiles.openai?.model ||
+        set.profiles.gemini?.model ||
+        t('chat.noModel');
+      return {
+        id: set.id,
+        label: `${set.name || t('chat.noConfigSet')}：${modelName}`,
+      };
+    });
+  }, [appConfig?.configSets, t]);
+  const activeModelLabel =
+    quickSwitchModels.find((item) => item.id === appConfig?.activeConfigSetId)?.label ||
+    t('chat.noConfigSet');
+
+  const handleModelSwitch = async (setId: string) => {
+    if (!isElectron || !window.electronAPI) {
+      setModelMenuOpen(false);
+      return;
+    }
+    try {
+      const { config } = await window.electronAPI.config.switchSet({ id: setId });
+      setAppConfig(config);
+      setIsConfigured(Boolean(config.isConfigured));
+    } catch (error) {
+      setGlobalNotice({
+        id: `notice-model-switch-${Date.now()}`,
+        type: 'error',
+        message: error instanceof Error ? error.message : '切换方案失败，请稍后重试',
+      });
+    } finally {
+      setModelMenuOpen(false);
+    }
+  };
 
   const handleSelectFolder = async () => {
     try {
@@ -415,27 +457,6 @@ export function WelcomeView() {
       icon: FolderOpen,
       prompt: t('welcome.quickPromptOrganize'),
     },
-    {
-      id: 'email',
-      label: t('welcome.checkEmails'),
-      icon: Mail,
-      prompt: t('welcome.quickPromptEmail'),
-      requiresChrome: true,
-    },
-    {
-      id: 'papers',
-      label: t('welcome.searchPapers'),
-      icon: BookOpen,
-      prompt: t('welcome.quickPromptPapers'),
-      requiresChrome: true,
-    },
-    {
-      id: 'research-notion',
-      label: t('welcome.summarizePapersToNotion'),
-      icon: FileSearch,
-      prompt: t('welcome.quickPromptNotion'),
-      requiresNotion: true,
-    },
   ];
 
   return (
@@ -478,19 +499,14 @@ export function WelcomeView() {
         )}
 
         {/* Quick Action Tags */}
-        <div className="flex flex-wrap gap-2 justify-center px-3">
+        <div className="flex flex-wrap gap-2.5 justify-center px-3">
           {quickTags.map((tag) => (
             <button
               key={tag.id}
               onClick={() => handleTagClick(tag.id, tag.prompt)}
-              className={`inline-flex items-center gap-2 rounded-full border px-3 py-2 text-sm transition-colors ${
+              className={`inline-flex items-center gap-2.5 rounded-full border border-border-subtle bg-background/65 px-4 py-2.5 text-sm text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary ${
                 selectedTag === tag.id
-                  ? 'border-accent/30 bg-accent-muted text-accent'
-                  : 'border-border-subtle bg-background/65 text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-              } ${
-                ('requiresChrome' in tag && tag.requiresChrome) ||
-                ('requiresNotion' in tag && tag.requiresNotion)
-                  ? 'relative'
+                  ? '!border-accent/30 !bg-accent-muted !text-accent'
                   : ''
               }`}
             >
@@ -498,16 +514,6 @@ export function WelcomeView() {
                 className={`w-4 h-4 ${selectedTag === tag.id ? 'text-accent' : 'text-text-muted'}`}
               />
               <span>{tag.label}</span>
-              {'requiresChrome' in tag && tag.requiresChrome && (
-                <span className="ml-1 px-1.5 py-px text-[9px] rounded bg-surface-active text-text-muted">
-                  {t('welcome.chromeRequired')}
-                </span>
-              )}
-              {'requiresNotion' in tag && tag.requiresNotion && (
-                <span className="ml-1 px-1.5 py-px text-[9px] rounded bg-surface-active text-text-muted">
-                  {t('welcome.notionRequired')}
-                </span>
-              )}
             </button>
           ))}
         </div>
@@ -599,8 +605,8 @@ export function WelcomeView() {
           />
 
           {/* Bottom Actions */}
-          <div className="flex items-center justify-between pt-3 border-t border-border-muted">
-            <div className="flex items-center gap-3">
+          <div className="flex items-center justify-between pt-3 border-t border-border-muted gap-3">
+            <div className="flex items-center gap-3 min-w-0">
               <button
                 type="button"
                 onClick={handleSelectFolder}
@@ -612,7 +618,7 @@ export function WelcomeView() {
                 title={workingDir || t('welcome.selectWorkingFolder')}
               >
                 <FolderOpen className="w-4 h-4" />
-                <span>
+                <span className="truncate">
                   {workingDir
                     ? workingDir.endsWith('default_working_dir')
                       ? t('welcome.defaultWorkingDir')
@@ -633,14 +639,57 @@ export function WelcomeView() {
               )}
             </div>
 
-            <button
-              type="submit"
-              disabled={!canSubmit || isSubmitting}
-              className="btn btn-primary px-5 py-2.5 rounded-2xl disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <span>{isSubmitting ? t('welcome.starting') : t('welcome.letsGo')}</span>
-              <ArrowRight className="w-4 h-4" />
-            </button>
+            <div className="flex items-center gap-2 shrink-0 relative">
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setModelMenuOpen((open) => !open)}
+                  disabled={quickSwitchModels.length === 0}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-border-subtle bg-background/60 px-3 py-2 text-xs text-text-muted transition-colors hover:bg-surface-hover hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
+                  title={t('chat.switchModel')}
+                >
+                  <Cpu className="w-3.5 h-3.5" />
+                  <span className="max-w-[220px] truncate">{activeModelLabel}</span>
+                  <ChevronDown className="w-3 h-3 shrink-0" />
+                </button>
+                {modelMenuOpen && quickSwitchModels.length > 0 && (
+                  <div className="absolute bottom-full right-0 z-50 mb-2 w-72 overflow-hidden rounded-xl border border-border bg-background shadow-elevated">
+                    <div className="border-b border-border-muted px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-text-muted">
+                      {t('chat.switchModel')}
+                    </div>
+                    <div className="max-h-60 overflow-y-auto py-1">
+                      {quickSwitchModels.map((item) => {
+                        const isActive = item.id === appConfig?.activeConfigSetId;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => void handleModelSwitch(item.id)}
+                            className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+                              isActive
+                                ? 'bg-accent/10 text-accent'
+                                : 'text-text-primary hover:bg-surface-hover'
+                            }`}
+                          >
+                            <span className="flex-1 truncate">{item.label}</span>
+                            {isActive && <Check className="h-3.5 w-3.5 shrink-0" />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <button
+                type="submit"
+                disabled={!canSubmit || isSubmitting}
+                className="btn btn-primary px-5 py-2.5 rounded-2xl disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span>{isSubmitting ? t('welcome.starting') : t('welcome.letsGo')}</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         </form>
       </div>

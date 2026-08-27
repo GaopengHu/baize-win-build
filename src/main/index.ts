@@ -1485,6 +1485,57 @@ ipcMain.handle(
   }
 );
 
+ipcMain.handle(
+  'artifacts.checkPaths',
+  async (_event, paths: string[], cwd?: string) => {
+    if (!Array.isArray(paths) || paths.length === 0) {
+      return [];
+    }
+    const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
+    const existing: string[] = [];
+
+    for (const raw of paths) {
+      if (typeof raw !== 'string' || !raw.trim()) {
+        continue;
+      }
+      let normalized = raw.trim();
+
+      if (
+        !isAbsolute(normalized) &&
+        !isWindowsDrivePath(normalized) &&
+        !isUncPath(normalized)
+      ) {
+        normalized = resolve(baseDir, normalized);
+      }
+
+      if (
+        normalized.startsWith('/workspace/') ||
+        /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalized)
+      ) {
+        const relativePart = normalized.startsWith('/workspace/')
+          ? normalized.slice('/workspace/'.length)
+          : normalized.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
+        normalized = resolve(baseDir, relativePart);
+      }
+
+      if (!isUncPath(normalized)) {
+        normalized = resolve(normalized);
+      }
+
+      try {
+        const stat = fs.statSync(normalized);
+        if (stat.isFile()) {
+          existing.push(normalized);
+        }
+      } catch {
+        // Path does not exist — not a deliverable, skip.
+      }
+    }
+
+    return existing;
+  }
+);
+
 ipcMain.handle('dialog.selectFiles', async () => {
   const result = await dialog.showOpenDialog({
     properties: ['openFile', 'multiSelections'],
@@ -2007,13 +2058,43 @@ ipcMain.on('window.close', () => {
 });
 
 // Sandbox IPC handlers
-ipcMain.handle('sandbox.getStatus', async () => {
+ipcMain.handle('sandbox.getStatus', async (_event, options?: { forceFresh?: boolean }) => {
   try {
     const adapter = getSandboxAdapter();
     const platform = process.platform;
 
+    if (options?.forceFresh) {
+      // Explicit refresh from the settings page - always run a fresh probe.
+      if (platform === 'win32') {
+        const wslStatus = await WSLBridge.checkWSLStatus();
+        return {
+          platform: 'win32',
+          mode: adapter.initialized ? adapter.mode : 'none',
+          initialized: adapter.initialized,
+          wsl: wslStatus,
+          lima: null,
+        };
+      }
+      if (platform === 'darwin') {
+        const limaStatus = await LimaBridge.checkLimaStatus();
+        return {
+          platform: 'darwin',
+          mode: adapter.initialized ? adapter.mode : 'native',
+          initialized: adapter.initialized,
+          wsl: null,
+          lima: limaStatus,
+        };
+      }
+    }
+
+    // Default path: reuse the bootstrap result (which serves from the
+    // persisted cache on subsequent launches) instead of running a duplicate
+    // full WSL/Lima probe every time the sandbox settings page is opened.
+    const bootstrap = getSandboxBootstrap();
+    const bootstrapResult = await bootstrap.bootstrap();
+
     if (platform === 'win32') {
-      const wslStatus = await WSLBridge.checkWSLStatus();
+      const wslStatus = bootstrapResult.wslStatus || { available: false };
       return {
         platform: 'win32',
         mode: adapter.initialized ? adapter.mode : 'none',
@@ -2022,7 +2103,7 @@ ipcMain.handle('sandbox.getStatus', async () => {
         lima: null,
       };
     } else if (platform === 'darwin') {
-      const limaStatus = await LimaBridge.checkLimaStatus();
+      const limaStatus = bootstrapResult.limaStatus || { available: false };
       return {
         platform: 'darwin',
         mode: adapter.initialized ? adapter.mode : 'native',

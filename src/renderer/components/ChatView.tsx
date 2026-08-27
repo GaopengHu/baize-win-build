@@ -18,7 +18,19 @@ import { ProcessPanel } from './message/ProcessPanel';
 import { ContentBlockView } from './message/ContentBlockView';
 import { normalizeAssistantBlocks } from '../utils/content-block-partition';
 import type { Message, ContentBlock } from '../types';
-import { Send, Square, Plus, Loader2, Plug, X, Clock, ChevronDown, Check, Cpu } from 'lucide-react';
+import {
+  Send,
+  Square,
+  Plus,
+  Loader2,
+  Plug,
+  X,
+  Clock,
+  ChevronDown,
+  ChevronRight,
+  Check,
+  Cpu,
+} from 'lucide-react';
 
 type AttachedFile = {
   name: string;
@@ -28,12 +40,9 @@ type AttachedFile = {
   inlineDataBase64?: string;
 };
 
-// Quick-switch model entries shown in the chat input dropdown.
-// Model IDs mirror the actual API model identifiers (e.g. OpenRouter slugs).
-const QUICK_SWITCH_MODELS: Array<{ id: string; label: string }> = [
-  { id: 'DS/DeepSeek-V4-Flash', label: 'DeepSeek V4 Flash' },
-  { id: 'Qwen/Qwen3.6-27B', label: 'Qwen3.6 27B' },
-];
+// Model quick-switch entries shown in the chat input dropdown.
+// Populated from the configured config sets (see useAppConfig configSets).
+type QuickSwitchModel = { id: string; label: string };
 
 type Round = {
   userMessage: Message | null;
@@ -82,6 +91,30 @@ export function ChatView() {
   const appConfig = useAppConfig();
   const setGlobalNotice = useAppStore((s) => s.setGlobalNotice);
   const { continueSession, stopSession, isElectron } = useIPC();
+
+  // Model quick-switch entries populated from the configured config sets.
+  // Each config set is a fully configured model profile (provider, key, url...).
+  const quickSwitchModels = useMemo<QuickSwitchModel[]>(() => {
+    const sets = appConfig?.configSets ?? [];
+    const list: QuickSwitchModel[] = sets.map((set) => {
+      const activeProfile = set.profiles[set.activeProfileKey];
+      const modelLabel =
+        activeProfile?.model ||
+        set.profiles.anthropic?.model ||
+        set.profiles.openai?.model ||
+        set.profiles.gemini?.model ||
+        '';
+      const schemeName = set.name.trim() || t('chat.noConfigSet');
+      const resolvedModel = modelLabel || t('chat.noModel');
+      return {
+        id: set.id,
+        label: `${schemeName}：${resolvedModel}`,
+      };
+    });
+    return list;
+  }, [appConfig?.configSets, t]);
+
+  const activeConfigSetId = appConfig?.activeConfigSetId;
   const [prompt, setPrompt] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [inputHeight, setInputHeight] = useState(56);
@@ -98,12 +131,13 @@ export function ChatView() {
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const { size: inputBoxSize, startResize } = useResizablePanel({
+  const inputBoxMaxWidth = 1320;
+  const { size: inputBoxSize, setSize: setInputBoxSize, startResize } = useResizablePanel({
     defaultWidth: 920,
     defaultHeight: 180,
     minWidth: 640,
     minHeight: 150,
-    maxWidth: 1320,
+    maxWidth: inputBoxMaxWidth,
     maxHeight: 360,
   });
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -123,6 +157,15 @@ export function ChatView() {
   const pendingCount = pendingTurns.length;
   const isSessionRunning = activeSession?.status === 'running';
   const canStop = isSessionRunning || hasActiveTurn || pendingCount > 0;
+
+  useEffect(() => {
+    // When switching sessions, restore the input capsule to its widest
+    // comfortable size so the composer looks balanced by default.
+    setInputBoxSize((prev) => ({
+      ...prev,
+      width: inputBoxMaxWidth,
+    }));
+  }, [activeSessionId, setInputBoxSize]);
 
   const displayedMessages = useMemo(() => {
     if (!activeSessionId) return messages;
@@ -619,13 +662,13 @@ export function ChatView() {
     };
   }, [modelMenuOpen]);
 
-  // Persist a model switch into the active config set through the same
-  // config.save pipeline used by the API settings modal.
+  // Switch to a different config set (model profile) by calling the
+  // config.switchSet IPC handler, which persists the active set id.
   const handleModelSwitch = useCallback(
-    async (modelId: string) => {
+    async (setId: string) => {
       if (isElectron && typeof window !== 'undefined' && window.electronAPI) {
         try {
-          const { config } = await window.electronAPI.config.save({ model: modelId });
+          const { config } = await window.electronAPI.config.switchSet({ id: setId });
           useAppStore.getState().setAppConfig(config);
           useAppStore.getState().setIsConfigured(Boolean(config.isConfigured));
         } catch (err) {
@@ -640,7 +683,7 @@ export function ChatView() {
       }
       setModelMenuOpen(false);
     },
-    [isElectron, t]
+    [isElectron]
   );
 
   // Load active MCP connectors
@@ -769,8 +812,232 @@ export function ChatView() {
 
   if (!activeSession) {
     return (
-      <div className="flex-1 flex items-center justify-center text-text-muted">
-        <span>{t('chat.loadingConversation')}</span>
+      <div className="flex-1 flex items-center justify-center bg-background px-5">
+        <div className="w-full max-w-[980px] space-y-8">
+          <div className="flex flex-col items-center justify-center text-center space-y-5 pt-10">
+            <div className="space-y-2">
+              <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">今点通</p>
+              <p className="text-3xl font-semibold tracking-[-0.04em] text-text-primary">
+                {t('welcome.title')}
+              </p>
+              <p className="text-sm text-text-muted">{t('chat.startConversation')}</p>
+            </div>
+          </div>
+
+          <div className="border-t border-border-muted bg-background/92 backdrop-blur-md rounded-[2rem] shadow-soft p-4 lg:p-5">
+            <div
+              className="mx-auto relative flex flex-col"
+              style={{
+                width: `${inputBoxSize.width}px`,
+                maxWidth: '100%',
+                minHeight: `${Math.max(inputHeight, inputBoxSize.height)}px`,
+              }}
+            >
+              <div className="relative w-full flex-1 flex flex-col">
+                <div
+                  className={`relative flex items-end gap-2 p-3.5 rounded-[1.75rem] bg-background/88 border border-border-muted shadow-soft transition-colors ${
+                    isDragging ? 'ring-2 ring-accent bg-accent/5' : ''
+                  }`}
+                >
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('x', -1)(e);
+                    }}
+                    className="absolute top-2 bottom-2 -left-1.5 w-2 cursor-ew-resize group/handle"
+                    title={t('chat.resizeWidth') || 'Drag to resize width'}
+                  >
+                    <div className="absolute inset-y-0 left-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('x', 1)(e);
+                    }}
+                    className="absolute top-2 bottom-2 -right-1.5 w-2 cursor-ew-resize group/handle"
+                    title={t('chat.resizeWidth') || 'Drag to resize width'}
+                  >
+                    <div className="absolute inset-y-0 right-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('y', -1)(e);
+                    }}
+                    className="absolute -top-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                    title={t('chat.resizeHeight') || 'Drag to resize height'}
+                  >
+                    <div className="absolute inset-x-0 top-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('y', 1)(e);
+                    }}
+                    className="absolute -bottom-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                    title={t('chat.resizeHeight') || 'Drag to resize height'}
+                  >
+                    <div className="absolute inset-x-0 bottom-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleFileSelect}
+                    className="w-9 h-9 rounded-2xl flex items-center justify-center text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
+                    title={t('welcome.attachFiles')}
+                  >
+                    <Plus className="w-5 h-5" />
+                  </button>
+
+                  <textarea
+                    ref={textareaRef}
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    style={{ minHeight: '24px', maxHeight: '180px' }}
+                    onCompositionStart={() => {
+                      isComposingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                      isComposingRef.current = false;
+                    }}
+                    onPaste={handlePaste}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        if (e.nativeEvent.isComposing || isComposingRef.current) return;
+                        e.preventDefault();
+                        handleSubmit();
+                      }
+                    }}
+                    placeholder={t('welcome.placeholder')}
+                    disabled={isSubmitting}
+                    rows={1}
+                    className="flex-1 resize-none bg-transparent border-none outline-none text-text-primary placeholder:text-text-muted text-[15px] py-2"
+                  />
+
+                  <div className="flex items-center gap-2">
+                    <div className="relative" ref={modelMenuRef}>
+                      <button
+                        type="button"
+                        onClick={() => setModelMenuOpen((v) => !v)}
+                        className="hidden sm:inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-border-subtle bg-background/60 text-xs text-text-muted hover:bg-surface-hover hover:text-text-primary transition-colors"
+                        title={t('chat.switchModel') || 'Switch model'}
+                      >
+                        <Cpu className="w-3 h-3" />
+                        <span className="max-w-[120px] truncate">
+                          {quickSwitchModels.find((item) => item.id === activeConfigSetId)?.label ||
+                            t('chat.noConfigSet')}
+                        </span>
+                        <ChevronDown className="w-3 h-3 shrink-0" />
+                      </button>
+                      {modelMenuOpen && (
+                        <div className="absolute bottom-full mb-2 right-0 w-64 bg-background border border-border rounded-xl shadow-elevated overflow-hidden z-50">
+                          <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-text-muted border-b border-border-muted">
+                            {t('chat.switchModel') || 'Switch model'}
+                          </div>
+                          <div className="py-1 max-h-60 overflow-y-auto">
+                            {quickSwitchModels.map((m) => {
+                              const isActive = activeConfigSetId === m.id;
+                              return (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  onClick={() => handleModelSwitch(m.id)}
+                                  className={`w-full text-left px-3 py-2 flex items-center gap-2 text-sm transition-colors ${
+                                    isActive
+                                      ? 'bg-accent/10 text-accent'
+                                      : 'text-text-primary hover:bg-surface-hover'
+                                  }`}
+                                >
+                                  <span className="flex-1 truncate">{m.label}</span>
+                                  {isActive && <Check className="w-3.5 h-3.5 shrink-0" />}
+                                </button>
+                              );
+                            })}
+                            {appConfig?.configSets &&
+                              appConfig.configSets.length > 0 &&
+                              quickSwitchModels.length === 0 && (
+                                <div className="px-3 py-2 flex items-center gap-2 text-sm text-text-muted">
+                                  <span className="flex-1 truncate">{t('chat.noConfigSet')}</span>
+                                </div>
+                              )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleSubmit}
+                      disabled={
+                        (!prompt.trim() && pastedImages.length === 0 && attachedFiles.length === 0) ||
+                        isSubmitting
+                      }
+                      className="inline-flex items-center gap-2 rounded-full bg-accent px-4 py-2.5 text-white shadow-sm hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {isSubmitting ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <>
+                          {t('welcome.letsGo')}
+                          <ChevronRight className="w-4 h-4" />
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex items-center justify-between gap-3 px-1">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">
+                    <span className="hidden sm:inline">{t('welcome.defaultWorkingDir')}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {pastedImages.length > 0 && (
+              <div className="w-full max-w-[760px] flex flex-wrap gap-2 justify-center mx-auto">
+                {pastedImages.map((img, index) => (
+                  <div key={img.url} className="relative">
+                    <img
+                      src={img.url}
+                      alt={t('welcome.pastedImageAlt', { index: index + 1 })}
+                      className="h-16 w-16 rounded-lg object-cover border border-border-muted"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removeImage(index)}
+                      className="absolute -top-2 -right-2 rounded-full bg-background border border-border-muted p-1 text-text-muted hover:text-error"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {attachedFiles.length > 0 && (
+              <div className="w-full max-w-[760px] space-y-2 mx-auto">
+                {attachedFiles.map((file, index) => (
+                  <div
+                    key={file.path || `attached-file-${index}`}
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-muted border border-border group"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-text-primary truncate">{file.name}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeFile(index)}
+                      className="w-6 h-6 rounded-full bg-error/10 hover:bg-error/20 text-error flex items-center justify-center"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     );
   }
@@ -973,10 +1240,52 @@ export function ChatView() {
             )}
 
             <div
-              className={`flex items-end gap-2 p-3.5 rounded-[1.75rem] bg-background/88 border border-border-muted shadow-soft transition-colors ${
+              className={`relative flex items-end gap-2 p-3.5 rounded-[1.75rem] bg-background/88 border border-border-muted shadow-soft transition-colors ${
                 isDragging ? 'ring-2 ring-accent bg-accent/5' : ''
               }`}
             >
+              {/* Resize handles - anchored to the rounded input capsule */}
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('x', -1)(e);
+                }}
+                className="absolute top-2 bottom-2 -left-1.5 w-2 cursor-ew-resize group/handle"
+                title={t('chat.resizeWidth') || 'Drag to resize width'}
+              >
+                <div className="absolute inset-y-0 left-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('x', 1)(e);
+                }}
+                className="absolute top-2 bottom-2 -right-1.5 w-2 cursor-ew-resize group/handle"
+                title={t('chat.resizeWidth') || 'Drag to resize width'}
+              >
+                <div className="absolute inset-y-0 right-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('y', -1)(e);
+                }}
+                className="absolute -top-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                title={t('chat.resizeHeight') || 'Drag to resize height'}
+              >
+                <div className="absolute inset-x-0 top-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('y', 1)(e);
+                }}
+                className="absolute -bottom-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                title={t('chat.resizeHeight') || 'Drag to resize height'}
+              >
+                <div className="absolute inset-x-0 bottom-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+
               <button
                 type="button"
                 onClick={handleFileSelect}
@@ -1030,13 +1339,13 @@ export function ChatView() {
                     <ChevronDown className="w-3 h-3 shrink-0" />
                   </button>
                   {modelMenuOpen && (
-                    <div className="absolute bottom-full mb-2 right-0 w-56 bg-background border border-border rounded-xl shadow-elevated overflow-hidden z-50">
+                    <div className="absolute bottom-full mb-2 right-0 w-64 bg-background border border-border rounded-xl shadow-elevated overflow-hidden z-50">
                       <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-text-muted border-b border-border-muted">
                         {t('chat.switchModel') || 'Switch model'}
                       </div>
                       <div className="py-1 max-h-60 overflow-y-auto">
-                        {QUICK_SWITCH_MODELS.map((m) => {
-                          const isActive = appConfig?.model === m.id;
+                        {quickSwitchModels.map((m) => {
+                          const isActive = activeConfigSetId === m.id;
                           return (
                             <button
                               key={m.id}
@@ -1053,12 +1362,15 @@ export function ChatView() {
                             </button>
                           );
                         })}
-                        {/* Show the current model if it isn't one of the quick presets */}
-                        {appConfig?.model &&
-                          !QUICK_SWITCH_MODELS.some((m) => m.id === appConfig.model) && (
-                            <div className="px-3 py-2 flex items-center gap-2 text-sm text-text-muted border-t border-border-muted">
-                              <span className="flex-1 truncate">{appConfig.model}</span>
-                              <Check className="w-3.5 h-3.5 shrink-0" />
+                        {/* Fallback: show the current active config set if the config was
+                            loaded before configSets were initialized */}
+                        {appConfig?.configSets &&
+                          appConfig.configSets.length > 0 &&
+                          quickSwitchModels.length === 0 && (
+                            <div className="px-3 py-2 flex items-center gap-2 text-sm text-text-muted">
+                              <span className="flex-1 truncate">
+                                {appConfig.model || appConfig.activeConfigSetId}
+                              </span>
                             </div>
                           )}
                       </div>
@@ -1097,48 +1409,6 @@ export function ChatView() {
               {t('chat.disclaimer')}
             </p>
           </form>
-
-          {/* Resize handles */}
-          <div
-            onPointerDown={(e) => {
-              e.preventDefault();
-              startResize('x', -1)(e);
-            }}
-            className="absolute top-0 bottom-0 -left-1 w-2 cursor-ew-resize group/handle"
-            title={t('chat.resizeWidth') || 'Drag to resize width'}
-          >
-            <div className="absolute inset-y-0 left-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
-          </div>
-          <div
-            onPointerDown={(e) => {
-              e.preventDefault();
-              startResize('x', 1)(e);
-            }}
-            className="absolute top-0 bottom-0 -right-1 w-2 cursor-ew-resize group/handle"
-            title={t('chat.resizeWidth') || 'Drag to resize width'}
-          >
-            <div className="absolute inset-y-0 right-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
-          </div>
-          <div
-            onPointerDown={(e) => {
-              e.preventDefault();
-              startResize('y', -1)(e);
-            }}
-            className="absolute -top-1 left-2 right-2 h-2 cursor-ns-resize group/handle"
-            title={t('chat.resizeHeight') || 'Drag to resize height'}
-          >
-            <div className="absolute inset-x-0 top-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
-          </div>
-          <div
-            onPointerDown={(e) => {
-              e.preventDefault();
-              startResize('y', 1)(e);
-            }}
-            className="absolute -bottom-1 left-2 right-2 h-2 cursor-ns-resize group/handle"
-            title={t('chat.resizeHeight') || 'Drag to resize height'}
-          >
-            <div className="absolute inset-x-0 bottom-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
-          </div>
         </div>
       </div>
     </div>

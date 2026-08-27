@@ -157,6 +157,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       limit = 50
     ): Promise<Array<{ path: string; modifiedAt: number; size: number }>> =>
       ipcRenderer.invoke('artifacts.listRecentFiles', cwd, sinceMs, Math.min(limit, 500)),
+    checkPaths: (paths: string[], cwd?: string): Promise<string[]> =>
+      ipcRenderer.invoke('artifacts.checkPaths', paths, cwd),
   },
 
   // Config methods
@@ -257,7 +259,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Sandbox methods
   sandbox: {
-    getStatus: (): Promise<{
+    getStatus: (forceFresh = false): Promise<{
       platform: string;
       mode: string;
       initialized: boolean;
@@ -284,7 +286,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         claudeCodeAvailable?: boolean;
       };
       error?: string;
-    }> => ipcRenderer.invoke('sandbox.getStatus'),
+    }> => ipcRenderer.invoke('sandbox.getStatus', { forceFresh }),
     checkWSL: (): Promise<{
       available: boolean;
       distro?: string;
@@ -465,6 +467,7 @@ declare global {
           sinceMs: number,
           limit?: number
         ) => Promise<Array<{ path: string; modifiedAt: number; size: number }>>;
+        checkPaths: (paths: string[], cwd?: string) => Promise<string[]>;
       };
       config: {
         get: () => Promise<AppConfig>;
@@ -533,7 +536,7 @@ declare global {
         uninstall: (pluginId: string) => Promise<{ success: boolean }>;
       };
       sandbox: {
-        getStatus: () => Promise<{
+        getStatus: (forceFresh?: boolean) => Promise<{
           platform: string;
           mode: string;
           initialized: boolean;

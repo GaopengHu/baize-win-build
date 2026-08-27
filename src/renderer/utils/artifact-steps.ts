@@ -166,17 +166,42 @@ const FINAL_DELIVERABLE_EXTENSIONS = new Set([
   'gz',
 ]);
 
+// Patterns that indicate an automated/intermediate image (screenshots, renders, etc.).
+const SIDECAR_IMAGE_STEM_PREFIX = /^(slide|slides|chart|preview|tmp|temp|render|page|sheet|screenshot|screen|capture|snap)[-_\d]/i;
+const SIDECAR_IMAGE_STEM_SEGMENT = /(?:^|[-_])(slide|chart|preview|render|draft|temp|tmp|index|screenshot|screen|capture)(?:$|[-_])/i;
+// Directories that are never deliverable output.
+const TEMP_PATH_PATTERNS = [
+  /(?:^|[/\\])tmp[/\\]/i,
+  /(?:^|[/\\])\.tmp[/\\]/i,   // .tmp/ — session-manager copies attachments here
+  /(?:^|[/\\])temp[/\\]/i,
+  /AppData[/\\]Local[/\\]Temp/i,
+  /node_modules[/\\]/i,
+  /__pycache__[/\\]/i,
+  /\.git[/\\]/i,
+  /\.cowork-user-data[/\\]/i,
+];
+
 function isLikelySidecarArtifact(pathValue: string): boolean {
   const ext = getFileExtension(pathValue);
   const stem = getFileStem(pathValue).toLowerCase();
+  const normalized = pathValue.trim().replace(/\\/g, '/');
 
-  if (ext === 'html' || ext === 'htm') {
-    return /^(slide|slides|chart|preview|index|tmp|temp|output|export|render|draft)[-_\d]/i.test(stem)
-      || /(?:^|[-_])(slide|chart|preview|render|draft|temp|tmp|index)(?:$|[-_])/i.test(stem);
+  // Temp / tool-internal directories always win, regardless of extension.
+  // (Previously checked last, so html/image files inside .tmp/ slipped through.)
+  if (TEMP_PATH_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return true;
   }
 
+  // Intermediate render files (html previews for slides/charts).
+  if (ext === 'html' || ext === 'htm') {
+    return SIDECAR_IMAGE_STEM_PREFIX.test(stem)
+      || SIDECAR_IMAGE_STEM_SEGMENT.test(stem);
+  }
+
+  // Automated screenshots / render outputs for images.
   if (ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'svg' || ext === 'webp') {
-    return /^(slide|slides|chart|preview|tmp|temp|render|page|sheet)[-_\d]/i.test(stem);
+    return SIDECAR_IMAGE_STEM_PREFIX.test(stem)
+      || SIDECAR_IMAGE_STEM_SEGMENT.test(stem);
   }
 
   return false;
@@ -196,7 +221,27 @@ export function shouldDisplayArtifactPath(pathValue: string): boolean {
     return false;
   }
 
-  if (isLikelySidecarArtifact(pathValue)) {
+  const trimmed = pathValue.trim();
+  const normalized = trimmed.replace(/\\/g, '/');
+
+  // A URL is not a local deliverable (e.g. https://host/README.md).
+  if (normalized.includes('://') || /^www\./i.test(normalized)) {
+    return false;
+  }
+
+  // Filenames that contain CJK punctuation are almost certainly false
+  // positives from text scanning (e.g. "总结。docx").
+  if (/[\u3000-\u303f]/.test(trimmed)) {
+    return false;
+  }
+
+  // Office lock / editor temp files.
+  const stem = getFileStem(trimmed);
+  if (/^~\$/.test(stem) || /[~#]$/.test(stem)) {
+    return false;
+  }
+
+  if (isLikelySidecarArtifact(trimmed)) {
     return false;
   }
 

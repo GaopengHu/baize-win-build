@@ -94,7 +94,7 @@ export function SettingsSandbox() {
 
   async function loadStatus() {
     try {
-      const s = await window.electronAPI.sandbox.getStatus();
+      const s = await window.electronAPI.sandbox.getStatus(true);
       setStatus(s);
       setError(null);
     } catch (err) {
@@ -121,8 +121,9 @@ export function SettingsSandbox() {
         await window.electronAPI.sandbox.checkLima();
       }
 
-      // Get full status after check
-      const fullStatus = await window.electronAPI.sandbox.getStatus();
+      // Get full status after check - force a fresh probe since the user
+      // explicitly asked to re-check.
+      const fullStatus = await window.electronAPI.sandbox.getStatus(true);
       setStatus(fullStatus);
 
       setSuccess({ text: t('sandbox.statusRefreshed') });

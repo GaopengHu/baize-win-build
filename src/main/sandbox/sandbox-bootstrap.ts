@@ -4,8 +4,19 @@
  * Handles early sandbox initialization at app startup
  * Provides progress feedback to the renderer process
  * Caches status to avoid repeated slow checks
+ *
+ * Cache strategy:
+ *   After the first successful bootstrap, the WSL / Lima / native status is
+ *   persisted to a JSON file in userData.  On subsequent launches the
+ *   expensive platform checks (multiple WSL/lima subprocess spawns) are
+ *   skipped entirely and the cached result is reported as "ready"
+ *   immediately.  Calling reset() deletes the cache so the user can
+ *   force a re-check via the "retry" UI button.
  */
 
+import { app } from 'electron';
+import * as path from 'path';
+import * as fs from 'fs';
 import { log, logError } from '../utils/logger';
 import { WSLBridge } from './wsl-bridge';
 import { LimaBridge } from './lima-bridge';
@@ -40,6 +51,37 @@ export interface SandboxBootstrapResult {
 }
 
 type ProgressCallback = (progress: SandboxSetupProgress) => void;
+
+/**
+ * Persisted sandbox status cache.
+ * Written after a successful bootstrap so the next launch can skip the
+ * slow platform checks (WSL/Lima spawns) entirely.
+ */
+interface SandboxCacheEntry {
+  platform: NodeJS.Platform;
+  mode: 'wsl' | 'lima' | 'native';
+  wslStatus?: WSLStatus | null;
+  limaStatus?: LimaStatus | null;
+  verifiedAt: number;
+}
+
+const SANDBOX_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+
+function isWSLReady(status: WSLStatus | null | undefined): boolean {
+  return Boolean(
+    status?.available && status.nodeAvailable && status.pythonAvailable && status.pipAvailable
+  );
+}
+
+function isLimaReady(status: LimaStatus | null | undefined): boolean {
+  return Boolean(
+    status?.available &&
+      status.instanceRunning &&
+      status.nodeAvailable &&
+      status.pythonAvailable &&
+      status.pipAvailable
+  );
+}
 
 /**
  * Bootstrap sandbox environment at app startup
@@ -104,11 +146,119 @@ export class SandboxBootstrap {
     return this.result !== null;
   }
 
+  private getCacheFilePath(): string {
+    return path.join(app.getPath('userData'), 'sandbox-status-cache.json');
+  }
+
+  private loadCache(): SandboxCacheEntry | null {
+    try {
+      const filePath = this.getCacheFilePath();
+      if (!fs.existsSync(filePath)) {
+        return null;
+      }
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as SandboxCacheEntry;
+      if (typeof raw !== 'object' || raw === null || !raw.mode || !raw.platform) {
+        return null;
+      }
+      if (Date.now() - raw.verifiedAt > SANDBOX_CACHE_TTL_MS) {
+        log('[SandboxBootstrap] Sandbox cache expired, will re-check platform');
+        return null;
+      }
+      return raw;
+    } catch (error) {
+      log('[SandboxBootstrap] Failed to load sandbox cache:', error);
+      return null;
+    }
+  }
+
+  private saveCache(entry: SandboxCacheEntry): void {
+    try {
+      const filePath = this.getCacheFilePath();
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify(entry, null, 2), 'utf-8');
+      log('[SandboxBootstrap] Saved sandbox cache:', entry.mode);
+    } catch (error) {
+      log('[SandboxBootstrap] Failed to save sandbox cache:', error);
+    }
+  }
+
+  private clearCache(): void {
+    try {
+      const filePath = this.getCacheFilePath();
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        log('[SandboxBootstrap] Cleared sandbox cache');
+      }
+    } catch (error) {
+      log('[SandboxBootstrap] Failed to clear sandbox cache:', error);
+    }
+  }
+
+  /**
+   * Try to serve a valid cached bootstrap result so we can skip the slow
+   * WSL/Lima platform checks on subsequent launches.
+   *
+   * Returns null when there is no usable cache (first run, cache expired,
+   * platform changed, or the previous run did not finish successfully).
+   */
+  private async tryLoadCachedResult(): Promise<SandboxBootstrapResult | null> {
+    const cache = this.loadCache();
+    if (!cache || cache.platform !== process.platform) {
+      return null;
+    }
+
+    if (cache.mode === 'native') {
+      log('[SandboxBootstrap] Using cached native mode');
+      this.reportProgress({
+        phase: 'skipped',
+        message: 'Using native execution mode',
+        detail: 'Reusing previous sandbox check result',
+        progress: 100,
+      });
+      return { mode: 'native' };
+    }
+
+    if (cache.mode === 'wsl' && isWSLReady(cache.wslStatus)) {
+      const wslStatus = cache.wslStatus as WSLStatus;
+      this.cachedWSLStatus = wslStatus;
+      this.reportProgress({
+        phase: 'ready',
+        message: 'WSL2 sandbox ready',
+        detail: `Reusing previous check - Node.js ${wslStatus.version || 'installed'}`,
+        progress: 100,
+      });
+      return { mode: 'wsl', wslStatus };
+    }
+
+    if (cache.mode === 'lima' && isLimaReady(cache.limaStatus)) {
+      // The Lima VM can be stopped between app launches, so verify it is
+      // actually still running before trusting the cache. This is a fast
+      // `limactl list` check, not a full node/python probe.
+      const running = await LimaBridge.isInstanceRunning();
+      if (running) {
+        const limaStatus = cache.limaStatus as LimaStatus;
+        this.cachedLimaStatus = limaStatus;
+        this.reportProgress({
+          phase: 'ready',
+          message: 'Lima sandbox ready',
+          detail: `Reusing previous check - Node.js ${limaStatus.version || 'installed'}`,
+          progress: 100,
+        });
+        return { mode: 'lima', limaStatus };
+      }
+      log('[SandboxBootstrap] Lima cache found but VM is not running, re-checking...');
+      return null;
+    }
+
+    return null;
+  }
+
   reset(): void {
     this.setupPromise = null;
     this.result = null;
     this.cachedWSLStatus = null;
     this.cachedLimaStatus = null;
+    this.clearCache();
   }
 
   /**
@@ -152,11 +302,20 @@ export class SandboxBootstrap {
       return { mode: 'native' };
     }
 
+    // Fast path: reuse the persisted status so the slow WSL/Lima checks
+    // (multiple subprocess spawns that can take 30+ seconds) are skipped
+    // on every launch after the first successful setup.
+    const cached = await this.tryLoadCachedResult();
+    if (cached) {
+      return cached;
+    }
+
     try {
+      let result: SandboxBootstrapResult;
       if (platform === 'win32') {
-        return await this.bootstrapWSL();
+        result = await this.bootstrapWSL();
       } else if (platform === 'darwin') {
-        return await this.bootstrapLima();
+        result = await this.bootstrapLima();
       } else {
         // Linux - native mode
         this.reportProgress({
@@ -165,8 +324,20 @@ export class SandboxBootstrap {
           detail: 'Linux runs commands directly',
           progress: 100,
         });
-        return { mode: 'native' };
+        result = { mode: 'native' };
       }
+
+      // Persist the successful result for the next launch
+      if (!result.error) {
+        this.saveCache({
+          platform,
+          mode: result.mode,
+          wslStatus: result.wslStatus || null,
+          limaStatus: result.limaStatus || null,
+          verifiedAt: Date.now(),
+        });
+      }
+      return result;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       logError('[SandboxBootstrap] Bootstrap failed:', error);
