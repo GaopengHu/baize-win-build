@@ -560,6 +560,7 @@ export interface Settings {
   globalSkillsPath: string;
   memoryStrategy: 'auto' | 'manual' | 'rolling';
   maxContextTokens: number;
+  fontScale: number;
 }
 
 // Tool types

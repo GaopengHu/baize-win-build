@@ -124,11 +124,15 @@ export function ApiConfigSetManager(props: ApiConfigSetManagerProps) {
             disabled={isMutatingConfigSet || hasDialogOpen}
             className="w-full px-3 py-2.5 rounded-lg bg-background border border-border-muted text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent disabled:opacity-60"
           >
-            {configSets.map((set) => (
-              <option key={set.id} value={set.id}>
-                {set.isSystem ? `${set.name} (${t('api.defaultSetTag')})` : set.name}
-              </option>
-            ))}
+            {configSets.map((set) => {
+              const profile = set.profiles[set.activeProfileKey];
+              const modelName = profile?.model || t('api.noModelsAvailable', '未配置');
+              return (
+                <option key={set.id} value={set.id}>
+                  {set.name}：{modelName}{set.isSystem ? ` (${t('api.defaultSetTag')})` : ''}
+                </option>
+              );
+            })}
           </select>
         )}
         {isInlineRenaming && (

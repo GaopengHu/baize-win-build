@@ -50,6 +50,10 @@ type TabId =
   | 'logs'
   | 'general';
 
+// Tabs kept functional but hidden from the settings sidebar.
+// They remain reachable programmatically (e.g. via nav-server __navigate).
+const HIDDEN_TABS = new Set<TabId>(['schedule', 'remote']);
+
 const VALID_TABS = new Set<TabId>([
   'api',
   'sandbox',
@@ -158,6 +162,7 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
       description: t('settings.generalDesc'),
     },
   ];
+  const visibleTabs = tabs.filter((tab) => !HIDDEN_TABS.has(tab.id));
   const activeTabMeta = tabs.find((tab) => tab.id === activeTab);
 
   return (
@@ -178,7 +183,7 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
           </div>
         )}
         <div className={`flex-1 ${compactSidebar ? 'p-1.5 space-y-1' : 'p-3 space-y-1.5'}`}>
-          {tabs.map((tab) => (
+          {visibleTabs.map((tab) => (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}

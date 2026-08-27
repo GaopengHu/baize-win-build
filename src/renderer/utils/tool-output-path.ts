@@ -24,6 +24,33 @@ export function normalizeArtifactPathValue(value: string): string {
     .replace(/[.,;:!?]+$/, '');
 }
 
+/**
+ * Determine whether a match sits inside a URL token (e.g. https://host/a/b.md).
+ * We look at the text before the match: if the nearest `://` appears after the
+ * nearest whitespace/CJK punctuation boundary, the match belongs to a URL.
+ */
+function isInsideUrlToken(text: string, matchIndex: number, matchLength: number): boolean {
+  const before = text.slice(0, matchIndex);
+  const schemeIdx = before.lastIndexOf('://');
+  if (schemeIdx === -1) {
+    return false;
+  }
+  const boundaryChars = [' ', '\n', '\r', '\t', '，', '。', '、', '；', '：', '（', '）', '【', '】'];
+  let lastBoundary = -1;
+  for (const ch of boundaryChars) {
+    const idx = before.lastIndexOf(ch);
+    if (idx > lastBoundary) {
+      lastBoundary = idx;
+    }
+  }
+  // A trailing `)` / `>` / quote directly attached to the match also suggests a URL/link.
+  const after = text.slice(matchIndex + matchLength, matchIndex + matchLength + 1);
+  if (after === ')' || after === '>' || after === '"' || after === "'") {
+    return schemeIdx > lastBoundary;
+  }
+  return schemeIdx > lastBoundary;
+}
+
 export function extractFilePathFromToolOutput(toolOutput?: string): string | null {
   if (!toolOutput) {
     return null;
@@ -83,9 +110,17 @@ export function extractFilePathCandidatesFromText(text: string): string[] {
   }
 
   // Match file paths with Chinese filenames support.
-  // Captures: optional drive letter + path separators + filename with known extension
-  const pathLikeRegex = /(?:[A-Za-z]:[\\/]|[\\/][\w\u4e00-\u9fff\u3000-\u303f.\-_]+[\\/])*([\w\u4e00-\u9fff\u3000-\u303f.\-_]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/giu;
+  // Captures: optional drive letter + path separators + filename with known extension.
+  // NOTE: filename charset intentionally excludes CJK punctuation (U+3000-303F) so
+  // things like "总结。docx" or "要点、png" are never treated as files.
+  const pathLikeRegex = /(?:[A-Za-z]:[\\/]|[\\/][\w\u4e00-\u9fff.\-_]+[\\/])*([\w\u4e00-\u9fff.\-_]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/giu;
   for (const found of trimmed.matchAll(pathLikeRegex)) {
+    const index = typeof found.index === 'number' ? found.index : -1;
+    // Skip matches that live inside a URL token (e.g. https://host/README.md),
+    // otherwise URLs would produce phantom artifacts.
+    if (index >= 0 && isInsideUrlToken(trimmed, index, found[0].length)) {
+      continue;
+    }
     const value = found[0].trim();
     if (value) {
       candidates.add(normalizeArtifactPathValue(value));
