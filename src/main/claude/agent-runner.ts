@@ -2719,6 +2719,26 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), f
               }
 
               const msg = event.message;
+              // Defensive: drop malformed toolCall blocks (empty/missing name) from the
+              // LIVE SDK message. A model/gateway may return a tool call with an empty
+              // function name; if left in the conversation it (a) can never be executed
+              // ("Tool not found") and (b) is forwarded verbatim to the upstream gateway
+              // on the follow-up request, which 500s ('str' object has no attribute
+              // 'items'). Removing it here means the SDK's tool-execution filter
+              // (agent-loop) never sees it, so the turn continues cleanly and history
+              // stays free of the broken block. `event.message` is the same object
+              // instance held in the SDK session state, so mutating it takes effect
+              // before the agent-loop scans `message.content` for pending tool calls.
+              if (msg && Array.isArray((msg as { content?: unknown }).content)) {
+                const content = (msg as { content: Array<{ type?: string; name?: string }> })
+                  .content;
+                const filtered = content.filter(
+                  (b) => !(b && b.type === 'toolCall' && (!b.name || String(b.name).trim() === ''))
+                );
+                if (filtered.length !== content.length) {
+                  (msg as { content: unknown }).content = filtered;
+                }
+              }
               if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
                 log('[ClaudeAgentRunner] message_end raw message:', safeStringify(msg, 2));
               }

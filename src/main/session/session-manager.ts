@@ -1010,20 +1010,33 @@ export class SessionManager {
       const scriptExtensions = ['.py', '.sh', '.mjs', '.js', '.ts'];
       // Product extensions to preserve (final products)
       const productExtensions = [
-        '.docx', '.pptx', '.xlsx', '.pdf', '.md', '.txt', '.json', '.csv',
-        '.png', '.jpg', '.jpeg', '.gif', '.svg', '.html', '.css'
+        '.docx',
+        '.pptx',
+        '.xlsx',
+        '.pdf',
+        '.md',
+        '.txt',
+        '.json',
+        '.csv',
+        '.png',
+        '.jpg',
+        '.jpeg',
+        '.gif',
+        '.svg',
+        '.html',
+        '.css',
       ];
 
       const files = fs.readdirSync(workDir, { withFileTypes: true });
-      
+
       for (const file of files) {
         if (!file.isFile()) continue;
-        
+
         const ext = path.extname(file.name).toLowerCase();
-        
+
         // Skip if it's a product file
         if (productExtensions.includes(ext)) continue;
-        
+
         // Delete if it's a script file
         if (scriptExtensions.includes(ext)) {
           const filePath = path.join(workDir, file.name);
@@ -1155,7 +1168,7 @@ export class SessionManager {
       id: message.id,
       session_id: message.sessionId,
       role: message.role,
-      content: JSON.stringify(message.content),
+      content: JSON.stringify(this.sanitizeContentBlocks(message.content)),
       timestamp: message.timestamp,
       token_usage: message.tokenUsage ? JSON.stringify(message.tokenUsage) : null,
       execution_time_ms: message.executionTimeMs ?? null,
@@ -1190,7 +1203,7 @@ export class SessionManager {
       id: row.id,
       sessionId: row.session_id,
       role: row.role as Message['role'],
-      content: this.normalizeContent(row.content),
+      content: this.sanitizeContentBlocks(this.normalizeContent(row.content)),
       timestamp: row.timestamp,
       tokenUsage: row.token_usage ? JSON.parse(row.token_usage) : undefined,
       executionTimeMs: row.execution_time_ms ?? undefined,
@@ -1220,6 +1233,48 @@ export class SessionManager {
     } catch {
       return [{ type: 'text', text: raw } as TextContent];
     }
+  }
+
+  /**
+   * Drop malformed tool_use / tool_result blocks that cannot be validly replayed
+   * to the model. A tool_use with an empty/blank `name` or `id` (or a tool_result
+   * with an empty/blank `toolUseId`) is corruption produced when an upstream model
+   * returns a broken tool call. Once persisted it poisons every future turn of the
+   * conversation. We remove these blocks both when reading history (self-heal) and
+   * when writing (defense), so a single broken response never becomes permanent.
+   */
+  private sanitizeContentBlocks(blocks: ContentBlock[]): ContentBlock[] {
+    if (!Array.isArray(blocks) || blocks.length === 0) return blocks;
+    let changed = false;
+    const filtered = blocks.filter((b) => {
+      if (b.type === 'tool_use') {
+        const nameOk = typeof b.name === 'string' && b.name.trim().length > 0;
+        const idOk = typeof b.id === 'string' && b.id.trim().length > 0;
+        if (!nameOk || !idOk) {
+          changed = true;
+          return false;
+        }
+        return true;
+      }
+      if (b.type === 'tool_result') {
+        const idOk = typeof b.toolUseId === 'string' && b.toolUseId.trim().length > 0;
+        if (!idOk) {
+          changed = true;
+          return false;
+        }
+        return true;
+      }
+      return true;
+    });
+    if (!changed) return blocks;
+    if (filtered.length === 0) {
+      const note: TextContent = {
+        type: 'text',
+        text: '[此消息包含损坏的工具调用数据（名称为空），已在加载时自动清理]',
+      };
+      return [note];
+    }
+    return filtered;
   }
 
   getTraceSteps(sessionId: string): TraceStep[] {
