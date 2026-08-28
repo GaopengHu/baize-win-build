@@ -2,7 +2,7 @@
 /**
  * 今点通 macOS (.dmg) 安装包构建脚本
  *
- * 在 Linux 主机上交叉编译 macOS x64 + arm64 安装包。
+ * 在 Linux 主机上交叉编译 macOS x64 安装包。
  * 自动处理:
  *   - macOS 预编译 better-sqlite3 下载
  *   - electron-builder 镜像加速
@@ -138,37 +138,32 @@ async function main() {
   log('Writing platform config...');
   writePlatformConfig();
 
-  // 6. Run electron-builder for macOS (both architectures)
-  log('Running electron-builder (mac x64 + arm64)...');
+  // 6. Run electron-builder for macOS x64 only
+  log('Running electron-builder (mac x64)...');
   const env = {
     ...process.env,
     ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/',
-    ELECTRON_BUILDER_BINARIES_MIRROR: process.env.ELECTRON_BUILDER_BINARIES_MIRROR || 'https://npmmirror.com/mirrors/electron-builder-binaries/',
+    ELECTRON_BUILDER_BINARIES_MIRROR:
+      process.env.ELECTRON_BUILDER_BINARIES_MIRROR ||
+      'https://github.com/electron-userland/electron-builder-binaries/releases/download/',
   };
-  run('npx electron-builder --mac --x64 --arm64', { env, timeout: 1800000 });
+  run('npx electron-builder --mac --x64', { env, timeout: 1800000 });
 
   // 7. Verify DMGs
   const productName = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8')).productName;
   const version = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8')).version;
 
   const dmgX64 = resolve(ROOT, 'release', `${productName}-${version}-mac-x64.dmg`);
-  const dmgArm64 = resolve(ROOT, 'release', `${productName}-${version}-mac-arm64.dmg`);
-
   if (existsSync(dmgX64)) {
     await verifyDMG(dmgX64);
   } else {
-    log('x64 DMG not found (may be packaged in universal)');
-  }
-
-  if (existsSync(dmgArm64)) {
-    await verifyDMG(dmgArm64);
-  } else {
-    log('arm64 DMG not found (may be packaged in universal)');
+    error('x64 DMG not found');
+    process.exit(1);
   }
 
   const elapsed = ((Date.now() - start) / 1000 / 60).toFixed(1);
   log(`Build complete in ${elapsed} min`);
-  log(`Output: release/${productName}-*-mac-*.dmg`);
+  log(`Output: release/${productName}-*-mac-x64.dmg`);
 }
 
 main().catch((err) => {
