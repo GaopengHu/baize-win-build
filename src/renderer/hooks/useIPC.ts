@@ -23,6 +23,10 @@ const isElectron = typeof window !== 'undefined' && window.electronAPI !== undef
 // listener, silently dropping subsequent events from main.
 let ipcListenerInstalled = false;
 
+// --- RAF batching buffers (module-level so useCallback can access) ---
+const pendingPartials: Record<string, string[]> = {};
+const pendingThinking: Record<string, string[]> = {};
+
 export function useIPC() {
   // Handle incoming server events - only setup once across all useIPC() callers.
   // See module-level `ipcListenerInstalled` guard above for the full reason.
@@ -43,10 +47,7 @@ export function useIPC() {
     console.log('[useIPC] Setting up IPC listener (once)');
 
     // --- RAF batching for high-frequency events ---
-    const pendingPartials: Record<string, string[]> = {};
     let partialRafId: number | null = null;
-
-    const pendingThinking: Record<string, string[]> = {};
     let thinkingRafId: number | null = null;
 
     const flushPartials = () => {
@@ -146,6 +147,10 @@ export function useIPC() {
               store.clearActiveTurn(event.payload.sessionId);
               store.clearPendingTurns(event.payload.sessionId);
               store.clearQueuedMessages(event.payload.sessionId);
+              delete pendingPartials[event.payload.sessionId];
+              delete pendingThinking[event.payload.sessionId];
+              store.clearPartialMessage(event.payload.sessionId);
+              store.clearPartialThinking(event.payload.sessionId);
             }
             break;
 
@@ -610,6 +615,12 @@ export function useIPC() {
         return;
       }
 
+      // Clear stale streaming buffers from previous aborted turns
+      delete pendingPartials[sessionId];
+      delete pendingThinking[sessionId];
+      useAppStore.getState().clearPartialMessage(sessionId);
+      useAppStore.getState().clearPartialThinking(sessionId);
+
       // Electron mode - send to backend (user message already added above)
       // Immediately activate turn to show processing indicator while waiting for API
       if (!shouldQueue) {
@@ -655,6 +666,10 @@ export function useIPC() {
       clearPendingTurns(sessionId);
       clearActiveTurn(sessionId);
       finishExecutionClock(sessionId);
+      delete pendingPartials[sessionId];
+      delete pendingThinking[sessionId];
+      useAppStore.getState().clearPartialMessage(sessionId);
+      useAppStore.getState().clearPartialThinking(sessionId);
       if (!isElectron) {
         updateSession(sessionId, { status: 'idle' });
         setLoading(false);
