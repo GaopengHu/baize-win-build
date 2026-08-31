@@ -2,7 +2,7 @@
 /**
  * 今点通 macOS (.dmg) 安装包构建脚本
  *
- * 在 Linux 主机上交叉编译 macOS x64 + arm64 安装包。
+ * 在 Linux 主机上交叉编译 macOS x64 和 arm64 安装包。
  * 自动处理:
  *   - macOS 预编译 better-sqlite3 下载
  *   - electron-builder 镜像加速
@@ -138,37 +138,37 @@ async function main() {
   log('Writing platform config...');
   writePlatformConfig();
 
-  // 6. Run electron-builder for macOS (both architectures)
+  // 6. Build both macOS architectures. The per-arch resources are downloaded
+  //    above and electron-builder selects them through ${arch} in the config.
   log('Running electron-builder (mac x64 + arm64)...');
   const env = {
     ...process.env,
     ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/',
-    ELECTRON_BUILDER_BINARIES_MIRROR: process.env.ELECTRON_BUILDER_BINARIES_MIRROR || 'https://npmmirror.com/mirrors/electron-builder-binaries/',
+    ELECTRON_BUILDER_BINARIES_MIRROR:
+      process.env.ELECTRON_BUILDER_BINARIES_MIRROR ||
+      'https://github.com/electron-userland/electron-builder-binaries/releases/download/',
   };
   run('npx electron-builder --mac --x64 --arm64', { env, timeout: 1800000 });
 
-  // 7. Verify DMGs
+  // 7. Verify both DMGs
   const productName = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8')).productName;
   const version = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8')).version;
+  const dmgPaths = ['x64', 'arm64'].map((arch) =>
+    resolve(ROOT, 'release', `${productName}-${version}-mac-${arch}.dmg`),
+  );
 
-  const dmgX64 = resolve(ROOT, 'release', `${productName}-${version}-mac-x64.dmg`);
-  const dmgArm64 = resolve(ROOT, 'release', `${productName}-${version}-mac-arm64.dmg`);
-
-  if (existsSync(dmgX64)) {
-    await verifyDMG(dmgX64);
-  } else {
-    log('x64 DMG not found (may be packaged in universal)');
-  }
-
-  if (existsSync(dmgArm64)) {
-    await verifyDMG(dmgArm64);
-  } else {
-    log('arm64 DMG not found (may be packaged in universal)');
+  for (const dmgPath of dmgPaths) {
+    if (existsSync(dmgPath)) {
+      await verifyDMG(dmgPath);
+    } else {
+      error(`DMG not found: ${dmgPath}`);
+      process.exit(1);
+    }
   }
 
   const elapsed = ((Date.now() - start) / 1000 / 60).toFixed(1);
   log(`Build complete in ${elapsed} min`);
-  log(`Output: release/${productName}-*-mac-*.dmg`);
+  log(`Output: release/${productName}-*-mac-{x64,arm64}.dmg`);
 }
 
 main().catch((err) => {

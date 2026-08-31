@@ -20,7 +20,7 @@ const PLATFORMS = {
   },
 };
 
-const BASE_URL = 'https://nodejs.org/dist';
+const BASE_URL = process.env.NODEJS_DIST_URL || 'https://npmmirror.com/mirrors/node';
 const OUTPUT_DIR = path.join(__dirname, '..', 'resources', 'node');
 const DOWNLOAD_ALL_PLATFORMS = process.env.OPEN_COWORK_DOWNLOAD_ALL_NODE_BINARIES === '1';
 const WINDOWS_UNLINK_RETRY_COUNT = 8;

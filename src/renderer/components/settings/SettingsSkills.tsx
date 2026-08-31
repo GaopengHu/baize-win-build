@@ -9,7 +9,6 @@ import {
   Trash2,
   Plus,
   Loader2,
-  FolderOpen,
   Globe,
   RefreshCw,
   X,
@@ -252,37 +251,6 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
     }
   }
 
-  async function handleSelectStoragePath() {
-    try {
-      const folderPath = await window.electronAPI.invoke<string | null>({
-        type: 'folder.select',
-        payload: {},
-      });
-      if (!folderPath) return;
-
-      setIsLoading(true);
-      const result = await window.electronAPI.skills.setStoragePath(folderPath, true);
-      if (result.success) {
-        setStoragePath(result.path);
-        await loadSkills(true);
-        setError(null);
-        setSuccess({
-          text: t('skills.storagePathUpdated', {
-            migrated: result.migratedCount,
-            skipped: result.skippedCount,
-          }),
-        });
-        setTimeout(() => setSuccess(null), 5000);
-      }
-    } catch (err) {
-      setError({
-        text: err instanceof Error ? err.message : t('skills.storagePathUpdateFailed'),
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
   async function handleOpenStoragePath() {
     setIsLoading(true);
     try {
@@ -428,19 +396,11 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
         <div className="text-xs text-text-muted break-all">
           {storagePath || t('skills.storagePathUnavailable')}
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-          <button
-            onClick={handleSelectStoragePath}
-            disabled={isLoading}
-            className="w-full py-2.5 px-3 rounded-lg border border-border hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
-          >
-            <FolderOpen className="w-4 h-4" />
-            {t('skills.selectStoragePath')}
-          </button>
+        <div className="flex flex-wrap gap-2 justify-start">
           <button
             onClick={handleOpenStoragePath}
             disabled={isLoading}
-            className="w-full py-2.5 px-3 rounded-lg border border-border hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
+            className="py-2.5 px-4 rounded-lg border border-border hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
           >
             <Globe className="w-4 h-4" />
             {t('skills.openStoragePath')}
@@ -448,7 +408,7 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
           <button
             onClick={handleRefreshSkills}
             disabled={isLoading}
-            className="w-full py-2.5 px-3 rounded-lg border border-border hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
+            className="py-2.5 px-4 rounded-lg border border-border hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
           >
             <RefreshCw className="w-4 h-4" />
             {t('skills.refreshSkills')}

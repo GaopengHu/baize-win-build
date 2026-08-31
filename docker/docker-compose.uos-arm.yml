@@ -4,23 +4,8 @@
 # 使用命名卷隔离 ARM64 .node 二进制（与 x86_64 .node 不兼容）。
 # 构建产物直接写入宿主 release/ 目录。
 #
-# 宿主机预下载 ARM64 工具链 .deb（首次，网络较快的一次性操作）:
-#   mkdir -p .build-cache/debs-arm64 && cd .build-cache/debs-arm64
-#   apt-get download \
-#     gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-#     gcc-8-cross-base gcc-8-aarch64-linux-gnu-base cpp-8-aarch64-linux-gnu \
-#     cpp-aarch64-linux-gnu gcc-8-aarch64-linux-gnu g++-8-aarch64-linux-gnu \
-#     binutils-aarch64-linux-gnu binutils-common \
-#     libc6-arm64-cross libc6-dev-arm64-cross \
-#     libgcc1-arm64-cross libgcc-8-dev-arm64-cross \
-#     libstdc++6-arm64-cross libstdc++-8-dev-arm64-cross \
-#     libgomp1-arm64-cross libitm1-arm64-cross libatomic1-arm64-cross \
-#     libasan5-arm64-cross liblsan0-arm64-cross libtsan0-arm64-cross \
-#     libubsan1-arm64-cross linux-libc-dev-arm64-cross
-#   for f in *.deb; do mv "$f" "${f%.deb}.deb.txt"; done
-#
 # 用法:
-#   # 首次或 Docker 镜像更新后
+#   # 首次或 Docker 镜像更新后（apt 源为国内镜像，几分钟即可完成）
 #   docker-compose -f docker/docker-compose.uos-arm.yml build
 #
 #   # 构建（重复构建跳过镜像层，速度更快）
@@ -38,12 +23,16 @@ services:
     image: zhinengti-linux-builder:uos-arm
     container_name: zhinengti-linux-build-arm
     working_dir: /app
-    user: 1000:1000
+    # 用 root 运行，避免命名卷 /app/node_modules 与 bind mount 宿主目录的权限问题
+    # (mac/win 版同样用 root；否则 npm install 报 EACCES)
+    user: root
     volumes:
       # 项目源码 (挂载宿主目录, 构建产物写入宿主 release/)
       - ..:/app
       # node_modules: 命名卷隔离 ARM64 .node 二进制（不污染宿主 x64 node_modules）
       - zhinengti-uos-arm-node-modules:/app/node_modules
+      # resources/node: 数万个小文件走 Windows bind mount 极慢且易报 EACCES，用命名卷
+      - zhinengti-uos-arm-node-resources:/app/resources/node
       # npm 全局缓存 (共享宿主 ~/.npm)
       - ~/.npm:/home/builder/.npm
       # Electron 二进制缓存 (共享宿主 ~/.cache/electron)
@@ -54,6 +43,8 @@ services:
     network_mode: host
     environment:
       - INSIDE_DOCKER=true
+      # root 运行时 HOME 默认 /root，指向 /home/builder 才能命中缓存卷
+      - HOME=/home/builder
       - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
       - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
     command: >
@@ -73,3 +64,4 @@ services:
 
 volumes:
   zhinengti-uos-arm-node-modules:
+  zhinengti-uos-arm-node-resources:

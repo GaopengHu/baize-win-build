@@ -118,3 +118,6 @@ package/windows/
 package/*.deb
 package/*.exe
 package/*.dmg
+
+.dmgbuild-bundle/
+
