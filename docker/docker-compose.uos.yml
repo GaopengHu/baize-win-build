@@ -19,11 +19,16 @@ services:
     image: zhinengti-linux-builder:uos
     container_name: zhinengti-linux-build
     working_dir: /app
-    user: 1000:1000
+    # 用 root 运行，避免命名卷 /app/node_modules 与 bind mount 宿主目录的权限问题
+    # (mac/win 版同样用 root；否则 npm install 报 EACCES)
+    user: root
     volumes:
       # 项目源码 (挂载宿主目录, 构建产物写入宿主 release/)
       - ..:/app
-      # node_modules: 使用宿主目录（同为 Linux x64，无需隔离）
+      # node_modules: 用独立命名卷（Windows Docker Desktop 上 bind mount 极慢）
+      - zhinengti-uos-node-modules:/app/node_modules
+      # resources/node: 数万个小文件走 Windows bind mount 极慢且易报 EACCES，用命名卷
+      - zhinengti-uos-node-resources:/app/resources/node
       # npm 全局缓存 (共享宿主 ~/.npm)
       - ~/.npm:/home/builder/.npm
       # Electron 二进制缓存 (共享宿主 ~/.cache/electron)
@@ -32,6 +37,8 @@ services:
       - ~/.cache/electron-builder:/home/builder/.cache/electron-builder
     environment:
       - INSIDE_DOCKER=true
+      # root 运行时 HOME 默认 /root，指向 /home/builder 才能命中缓存卷
+      - HOME=/home/builder
       - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
       - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
       # 覆盖 Dockerfile 中的 REBUILD_NATIVE=1，使用 Step 2 手动 rebuild
@@ -63,3 +70,8 @@ services:
         echo 'Step 5: Build .deb' &&
         node scripts/build-linux-deb.mjs
       "
+
+volumes:
+  zhinengti-uos-node-modules:
+  zhinengti-uos-node-resources:
+

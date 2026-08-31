@@ -80,16 +80,6 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
   const [activeTab, setActiveTab] = useState<TabId>(resolvedInitial);
   // Track which tabs have been viewed at least once (for lazy loading)
   const [viewedTabs, setViewedTabs] = useState<Set<TabId>>(new Set([resolvedInitial]));
-  const [appVersion, setAppVersion] = useState('');
-  useEffect(() => {
-    try {
-      const v = window.electronAPI?.getVersion?.();
-      if (v instanceof Promise) v.then(setAppVersion);
-      else if (v) setAppVersion(v);
-    } catch {
-      /* ignore */
-    }
-  }, []);
 
   // Consume the store signal and apply tab in one effect
   useEffect(() => {
@@ -219,7 +209,7 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
           </button>
           {!compactSidebar && (
             <p className="text-[10px] text-text-muted text-center mt-2 select-text">
-              v{appVersion}
+              v0.0.1
             </p>
           )}
         </div>

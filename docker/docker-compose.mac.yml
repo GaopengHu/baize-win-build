@@ -17,11 +17,14 @@ services:
     image: zhinengti-mac-builder:latest
     container_name: zhinengti-mac-build
     working_dir: /app
-    user: 1000:1000
+    # Use root here to avoid host-mounted workspace permission issues during
+    # dist-electron / release writes on different Docker Desktop setups.
+    user: root
     volumes:
       # 项目源码 (挂载宿主目录, 构建产物写入宿主 release/)
       - ..:/app
-      # node_modules: 使用宿主目录（macOS .node 二进制由 download-mac-better-sqlite3 脚本下载覆盖）
+      # node_modules: 用独立命名卷，避免通过 bind mount 写入宿主磁盘（性能瓶颈）
+      - zhinengti-node-modules:/app/node_modules
       # npm 缓存 (加速重复构建)
       - zhinengti-npm-cache:/home/builder/.npm
       # npm prebuilds (better-sqlite3 等平台二进制)
@@ -30,18 +33,24 @@ services:
       - zhinengti-electron-cache:/home/builder/.cache/electron
       # electron-builder 缓存
       - zhinengti-builder-cache:/home/builder/.cache/electron-builder
-      # 宿主 /tmp 中的预下载 better-sqlite3 二进制 (只读)
-      - /tmp:/host-tmp:ro
     network_mode: host
     environment:
       - INSIDE_DOCKER=true
       - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
-      - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
-      # 使用宿主提供的 dmgbuild 包装脚本（基于 genisoimage 的 DMG 创建，支持 Linux 交叉编译）
-      - CUSTOM_DMGBUILD_PATH=/host-tmp/dmgbuild
+      - ELECTRON_BUILDER_BINARIES_MIRROR=https://github.com/electron-userland/electron-builder-binaries/releases/download/
+      # 让 electron-builder 直接使用仓库内的 Linux dmgbuild 包装脚本
+      # (scripts/dmgbuild-wrapper.sh, 基于 genisoimage 生成 ISO/HFS 混合镜像)。
+      # 绕开 npmmirror 缺失的 dmg-builder bundle（404）以及官方 bundle 内嵌
+      # macOS Python 在 Linux 上无法执行的问题（Exec format error）。
+      - CUSTOM_DMGBUILD_PATH=/app/.dmgbuild-bundle/dmgbuild
     command: >
       sh -c "
         echo '=== 今点通 macOS Build Container ===' &&
+        echo 'Step 0: Prepare Linux dmgbuild wrapper (genisoimage based)' &&
+        mkdir -p /app/.dmgbuild-bundle &&
+        cp /app/scripts/dmgbuild-wrapper.sh /app/.dmgbuild-bundle/dmgbuild &&
+        chmod +x /app/.dmgbuild-bundle/dmgbuild &&
+        echo 'dmgbuild wrapper ready:' /app/.dmgbuild-bundle/dmgbuild &&
         echo 'Step 1: npm install (skip postinstall — rebuild is for Linux, not needed for macOS cross-compile)' &&
         npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
         echo 'Step 2: Apply patches' &&
@@ -58,6 +67,7 @@ services:
       "
 
 volumes:
+  zhinengti-node-modules:
   zhinengti-npm-cache:
   zhinengti-npm-prebuilds:
   zhinengti-electron-cache:

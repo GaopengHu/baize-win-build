@@ -8,6 +8,8 @@
 #
 # 使用 (一键构建):
 #   docker compose -f docker/docker-compose.yml run --rm build
+
+#   docker compose -f docker/docker-compose.mac.yml run --rm build
 #
 # 使用 (交互式):
 #   docker run -it --rm \
