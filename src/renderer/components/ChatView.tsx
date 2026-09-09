@@ -156,6 +156,7 @@ export function ChatView() {
   const scrollRequestRef = useRef<number | null>(null);
   const isScrollingRef = useRef(false);
   const loadingMoreRef = useRef(false);
+  const prevActiveSessionIdRef = useRef<string | null>(null);
 
   const hasActiveTurn = Boolean(activeTurn);
   const pendingCount = pendingTurns.length;
@@ -302,6 +303,14 @@ export function ChatView() {
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
+
+    // Skip the initial scroll-to-top check when switching sessions.
+    // handleSessionClick already loads messages via IPC; triggering
+    // loadMoreMessages here would cause a duplicate IPC call.
+    const sessionJustChanged = prevActiveSessionIdRef.current !== activeSessionId;
+    prevActiveSessionIdRef.current = activeSessionId;
+    if (sessionJustChanged) return;
+
     const updateScrollState = () => {
       const distanceToBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight;
@@ -316,7 +325,7 @@ export function ChatView() {
     const onScroll = () => updateScrollState();
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);
-  }, [hasMoreMessages, loadMoreMessages]);
+  }, [activeSessionId, hasMoreMessages, loadMoreMessages]);
 
   // [PERF] Track message count changes for render timing
   const prevMsgCountForPerfRef = useRef(0);
