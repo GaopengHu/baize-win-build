@@ -1254,13 +1254,17 @@ export class SessionManager {
     limit: number,
     offset: number
   ): { messages: Message[]; total: number; hasMore: boolean } {
+    const t0 = performance.now();
     const total = this.db.messages.getCountBySessionId(sessionId);
+    const t1 = performance.now();
     const rows = this.db.messages.getPaginated(sessionId, limit, offset);
+    const t2 = performance.now();
     // DB returns DESC (newest first), reverse to ASC for chronological order
     rows.reverse();
     const messages = rows.map((row) => this.createLazyMessage(row));
+    const t3 = performance.now();
     log(
-      `[SessionManager] getMessagesPaginated: offset=${offset} limit=${limit} got=${messages.length} total=${total}`
+      `[PERF] getMessagesPaginated: count=${Math.round(t1-t0)}ms query=${Math.round(t2-t1)}ms create=${Math.round(t3-t2)}ms total=${Math.round(t3-t0)}ms rows=${rows.length} sessionId=${sessionId}`
     );
     return {
       messages,

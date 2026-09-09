@@ -318,6 +318,19 @@ export function ChatView() {
     return () => container.removeEventListener('scroll', onScroll);
   }, [hasMoreMessages, loadMoreMessages]);
 
+  // [PERF] Track message count changes for render timing
+  const prevMsgCountForPerfRef = useRef(0);
+  useEffect(() => {
+    const count = messages.length;
+    if (count > 0 && prevMsgCountForPerfRef.current === 0) {
+      // Messages loaded from empty → measure after paint
+      requestAnimationFrame(() => {
+        console.log(`[PERF] ChatView rendered ${count} messages`);
+      });
+    }
+    prevMsgCountForPerfRef.current = count;
+  }, [messages.length]);
+
   useEffect(() => {
     const messageCount = messages.length;
     const partialLength = partialMessage.length + partialThinking.length;

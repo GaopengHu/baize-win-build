@@ -167,6 +167,7 @@ export function Sidebar() {
       if (activeSessionId === sessionId) return;
 
       setActiveSession(sessionId);
+      const clickStart = performance.now();
 
       // Read sessionStates at call-time from the store rather than closing over
       // the selector value. The selector returns a new object reference every
@@ -179,11 +180,14 @@ export function Sidebar() {
       const existingMessages = currentSessionStates[sessionId]?.messages;
       if ((!existingMessages || existingMessages.length === 0) && isElectron) {
         try {
+          const msgStart = performance.now();
           const result = await getSessionMessagesPaginated(sessionId, 50, 0);
+          const msgMs = Math.round(performance.now() - msgStart);
           if (result.messages && result.messages.length > 0) {
             setMessages(sessionId, result.messages);
           }
           setHasMoreMessages(sessionId, result.hasMore);
+          console.log(`[PERF] Sidebar loadMessages: ${msgMs}ms (${result.messages?.length ?? 0} msgs, total=${result.total})`);
         } catch (error) {
           console.error('[Sidebar] Failed to load messages:', error);
         }
@@ -198,6 +202,7 @@ export function Sidebar() {
           console.error('[Sidebar] Failed to load trace steps:', error);
         }
       }
+      console.log(`[PERF] Sidebar handleSessionClick total: ${Math.round(performance.now() - clickStart)}ms`);
     },
     [
       activeSessionId,
