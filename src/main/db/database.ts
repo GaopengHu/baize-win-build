@@ -27,6 +27,8 @@ export interface DatabaseInstance {
     create: (message: MessageRow) => void;
     update: (id: string, updates: Partial<Pick<MessageRow, 'execution_time_ms'>>) => void;
     getBySessionId: (sessionId: string) => MessageRow[];
+    getPaginated: (sessionId: string, limit: number, offset: number) => MessageRow[];
+    getCountBySessionId: (sessionId: string) => number;
     delete: (id: string) => void;
     deleteBySessionId: (sessionId: string) => void;
   };
@@ -462,6 +464,14 @@ export function initDatabase(): DatabaseInstance {
     SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC
   `);
 
+  const getMessagesPaginatedStmt = rawDb.prepare(`
+    SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?
+  `);
+
+  const getMessageCountBySessionStmt = rawDb.prepare(`
+    SELECT COUNT(*) as count FROM messages WHERE session_id = ?
+  `);
+
   const updateMessageStmt = rawDb.prepare(`
     UPDATE messages SET execution_time_ms = ? WHERE id = ?
   `);
@@ -592,6 +602,16 @@ export function initDatabase(): DatabaseInstance {
 
       getBySessionId: (sessionId: string): MessageRow[] => {
         return getMessagesBySessionStmt.all(sessionId) as MessageRow[];
+      },
+
+      getPaginated: (sessionId: string, limit: number, offset: number): MessageRow[] => {
+        // Returns in DESC order (newest first) — caller reverses if needed
+        return getMessagesPaginatedStmt.all(sessionId, limit, offset) as MessageRow[];
+      },
+
+      getCountBySessionId: (sessionId: string): number => {
+        const row = getMessageCountBySessionStmt.get(sessionId) as { count: number };
+        return row.count;
       },
 
       delete: (id: string) => {

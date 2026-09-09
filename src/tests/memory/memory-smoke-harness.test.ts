@@ -195,6 +195,8 @@ function createDatabaseInstance(db: Database.Database): DatabaseInstance {
             sessionId
           ) as MessageRow[]
       ),
+      getPaginated: vi.fn(() => []),
+      getCountBySessionId: vi.fn(() => 0),
       delete: vi.fn(),
       deleteBySessionId: vi.fn(),
     },

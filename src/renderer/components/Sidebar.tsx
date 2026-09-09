@@ -39,6 +39,7 @@ export function Sidebar() {
   const settings = useAppStore((s) => s.settings);
   const setActiveSession = useAppStore((s) => s.setActiveSession);
   const setMessages = useAppStore((s) => s.setMessages);
+  const setHasMoreMessages = useAppStore((s) => s.setHasMoreMessages);
   const setTraceSteps = useAppStore((s) => s.setTraceSteps);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const updateSession = useAppStore((s) => s.updateSession);
@@ -49,7 +50,7 @@ export function Sidebar() {
   const {
     deleteSession,
     batchDeleteSessions,
-    getSessionMessages,
+    getSessionMessagesPaginated,
     getSessionTraceSteps,
     isElectron,
   } = useIPC();
@@ -178,10 +179,11 @@ export function Sidebar() {
       const existingMessages = currentSessionStates[sessionId]?.messages;
       if ((!existingMessages || existingMessages.length === 0) && isElectron) {
         try {
-          const messages = await getSessionMessages(sessionId);
-          if (messages && messages.length > 0) {
-            setMessages(sessionId, messages);
+          const result = await getSessionMessagesPaginated(sessionId, 50, 0);
+          if (result.messages && result.messages.length > 0) {
+            setMessages(sessionId, result.messages);
           }
+          setHasMoreMessages(sessionId, result.hasMore);
         } catch (error) {
           console.error('[Sidebar] Failed to load messages:', error);
         }
@@ -199,11 +201,12 @@ export function Sidebar() {
     },
     [
       activeSessionId,
-      getSessionMessages,
+      getSessionMessagesPaginated,
       getSessionTraceSteps,
       isElectron,
       setActiveSession,
       setMessages,
+      setHasMoreMessages,
       setShowSettings,
       setTraceSteps,
     ]

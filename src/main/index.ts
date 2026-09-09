@@ -2913,6 +2913,13 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
     case 'session.getMessages':
       return sm.getMessages(event.payload.sessionId);
 
+    case 'session.getMessagesPaginated':
+      return sm.getMessagesPaginated(
+        event.payload.sessionId,
+        event.payload.limit,
+        event.payload.offset
+      );
+
     case 'session.getTraceSteps':
       return sm.getTraceSteps(event.payload.sessionId);
 

@@ -2162,24 +2162,36 @@ If your answer uses linkable content from MCP tools, include a "Sources:" sectio
 Tool routing:
 - If user explicitly asks to use Chrome/browser/web navigation, prioritize Chrome MCP tools (mcp__Chrome__*) over generic WebSearch/WebFetch.
 - Use WebSearch/WebFetch only when Chrome MCP is unavailable or the user explicitly asks for generic web search.
+
+Tool parameter naming (CRITICAL - incorrect parameter names will cause validation errors):
+- read tool: use \`path\` (NOT \`file_path\` or \`filePath\`)
+- write tool: use \`path\` and \`content\` (NOT \`file_path\` or \`filePath\`)
+- edit tool: use \`path\`, \`oldText\`, and \`newText\` (NOT \`file_path\`, \`old_string\`, or \`new_string\`)
+- bash tool: use \`command\` and optionally \`timeout\`
 </tool_behavior>`,
+        `<code_quality_rules>
+When writing or modifying code:
+1. DEPENDENCY CHECK: Before using any library, verify it exists in package.json (or equivalent manifest). If not available, install it first or use an existing alternative.
+2. READ BEFORE WRITE: Always read existing files before modifying them. Never assume file contents or structure.
+3. ERROR HANDLING: Include proper error handling (try-catch, null checks, boundary validation). Never silently swallow errors.
+4. SECURITY: Validate user inputs. Never hardcode secrets or API keys. Use parameterized queries for databases.
+5. CODE STYLE: Match the existing project style — indentation, naming conventions, import patterns, and comment style.
+6. VERIFICATION: After making changes, run available verification commands (lint, typecheck, test) if defined in package.json scripts or equivalent.
+7. MINIMAL CHANGES: Make the smallest change that achieves the goal. Do not refactor unrelated code unless asked.
+8. EXPLAIN BRIEFLY: After completing changes, summarize what was done and why in 2-3 sentences.
+</code_quality_rules>`,
         `<document_generation_rules>
-When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), follow these EFFICIENCY rules:
+When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
 
-1. MINIMIZE TOOL CALLS: Plan the entire document content BEFORE writing any code. Write ONE script that generates the complete document in a single execution. Do NOT write, test, debug, and rewrite scripts iteratively.
+1. READ SKILL DOCS FIRST: Read the relevant SKILL.md to understand the API and best practices before writing code. Do not skip this step — understanding the API prevents errors.
 
-2. DO NOT READ SKILL DOCS IN FULL: When using docx/pptx/xlsx skills, do NOT read the entire SKILL.md, html2pptx.md, css.md, ooxml.md, or other documentation files. Instead:
-   - For PPTX: Use PptxGenJS directly. Write a single Node.js script that creates all slides programmatically. Do NOT use the html2pptx workflow (it requires writing HTML, then converting — too many steps).
-   - For DOCX: Use the docx npm package directly. Write a single Node.js script.
-   - For XLSX: Use the exceljs or xlsx npm package directly. Write a single Node.js script.
+2. ONE COMPLETE SCRIPT: Plan the full document content, then write ONE script that generates everything in a single execution.
 
-3. ONE SCRIPT, ONE EXECUTION: Write the complete generation script in one file, execute it once. If it fails, read the error, fix the script, and re-run — but do NOT start over from scratch. Maximum 2 retry attempts.
+3. EXECUTE AND FIX: Run the script. If it fails, read the error carefully, fix the issue, and re-run. Maximum 3 retry attempts. Do not rewrite from scratch — fix the specific error.
 
-4. NO ITERATIVE REFINEMENT: Do not generate the document incrementally (e.g., one slide at a time, one section at a time). Generate ALL content in a single script execution.
+4. BUDGET: Aim for 5-10 tool calls total for a complete document. Complex documents may require more.
 
-5. CONTENT FIRST: Focus on delivering the document content the user asked for. Do not spend time on elaborate styling, custom fonts, or complex visual designs unless the user explicitly requests them. Use default templates and simple, clean formatting.
-
-6. TIME BUDGET: Document generation should complete within 3-5 tool calls total (read skill reference if needed → write script → execute → done). If you find yourself making more than 8 tool calls for a single document generation task, STOP, finalize what you have, and deliver the result.
+5. CONTENT FIRST: Focus on delivering correct, complete content the user asked for. Use clean, simple formatting unless the user explicitly requests elaborate styling.
 </document_generation_rules>`,
         this.getBundledPathHints(),
       ]
@@ -2284,6 +2296,9 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), f
           cwd: effectiveCwd,
           additionalSkillPaths: skillPaths,
           appendSystemPrompt: coworkAppendPrompt,
+          agentsFilesOverride: () => ({
+            agentsFiles: [],
+          }),
         });
         await resourceLoader.reload();
 
@@ -2411,6 +2426,9 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), f
       const thinkParser = new ThinkTagStreamParser();
       const promptStartedAt = Date.now();
       const streamEventCounts = new Map<string, number>();
+      // Per-API-call timing: track each LLM round-trip within the agent loop
+      let messageStartTime: number | undefined;
+      let apiCallCount = 0;
 
       // ── Loop guard: protect against runaway tool-call loops ──
       // (e.g. gemini-3.1-pro with thinking=off has been observed producing hundreds
@@ -2620,13 +2638,16 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), f
               log(`[ClaudeAgentRunner] Event: ${event.type} → ${updateType}`);
             }
           } else if (event.type === 'message_start') {
+            messageStartTime = Date.now();
+            apiCallCount++;
             log(
-              '[ClaudeAgentRunner] Event: message_start',
+              `[ClaudeAgentRunner] Event: message_start [api_call #${apiCallCount}]`,
               safeStringify(summarizeMessageForLog(event.message), 2)
             );
           } else if (event.type === 'message_end') {
+            const apiCallDuration = messageStartTime ? Date.now() - messageStartTime : -1;
             log(
-              '[ClaudeAgentRunner] Event: message_end',
+              `[ClaudeAgentRunner] Event: message_end [api_call #${apiCallCount}, ${apiCallDuration}ms]`,
               safeStringify(
                 {
                   message: summarizeMessageForLog(event.message),
@@ -2635,6 +2656,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), f
                 2
               )
             );
+            messageStartTime = undefined;
           } else if (event.type === 'turn_end') {
             log(`[ClaudeAgentRunner] Event: ${event.type}`);
           } else {
@@ -3015,7 +3037,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.), f
         if (ollamaColdStartTimerId) clearTimeout(ollamaColdStartTimerId);
       }
 
-      logTiming('agent prompt completed', runStartTime);
+      logTiming(`agent prompt completed (${apiCallCount} API calls)`, runStartTime);
 
       // If the SDK swallowed the AbortError and returned void, detect timeout here
       if (controller.signal.aborted && abortedByTimeout) {

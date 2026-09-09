@@ -175,6 +175,13 @@ export function useActiveContextWindow(): number | undefined {
   );
 }
 
+/** Returns whether there are more (older) messages to load for the active session. */
+export function useActiveHasMoreMessages(): boolean {
+  return useAppStore((s) =>
+    s.activeSessionId ? (s.sessionStates[s.activeSessionId]?.hasMoreMessages ?? true) : true
+  );
+}
+
 // ---------------------------------------------------------------------------
 // UI layout domain
 // ---------------------------------------------------------------------------

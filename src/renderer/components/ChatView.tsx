@@ -10,6 +10,7 @@ import {
   usePendingTurns,
   useActiveExecutionClock,
   useAppConfig,
+  useActiveHasMoreMessages,
 } from '../store/selectors';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
@@ -85,12 +86,14 @@ export function ChatView() {
   const activeSession = useCurrentSession();
   const messages = useActiveSessionMessages();
   const { partialMessage, partialThinking } = useActivePartialContent();
+  const hasMoreMessages = useActiveHasMoreMessages();
   const activeTurn = useActiveTurn();
   const pendingTurns = usePendingTurns();
   const executionClock = useActiveExecutionClock();
   const appConfig = useAppConfig();
   const setGlobalNotice = useAppStore((s) => s.setGlobalNotice);
-  const { continueSession, stopSession, isElectron } = useIPC();
+  const { continueSession, stopSession, getSessionMessagesPaginated, isElectron } = useIPC();
+  const prependMessages = useAppStore((s) => s.prependMessages);
 
   // Model quick-switch entries populated from the configured config sets.
   // Each config set is a fully configured model profile (provider, key, url...).
@@ -152,11 +155,38 @@ export function ChatView() {
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRequestRef = useRef<number | null>(null);
   const isScrollingRef = useRef(false);
+  const loadingMoreRef = useRef(false);
 
   const hasActiveTurn = Boolean(activeTurn);
   const pendingCount = pendingTurns.length;
   const isSessionRunning = activeSession?.status === 'running';
   const canStop = isSessionRunning || hasActiveTurn || pendingCount > 0;
+
+  const loadMoreMessages = useCallback(async () => {
+    if (!activeSessionId || loadingMoreRef.current || !hasMoreMessages || !isElectron) return;
+    loadingMoreRef.current = true;
+    try {
+      const result = await getSessionMessagesPaginated(activeSessionId, 50, messages.length);
+      if (result.messages.length > 0) {
+        const container = scrollContainerRef.current;
+        const prevHeight = container?.scrollHeight ?? 0;
+        prependMessages(activeSessionId, result.messages, result.hasMore);
+        // Restore scroll position so user doesn't jump to bottom after prepend
+        requestAnimationFrame(() => {
+          if (container) {
+            const newHeight = container.scrollHeight;
+            container.scrollTop += newHeight - prevHeight;
+          }
+        });
+      } else {
+        prependMessages(activeSessionId, [], false);
+      }
+    } catch (e) {
+      console.error('[ChatView] loadMoreMessages failed:', e);
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [activeSessionId, hasMoreMessages, isElectron, messages.length, getSessionMessagesPaginated, prependMessages]);
 
   useEffect(() => {
     // When switching sessions, restore the input capsule to its widest
@@ -276,13 +306,17 @@ export function ChatView() {
       const distanceToBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight;
       isUserAtBottomRef.current = distanceToBottom <= 80;
+      // Load more messages when scrolling near the top (within 200px)
+      if (container.scrollTop <= 200 && hasMoreMessages) {
+        loadMoreMessages();
+      }
     };
     updateScrollState();
     // 用户阅读旧消息时，阻止新消息自动滚动打断视线
     const onScroll = () => updateScrollState();
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);
-  }, []);
+  }, [hasMoreMessages, loadMoreMessages]);
 
   useEffect(() => {
     const messageCount = messages.length;
@@ -1090,6 +1124,11 @@ export function ChatView() {
           ref={messagesContainerRef}
           className="w-full max-w-[920px] mx-auto py-8 px-5 lg:px-8 space-y-5"
         >
+          {hasMoreMessages && messages.length > 0 && (
+            <div className="flex justify-center py-2">
+              <Loader2 className="w-4 h-4 animate-spin text-text-muted" />
+            </div>
+          )}
           {displayedMessages.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
               <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">

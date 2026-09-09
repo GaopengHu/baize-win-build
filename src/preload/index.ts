@@ -53,6 +53,7 @@ const ALLOWED_CLIENT_EVENTS: ReadonlySet<string> = new Set<ClientEvent['type']>(
   'session.batchDelete',
   'session.list',
   'session.getMessages',
+  'session.getMessagesPaginated',
   'session.getTraceSteps',
   'permission.response',
   'sudo.password.response',

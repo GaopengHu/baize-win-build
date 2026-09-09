@@ -41,6 +41,7 @@ export interface SessionState {
   executionClock: SessionExecutionClock;
   traceSteps: TraceStep[];
   contextWindow: number;
+  hasMoreMessages: boolean;
 }
 
 const DEFAULT_SESSION_STATE: SessionState = {
@@ -52,6 +53,7 @@ const DEFAULT_SESSION_STATE: SessionState = {
   executionClock: { startAt: null, endAt: null },
   traceSteps: [],
   contextWindow: 0,
+  hasMoreMessages: true,
 };
 
 // Helper to immutably update a single session's state within the record
@@ -132,6 +134,8 @@ interface AppState {
   finishExecutionClock: (sessionId: string, endAt?: number) => void;
   clearExecutionClock: (sessionId: string) => void;
   setMessages: (sessionId: string, messages: Message[]) => void;
+  prependMessages: (sessionId: string, messages: Message[], hasMore: boolean) => void;
+  setHasMoreMessages: (sessionId: string, hasMore: boolean) => void;
   setPartialMessage: (sessionId: string, partial: string) => void;
   clearPartialMessage: (sessionId: string) => void;
   setPartialThinking: (sessionId: string, delta: string) => void;
@@ -412,6 +416,24 @@ export const useAppStore = create<AppState>((set) => ({
   setMessages: (sessionId, messages) =>
     set((state) => ({
       sessionStates: patchSession(state.sessionStates, sessionId, { messages }),
+    })),
+
+  prependMessages: (sessionId, newMessages, hasMore) =>
+    set((state) => {
+      const ss = getSession(state.sessionStates, sessionId);
+      return {
+        sessionStates: patchSession(state.sessionStates, sessionId, {
+          messages: [...newMessages, ...ss.messages],
+          hasMoreMessages: hasMore,
+        }),
+      };
+    }),
+
+  setHasMoreMessages: (sessionId, hasMore) =>
+    set((state) => ({
+      sessionStates: patchSession(state.sessionStates, sessionId, {
+        hasMoreMessages: hasMore,
+      }),
     })),
 
   setPartialMessage: (sessionId, partial) =>

@@ -731,6 +731,23 @@ export function useIPC() {
     [invoke]
   );
 
+  const getSessionMessagesPaginated = useCallback(
+    async (
+      sessionId: string,
+      limit: number,
+      offset: number
+    ): Promise<{ messages: Message[]; total: number; hasMore: boolean }> => {
+      if (!isElectron) {
+        return { messages: [], total: 0, hasMore: false };
+      }
+      return invoke<{ messages: Message[]; total: number; hasMore: boolean }>({
+        type: 'session.getMessagesPaginated',
+        payload: { sessionId, limit, offset },
+      });
+    },
+    [invoke]
+  );
+
   const getSessionTraceSteps = useCallback(
     async (sessionId: string): Promise<TraceStep[]> => {
       if (!isElectron) {
@@ -820,6 +837,7 @@ export function useIPC() {
     batchDeleteSessions,
     listSessions,
     getSessionMessages,
+    getSessionMessagesPaginated,
     getSessionTraceSteps,
     respondToPermission,
     respondToSudoPassword,

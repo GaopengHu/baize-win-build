@@ -472,6 +472,10 @@ export type ClientEvent =
   | { type: 'session.batchDelete'; payload: { sessionIds: string[] } }
   | { type: 'session.list'; payload: Record<string, never> }
   | { type: 'session.getMessages'; payload: { sessionId: string } }
+  | {
+      type: 'session.getMessagesPaginated';
+      payload: { sessionId: string; limit: number; offset: number };
+    }
   | { type: 'session.getTraceSteps'; payload: { sessionId: string } }
   | {
       type: 'permission.response';
