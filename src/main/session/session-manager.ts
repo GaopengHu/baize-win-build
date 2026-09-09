@@ -1254,18 +1254,28 @@ export class SessionManager {
     limit: number,
     offset: number
   ): { messages: Message[]; total: number; hasMore: boolean } {
-    const t0 = performance.now();
     const total = this.db.messages.getCountBySessionId(sessionId);
-    const t1 = performance.now();
     const rows = this.db.messages.getPaginated(sessionId, limit, offset);
-    const t2 = performance.now();
     // DB returns DESC (newest first), reverse to ASC for chronological order
     rows.reverse();
-    const messages = rows.map((row) => this.createLazyMessage(row));
-    const t3 = performance.now();
-    log(
-      `[PERF] getMessagesPaginated: count=${Math.round(t1-t0)}ms query=${Math.round(t2-t1)}ms create=${Math.round(t3-t2)}ms total=${Math.round(t3-t0)}ms rows=${rows.length} sessionId=${sessionId}`
-    );
+    // Pre-parse content and tokenUsage into plain objects so IPC structured clone
+    // does not trigger lazy getters. This keeps the parsing controlled in the main
+    // process and avoids redundant parse cycles during transfer + render.
+    const messages: Message[] = rows.map((row) => {
+      const content = this.sanitizeContentBlocks(this.normalizeContent(row.content));
+      const tokenUsage = row.token_usage
+        ? (JSON.parse(row.token_usage) as Message['tokenUsage'])
+        : undefined;
+      return {
+        id: row.id,
+        sessionId: row.session_id,
+        role: row.role as Message['role'],
+        timestamp: row.timestamp,
+        executionTimeMs: row.execution_time_ms ?? undefined,
+        content,
+        tokenUsage,
+      };
+    });
     return {
       messages,
       total,

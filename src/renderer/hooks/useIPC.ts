@@ -740,14 +740,10 @@ export function useIPC() {
       if (!isElectron) {
         return { messages: [], total: 0, hasMore: false };
       }
-      const ipcStart = performance.now();
-      const result = await invoke<{ messages: Message[]; total: number; hasMore: boolean }>({
+      return invoke<{ messages: Message[]; total: number; hasMore: boolean }>({
         type: 'session.getMessagesPaginated',
         payload: { sessionId, limit, offset },
       });
-      const ipcMs = Math.round(performance.now() - ipcStart);
-      console.log(`[PERF] IPC session.getMessagesPaginated total=${ipcMs}ms messages=${result?.messages?.length ?? 0}`);
-      return result;
     },
     [invoke]
   );
