@@ -17,7 +17,7 @@ import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
 import { ProcessPanel } from './message/ProcessPanel';
 import { ContentBlockView } from './message/ContentBlockView';
-import { normalizeAssistantBlocks } from '../utils/content-block-partition';
+import { buildRoundRenderPlans } from '../utils/round-render-plan';
 import type { Message, ContentBlock } from '../types';
 import {
   Send,
@@ -44,40 +44,6 @@ type AttachedFile = {
 // Model quick-switch entries shown in the chat input dropdown.
 // Populated from the configured config sets (see useAppConfig configSets).
 type QuickSwitchModel = { id: string; label: string };
-
-type Round = {
-  userMessage: Message | null;
-  assistantMessages: Message[];
-};
-
-function groupMessagesIntoRounds(messages: Message[]): Round[] {
-  const rounds: Round[] = [];
-  let currentRound: Round = { userMessage: null, assistantMessages: [] };
-
-  for (const message of messages) {
-    if (message.role === 'user') {
-      if (currentRound.userMessage || currentRound.assistantMessages.length > 0) {
-        rounds.push(currentRound);
-      }
-      currentRound = { userMessage: message, assistantMessages: [] };
-    } else {
-      currentRound.assistantMessages.push(message);
-    }
-  }
-
-  if (currentRound.userMessage || currentRound.assistantMessages.length > 0) {
-    rounds.push(currentRound);
-  }
-
-  return rounds;
-}
-
-function getMessageContentBlocks(message: Message): ContentBlock[] {
-  const rawContent = message.content as unknown;
-  return Array.isArray(rawContent)
-    ? (rawContent as ContentBlock[])
-    : [{ type: 'text', text: String(rawContent ?? '') } as ContentBlock];
-}
 
 export function ChatView() {
   const { t } = useTranslation();
@@ -135,7 +101,11 @@ export function ChatView() {
   const [isDragging, setIsDragging] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const inputBoxMaxWidth = 1320;
-  const { size: inputBoxSize, setSize: setInputBoxSize, startResize } = useResizablePanel({
+  const {
+    size: inputBoxSize,
+    setSize: setInputBoxSize,
+    startResize,
+  } = useResizablePanel({
     defaultWidth: 920,
     defaultHeight: 180,
     minWidth: 640,
@@ -187,7 +157,14 @@ export function ChatView() {
     } finally {
       loadingMoreRef.current = false;
     }
-  }, [activeSessionId, hasMoreMessages, isElectron, messages.length, getSessionMessagesPaginated, prependMessages]);
+  }, [
+    activeSessionId,
+    hasMoreMessages,
+    isElectron,
+    messages.length,
+    getSessionMessagesPaginated,
+    prependMessages,
+  ]);
 
   useEffect(() => {
     // When switching sessions, restore the input capsule to its widest
@@ -230,6 +207,11 @@ export function ChatView() {
 
     return [...messages.slice(0, insertIndex), streamingMessage, ...messages.slice(insertIndex)];
   }, [activeSessionId, activeTurn?.userMessageId, messages, partialMessage, partialThinking]);
+
+  // Memoized render plans: unchanged rounds keep identical plan/block array
+  // references across streaming frames, so memoized children (ProcessPanel,
+  // ContentBlockView, ...) skip re-rendering entirely. See round-render-plan.ts.
+  const roundPlans = useMemo(() => buildRoundRenderPlans(displayedMessages), [displayedMessages]);
 
   // Format execution time for display
   const formatExecutionTime = useCallback((ms: number): string => {
@@ -326,19 +308,6 @@ export function ChatView() {
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);
   }, [activeSessionId, hasMoreMessages, loadMoreMessages]);
-
-  // Measure render time for first message batch (after paint)
-  useEffect(() => {
-    const count = messages.length;
-    if (count > 0) {
-      const t0 = performance.now();
-      requestAnimationFrame(() => {
-        const elapsed = Math.round(performance.now() - t0);
-        window.electronAPI?.logs?.write?.('warn', `[DIAG] ChatView rendered ${count} messages in ${elapsed}ms`);
-        console.error(`[DIAG] ChatView rendered ${count} messages in ${elapsed}ms`);
-      });
-    }
-  }, [messages.length]);
 
   useEffect(() => {
     const messageCount = messages.length;
@@ -441,6 +410,36 @@ export function ChatView() {
     el.style.height = `${nextHeight}px`;
     setInputHeight(nextHeight + 24);
   }, [prompt, activeSessionId]);
+
+  // Warm up experience-memory retrieval while the user types so the deferred
+  // mid-turn injection is usually a cache hit when the message is sent.
+  const memoryPrefetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastPrefetchedDraftRef = useRef('');
+
+  const handlePromptChange = useCallback(
+    (value: string) => {
+      setPrompt(value);
+      if (typeof window === 'undefined' || !window.electronAPI || !activeSessionId) return;
+      if (memoryPrefetchTimerRef.current) clearTimeout(memoryPrefetchTimerRef.current);
+      const draft = value.trim();
+      if (draft.length < 8 || draft === lastPrefetchedDraftRef.current) return;
+      memoryPrefetchTimerRef.current = setTimeout(() => {
+        memoryPrefetchTimerRef.current = null;
+        lastPrefetchedDraftRef.current = draft;
+        window.electronAPI?.send({
+          type: 'memory.prefetch',
+          payload: { sessionId: activeSessionId, draft },
+        });
+      }, 600);
+    },
+    [activeSessionId]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (memoryPrefetchTimerRef.current) clearTimeout(memoryPrefetchTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (inputHeight < 56) {
@@ -732,8 +731,7 @@ export function ChatView() {
           useAppStore.getState().setGlobalNotice({
             id: `notice-model-switch-${Date.now()}`,
             type: 'error',
-            message:
-              err instanceof Error ? err.message : '切换模型失败，请稍后重试',
+            message: err instanceof Error ? err.message : '切换模型失败，请稍后重试',
           });
         }
       }
@@ -752,14 +750,19 @@ export function ChatView() {
             (
               statuses as Array<{ id: string; name: string; connected: boolean; toolCount: number }>
             )?.filter((s) => s.connected && s.toolCount > 0) || [];
-          setActiveConnectors(active);
+          // Only touch state when the connector set actually changed — a new
+          // array every tick re-rendered the whole chat view for nothing.
+          setActiveConnectors((prev) =>
+            JSON.stringify(prev) === JSON.stringify(active) ? prev : active
+          );
         } catch (err) {
           console.error('Failed to load MCP connectors:', err);
         }
       };
       loadConnectors();
-      // Refresh every 5 seconds
-      const interval = setInterval(loadConnectors, 5000);
+      // Connector status changes rarely; 15s keeps the header fresh without
+      // a constant IPC + render heartbeat on the chat view.
+      const interval = setInterval(loadConnectors, 15000);
       return () => clearInterval(interval);
     }
   }, [isElectron]);
@@ -948,7 +951,7 @@ export function ChatView() {
                   <textarea
                     ref={textareaRef}
                     value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
+                    onChange={(e) => handlePromptChange(e.target.value)}
                     style={{ minHeight: '24px', maxHeight: '180px' }}
                     onCompositionStart={() => {
                       isComposingRef.current = true;
@@ -1025,7 +1028,9 @@ export function ChatView() {
                       type="button"
                       onClick={handleSubmit}
                       disabled={
-                        (!prompt.trim() && pastedImages.length === 0 && attachedFiles.length === 0) ||
+                        (!prompt.trim() &&
+                          pastedImages.length === 0 &&
+                          attachedFiles.length === 0) ||
                         isSubmitting
                       }
                       className="inline-flex items-center gap-2 rounded-full bg-accent px-4 py-2.5 text-white shadow-sm hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
@@ -1153,63 +1158,49 @@ export function ChatView() {
           )}
           {displayedMessages.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">
-                今点通
-              </p>
+              <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">今点通</p>
               <p className="text-base text-text-secondary">{t('chat.startConversation')}</p>
             </div>
           ) : (
-            groupMessagesIntoRounds(displayedMessages).map((round, roundIndex) => {
-              const roundProcessBlocks = round.assistantMessages.flatMap((assistantMessage) => {
-                const blocks = getMessageContentBlocks(assistantMessage);
-                const normalized = normalizeAssistantBlocks(blocks);
-                return normalized.hasTools ? normalized.processBlocks : [];
-              });
+            roundPlans.map((round) => (
+              <div key={round.key} className="space-y-5">
+                {round.userMessage && (
+                  <div key={round.userMessage.id}>
+                    <MessageCard message={round.userMessage} />
+                  </div>
+                )}
+                {round.items.length > 0 && (
+                  <div className="space-y-1.5">
+                    <ProcessPanel
+                      blocks={round.processBlocks}
+                      message={round.lastAssistantMessage}
+                    />
+                    {round.items.map((item) => {
+                      if (item.visibleBlocks.length === 0) return null;
 
-              return (
-                <div key={roundIndex} className="space-y-5">
-                  {round.userMessage && (
-                    <div key={round.userMessage.id}>
-                      <MessageCard message={round.userMessage} />
-                    </div>
-                  )}
-                  {round.assistantMessages.length > 0 && (
-                    <div className="space-y-1.5">
-                      <ProcessPanel
-                        blocks={roundProcessBlocks}
-                        message={round.assistantMessages[round.assistantMessages.length - 1]}
-                      />
-                      {round.assistantMessages.map((message) => {
-                        const isStreaming =
-                          typeof message.id === 'string' && message.id.startsWith('partial-');
-                        const blocks = getMessageContentBlocks(message);
-                        const { mergedBlocks, visibleBlocks } = normalizeAssistantBlocks(blocks);
-                        if (visibleBlocks.length === 0) return null;
-
-                        return (
-                          <div key={message.id} className="space-y-1.5">
-                            {visibleBlocks.map((block, index) => (
-                              <ContentBlockView
-                                key={
-                                  'id' in block
-                                    ? (block as { id: string }).id
-                                    : `block-${block.type}-${index}`
-                                }
-                                block={block}
-                                isUser={false}
-                                isStreaming={isStreaming}
-                                allBlocks={mergedBlocks}
-                                message={message}
-                              />
-                            ))}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            })
+                      return (
+                        <div key={item.message.id} className="space-y-1.5">
+                          {item.visibleBlocks.map((block, index) => (
+                            <ContentBlockView
+                              key={
+                                'id' in block
+                                  ? (block as { id: string }).id
+                                  : `block-${block.type}-${index}`
+                              }
+                              block={block}
+                              isUser={false}
+                              isStreaming={item.isStreaming}
+                              allBlocks={item.mergedBlocks}
+                              message={item.message}
+                            />
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ))
           )}
 
           {/* Processing indicator - show when we have an active turn but no streaming content yet */}
@@ -1359,7 +1350,7 @@ export function ChatView() {
               <textarea
                 ref={textareaRef}
                 value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
+                onChange={(e) => handlePromptChange(e.target.value)}
                 style={{ minHeight: '24px', maxHeight: '180px' }}
                 onCompositionStart={() => {
                   isComposingRef.current = true;

@@ -62,6 +62,7 @@ const ALLOWED_CLIENT_EVENTS: ReadonlySet<string> = new Set<ClientEvent['type']>(
   'workdir.get',
   'workdir.set',
   'workdir.select',
+  'memory.prefetch',
 ]);
 
 // Expose protected methods that allow the renderer process to use
@@ -73,7 +74,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       console.warn('[Preload] Blocked unauthorized event type:', event.type);
       return;
     }
-    console.log('[Preload] Sending event:', event.type);
     ipcRenderer.send('client-event', event);
   },
 
@@ -87,7 +87,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
     registeredCallback = callback;
     ipcListener = (_: Electron.IpcRendererEvent, data: ServerEvent) => {
-      console.log('[Preload] Received event:', data.type);
       if (registeredCallback) {
         registeredCallback(data);
       }
@@ -113,7 +112,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       console.warn('[Preload] Blocked unauthorized invoke type:', event.type);
       throw new Error(`Unauthorized event type: ${event.type}`);
     }
-    console.log('[Preload] Invoking:', event.type);
     return ipcRenderer.invoke('client-invoke', event);
   },
 
@@ -260,7 +258,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Sandbox methods
   sandbox: {
-    getStatus: (forceFresh = false): Promise<{
+    getStatus: (
+      forceFresh = false
+    ): Promise<{
       platform: string;
       mode: string;
       initialized: boolean;
@@ -416,7 +416,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   memory: {
-    getOverview: (cwd?: string): Promise<MemoryOverview> => ipcRenderer.invoke('memory.getOverview', cwd),
+    getOverview: (cwd?: string): Promise<MemoryOverview> =>
+      ipcRenderer.invoke('memory.getOverview', cwd),
     search: (payload: {
       query: string;
       cwd?: string;
@@ -429,7 +430,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('memory.rebuildWorkspace', cwd),
     clearWorkspace: (cwd: string): Promise<{ success: boolean; workspaceKey: string }> =>
       ipcRenderer.invoke('memory.clearWorkspace', cwd),
-    clearCoreMemory: (): Promise<{ success: boolean }> => ipcRenderer.invoke('memory.clearCoreMemory'),
+    clearCoreMemory: (): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('memory.clearCoreMemory'),
     rebuildAll: (): Promise<{ success: boolean; workspaceCount: number; sessionCount: number }> =>
       ipcRenderer.invoke('memory.rebuildAll'),
     listFiles: (): Promise<MemoryDebugFileInfo[]> => ipcRenderer.invoke('memory.listFiles'),
@@ -675,7 +677,11 @@ declare global {
         rebuildWorkspace: (cwd: string) => Promise<{ success: boolean; workspaceKey: string }>;
         clearWorkspace: (cwd: string) => Promise<{ success: boolean; workspaceKey: string }>;
         clearCoreMemory: () => Promise<{ success: boolean }>;
-        rebuildAll: () => Promise<{ success: boolean; workspaceCount: number; sessionCount: number }>;
+        rebuildAll: () => Promise<{
+          success: boolean;
+          workspaceCount: number;
+          sessionCount: number;
+        }>;
         listFiles: () => Promise<MemoryDebugFileInfo[]>;
         readFile: (filePath: string) => Promise<MemoryDebugFileContent>;
         inspectSession: (

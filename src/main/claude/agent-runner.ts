@@ -79,6 +79,10 @@ import {
 import { buildPiSessionRuntimeSignature } from './pi-session-runtime';
 import { ThinkTagStreamParser } from './think-tag-parser';
 import {
+  attachDeferredMemoryInjection,
+  type DeferredMemoryInjectionHandle,
+} from './deferred-memory-injector';
+import {
   LoopGuard,
   buildAbortUserMessage,
   buildHaltSteerMessage,
@@ -3005,6 +3009,39 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         }
       });
 
+      // ── Deferred memory injection ──
+      // Background experience retrieval (see MemoryExtension) resolves in
+      // parallel with the first LLM request; when it lands while the turn is
+      // still running we inject it via pi's steering channel. This keeps the
+      // first-token path free of memory LLM round-trips.
+      let promptInProgress = false;
+      let memoryInjectionHandle: DeferredMemoryInjectionHandle | undefined;
+      if (extensionResult.deferredExperience) {
+        const retrievalTimeoutMs = configStore.get('memoryRuntime')?.retrievalTimeoutMs ?? 8000;
+        memoryInjectionHandle = attachDeferredMemoryInjection(extensionResult.deferredExperience, {
+          timeoutMs: retrievalTimeoutMs,
+          isTurnActive: () => promptInProgress && !controller.signal.aborted,
+          sendSteer: (text) => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const sessionAny = piSession as any;
+            if (typeof sessionAny.sendUserMessage !== 'function') {
+              throw new Error('piSession.sendUserMessage is not available');
+            }
+            return Promise.resolve(sessionAny.sendUserMessage(text, { deliverAs: 'steer' }));
+          },
+          onInjected: () => {
+            log('[ClaudeAgentRunner] Deferred memory context injected via steering');
+            this.sendTraceStep(session.id, {
+              id: uuidv4(),
+              type: 'thinking',
+              status: 'completed',
+              title: 'Memory context injected',
+              timestamp: Date.now(),
+            });
+          },
+        });
+      }
+
       // Execute the prompt — unsubscribe in finally to prevent event listener leak
       try {
         resetActivityTimeout();
@@ -3022,12 +3059,16 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
             })
           );
         }
+        promptInProgress = true;
         const promptResult = await piSession.prompt(contextualPrompt);
+        promptInProgress = false;
         log(
           '[ClaudeAgentRunner] prompt() returned:',
           JSON.stringify(promptResult ?? 'void').substring(0, 1000)
         );
       } finally {
+        promptInProgress = false;
+        memoryInjectionHandle?.cancel();
         try {
           unsubscribe();
         } catch (e) {

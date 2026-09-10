@@ -3,7 +3,12 @@ import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../store';
 import { resolveArtifactPath } from '../utils/artifact-path';
 import { normalizeArtifactPathValue } from '../utils/tool-output-path';
-import { getArtifactLabel, getArtifactIconComponent, collectArtifactPaths, shouldDisplayArtifactPath } from '../utils/artifact-steps';
+import {
+  getArtifactLabel,
+  getArtifactIconComponent,
+  collectArtifactPaths,
+  shouldDisplayArtifactPath,
+} from '../utils/artifact-steps';
 import { useIPC } from '../hooks/useIPC';
 import {
   ChevronDown,
@@ -33,12 +38,25 @@ import type { TraceStep, MCPServerInfo, ContentBlock, ToolUseContent } from '../
 import { getMcpToolDisplayName } from './message/toolHelpers';
 
 const EMPTY_STEPS: TraceStep[] = [];
+const EMPTY_MESSAGES: never[] = [];
 
 export function ContextPanel() {
   const { t } = useTranslation();
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const sessions = useAppStore((s) => s.sessions);
-  const sessionStates = useAppStore((s) => s.sessionStates);
+  // Fine-grained slices instead of the whole sessionStates map: streaming
+  // patches sessionStates on every animation frame, but these slices keep
+  // stable references until they actually change — so the panel no longer
+  // re-renders per token.
+  const sessionSteps = useAppStore((s) =>
+    activeSessionId ? s.sessionStates[activeSessionId]?.traceSteps : undefined
+  );
+  const sessionMessages = useAppStore((s) =>
+    activeSessionId ? s.sessionStates[activeSessionId]?.messages : undefined
+  );
+  const contextWindow = useAppStore((s) =>
+    activeSessionId ? s.sessionStates[activeSessionId]?.contextWindow : undefined
+  );
   const appConfig = useAppStore((s) => s.appConfig);
   const contextPanelCollapsed = useAppStore((s) => s.contextPanelCollapsed);
   const toggleContextPanel = useAppStore((s) => s.toggleContextPanel);
@@ -50,11 +68,13 @@ export function ContextPanel() {
   const [mcpServers, setMcpServers] = useState<MCPServerInfo[]>([]);
   const [copiedPath, setCopiedPath] = useState(false);
   const [isChangingDir, setIsChangingDir] = useState(false);
-  const [, setRecentWorkspaceFiles] = useState<Array<{
-    path: string;
-    modifiedAt: number;
-    size: number;
-  }>>([]);
+  const [, setRecentWorkspaceFiles] = useState<
+    Array<{
+      path: string;
+      modifiedAt: number;
+      size: number;
+    }>
+  >([]);
 
   const handleCopyPath = async (path: string) => {
     try {
@@ -72,17 +92,14 @@ export function ContextPanel() {
     }
   };
 
-  const ss = activeSessionId ? sessionStates[activeSessionId] : undefined;
-  const steps = ss?.traceSteps ?? EMPTY_STEPS;
-  const activeSession = activeSessionId ? sessions.find(s => s.id === activeSessionId) : null;
+  const steps = sessionSteps ?? EMPTY_STEPS;
+  const activeSession = activeSessionId ? sessions.find((s) => s.id === activeSessionId) : null;
   const currentWorkingDir = activeSession?.cwd || workingDir;
-  const canShowItemInFolder = typeof window !== 'undefined' && !!window.electronAPI?.showItemInFolder;
+  const canShowItemInFolder =
+    typeof window !== 'undefined' && !!window.electronAPI?.showItemInFolder;
 
   // Session info computations
-  const messages = useMemo(
-    () => (activeSessionId ? sessionStates[activeSessionId]?.messages || [] : []),
-    [activeSessionId, sessionStates]
-  );
+  const messages = sessionMessages ?? EMPTY_MESSAGES;
   const artifactPaths = useMemo(() => collectArtifactPaths(steps, messages), [steps, messages]);
   const activeConfigSet = appConfig?.configSets?.find(
     (set) => set.id === appConfig.activeConfigSetId
@@ -109,7 +126,6 @@ export function ContextPanel() {
 
   // Context usage: last message's input tokens ≈ current context occupation
   const contextUsage = useMemo(() => {
-    const contextWindow = activeSessionId ? sessionStates[activeSessionId]?.contextWindow : undefined;
     if (!contextWindow) return null;
 
     let lastInput = 0;
@@ -123,7 +139,7 @@ export function ContextPanel() {
 
     const percentage = Math.min((lastInput / contextWindow) * 100, 100);
     return { used: lastInput, total: contextWindow, percentage };
-  }, [activeSessionId, sessionStates, messages]);
+  }, [contextWindow, messages]);
 
   const completedStepCount = useMemo(
     () => steps.reduce((n, s) => n + (s.status === 'completed' ? 1 : 0), 0),
@@ -170,16 +186,18 @@ export function ContextPanel() {
       return;
     }
     if (
-      typeof window === 'undefined'
-      || !window.electronAPI?.artifacts?.listRecentFiles
-      || !currentWorkingDir
-      || !activeSession?.createdAt
+      typeof window === 'undefined' ||
+      !window.electronAPI?.artifacts?.listRecentFiles ||
+      !currentWorkingDir ||
+      !activeSession?.createdAt
     ) {
       setRecentWorkspaceFiles([]);
       return;
     }
 
     let cancelled = false;
+    // 2s debounce: each completed tool step used to retrigger a full recursive
+    // workspace scan in the main process; dense tool loops kept the scan hot.
     const timer = setTimeout(async () => {
       try {
         const files = await window.electronAPI.artifacts.listRecentFiles(
@@ -196,7 +214,7 @@ export function ContextPanel() {
           setRecentWorkspaceFiles([]);
         }
       }
-    }, 500);
+    }, 2000);
 
     return () => {
       cancelled = true;
@@ -205,7 +223,6 @@ export function ContextPanel() {
   }, [
     activeSession?.createdAt,
     activeSessionId,
-    steps.length,
     completedStepCount,
     contextPanelCollapsed,
     currentWorkingDir,
@@ -349,20 +366,26 @@ export function ContextPanel() {
             <span className="text-xs font-medium text-text-muted uppercase tracking-wider">
               {t('context.contextUsage')}
             </span>
-            <span className={`text-xs font-medium ${
-              contextUsage.percentage > 95 ? 'text-error' :
-              contextUsage.percentage > 80 ? 'text-warning' :
-              'text-text-primary'
-            }`}>
+            <span
+              className={`text-xs font-medium ${
+                contextUsage.percentage > 95
+                  ? 'text-error'
+                  : contextUsage.percentage > 80
+                    ? 'text-warning'
+                    : 'text-text-primary'
+              }`}
+            >
               {Math.round(contextUsage.percentage)}%
             </span>
           </div>
           <div className="h-1.5 bg-surface-muted rounded-full overflow-hidden">
             <div
               className={`h-full rounded-full transition-all duration-500 ease-out ${
-                contextUsage.percentage > 95 ? 'bg-error' :
-                contextUsage.percentage > 80 ? 'bg-warning' :
-                'bg-gradient-to-r from-accent to-accent-hover'
+                contextUsage.percentage > 95
+                  ? 'bg-error'
+                  : contextUsage.percentage > 80
+                    ? 'bg-warning'
+                    : 'bg-gradient-to-r from-accent to-accent-hover'
               }`}
               style={{ width: `${contextUsage.percentage}%` }}
             />
@@ -407,16 +430,25 @@ export function ContextPanel() {
                   const canClick = Boolean(artifactPath && canShowItemInFolder);
                   const iconComponent = getArtifactIconComponent(label);
                   const IconComponent =
-                    iconComponent === 'presentation' ? FilePieChart
-                    : iconComponent === 'table' ? FileSpreadsheet
-                    : iconComponent === 'document' ? FileText
-                    : iconComponent === 'code' ? FileCode2
-                    : iconComponent === 'image' ? ImageIcon
-                    : iconComponent === 'audio' ? FileAudio2
-                    : iconComponent === 'video' ? FileVideo
-                    : iconComponent === 'archive' ? FileArchive
-                    : iconComponent === 'text' ? File
-                    : File;
+                    iconComponent === 'presentation'
+                      ? FilePieChart
+                      : iconComponent === 'table'
+                        ? FileSpreadsheet
+                        : iconComponent === 'document'
+                          ? FileText
+                          : iconComponent === 'code'
+                            ? FileCode2
+                            : iconComponent === 'image'
+                              ? ImageIcon
+                              : iconComponent === 'audio'
+                                ? FileAudio2
+                                : iconComponent === 'video'
+                                  ? FileVideo
+                                  : iconComponent === 'archive'
+                                    ? FileArchive
+                                    : iconComponent === 'text'
+                                      ? File
+                                      : File;
 
                   return (
                     <div
@@ -424,7 +456,10 @@ export function ContextPanel() {
                       className={`flex items-center gap-2 px-4 py-1.5 transition-colors ${canClick ? 'cursor-pointer hover:bg-surface-hover' : ''}`}
                       onClick={async () => {
                         if (!canClick) return;
-                        const revealed = await window.electronAPI.showItemInFolder(artifactPath, currentWorkingDir ?? undefined);
+                        const revealed = await window.electronAPI.showItemInFolder(
+                          artifactPath,
+                          currentWorkingDir ?? undefined
+                        );
                         if (!revealed) {
                           setGlobalNotice({
                             id: `artifact-reveal-failed-${Date.now()}`,
@@ -457,7 +492,9 @@ export function ContextPanel() {
             <span
               className={`text-xs truncate flex-1 ${currentWorkingDir ? 'text-text-primary cursor-pointer hover:text-accent-primary transition-colors' : 'text-text-muted'}`}
               title={currentWorkingDir ? t('context.openInFileManager') : ''}
-              onClick={() => currentWorkingDir && window.electronAPI?.showItemInFolder(currentWorkingDir)}
+              onClick={() =>
+                currentWorkingDir && window.electronAPI?.showItemInFolder(currentWorkingDir)
+              }
             >
               {currentWorkingDir ? formatPath(currentWorkingDir) : t('context.noFolderSelected')}
             </span>
@@ -549,14 +586,14 @@ export function ContextPanel() {
   );
 }
 
-function ConnectorItem({ 
-  server, 
-  steps, 
+function ConnectorItem({
+  server,
+  steps,
   mcpToolDisplayNames,
-  expanded, 
-  onToggle 
-}: { 
-  server: MCPServerInfo; 
+  expanded,
+  onToggle,
+}: {
+  server: MCPServerInfo;
   steps: TraceStep[];
   mcpToolDisplayNames: Map<string, string>;
   expanded: boolean;
@@ -567,12 +604,12 @@ function ConnectorItem({
   // Tool names are in format: mcp__ServerName__toolname (with double underscores)
   // Server name preserves original case and spaces are replaced with underscores
   const serverNamePattern = server.name.replace(/\s+/g, '_');
-  
+
   const mcpToolsUsed = steps
-    .filter(s => s.toolName?.startsWith('mcp__'))
-    .map(s => s.toolName!)
+    .filter((s) => s.toolName?.startsWith('mcp__'))
+    .map((s) => s.toolName!)
     .filter((name, index, self) => self.indexOf(name) === index)
-    .filter(name => {
+    .filter((name) => {
       // Check if this tool belongs to this server
       // Format: mcp__ServerName__toolname
       const match = name.match(/^mcp__(.+?)__(.+)$/);
@@ -583,8 +620,8 @@ function ConnectorItem({
       return false;
     });
 
-  const usageCount = steps.filter(s => 
-    s.toolName?.startsWith('mcp__') && mcpToolsUsed.includes(s.toolName)
+  const usageCount = steps.filter(
+    (s) => s.toolName?.startsWith('mcp__') && mcpToolsUsed.includes(s.toolName)
   ).length;
 
   return (
@@ -592,21 +629,19 @@ function ConnectorItem({
       <button
         onClick={onToggle}
         className={`w-full px-3 py-2 flex items-center gap-2 transition-colors ${
-          server.connected 
-            ? 'bg-mcp/10 hover:bg-mcp/20' 
-            : 'bg-surface-muted hover:bg-surface-hover'
+          server.connected ? 'bg-mcp/10 hover:bg-mcp/20' : 'bg-surface-muted hover:bg-surface-hover'
         }`}
       >
-        <div className={`w-6 h-6 rounded flex items-center justify-center ${
-          server.connected ? 'bg-mcp/20' : 'bg-surface-muted'
-        }`}>
+        <div
+          className={`w-6 h-6 rounded flex items-center justify-center ${
+            server.connected ? 'bg-mcp/20' : 'bg-surface-muted'
+          }`}
+        >
           <Plug className={`w-3.5 h-3.5 ${server.connected ? 'text-mcp' : 'text-text-muted'}`} />
         </div>
         <div className="flex-1 text-left min-w-0">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-text-primary truncate">
-              {server.name}
-            </span>
+            <span className="text-sm font-medium text-text-primary truncate">{server.name}</span>
             {!server.connected && (
               <span className="text-xs text-text-muted">({t('mcp.notConnected')})</span>
             )}
@@ -618,13 +653,12 @@ function ConnectorItem({
             </p>
           )}
         </div>
-        {server.connected && (
-          expanded ? (
+        {server.connected &&
+          (expanded ? (
             <ChevronDown className="w-4 h-4 text-text-muted" />
           ) : (
             <ChevronRight className="w-4 h-4 text-text-muted" />
-          )
-        )}
+          ))}
       </button>
 
       {expanded && server.connected && (
@@ -633,10 +667,10 @@ function ConnectorItem({
             <>
               <p className="text-xs text-text-muted px-2 py-1">{t('context.toolsUsedLabel')}</p>
               {mcpToolsUsed.map((toolName, index) => {
-                const count = steps.filter(s => s.toolName === toolName).length;
+                const count = steps.filter((s) => s.toolName === toolName).length;
                 const readableName =
                   mcpToolDisplayNames.get(toolName) || getMcpToolDisplayName(toolName);
-                
+
                 return (
                   <div
                     key={index}
@@ -661,21 +695,21 @@ function ConnectorItem({
 // Format long paths to show abbreviated version
 function formatPath(path: string): string {
   if (!path) return '';
-  
+
   // Windows: Replace C:\Users\username with ~
   const winHome = /^[A-Z]:\\Users\\[^\\]+/i;
   const winMatch = path.match(winHome);
   if (winMatch) {
     return '~' + path.slice(winMatch[0].length).replace(/\\/g, '/');
   }
-  
+
   // macOS/Linux: Replace /Users/username or /home/username with ~
   const unixHome = /^\/(?:Users|home)\/[^/]+/;
   const unixMatch = path.match(unixHome);
   if (unixMatch) {
     return '~' + path.slice(unixMatch[0].length);
   }
-  
+
   return path;
 }
 
