@@ -9,6 +9,11 @@ dist-lima-agent/
 dist-mcp/
 release/
 
+# tsc artifacts that would shadow vite.config.ts (Vite resolves .js before .ts)
+vite.config.js
+vite.config.d.ts
+*.tsbuildinfo
+
 # Bundled Node.js binaries
 resources/node/
 

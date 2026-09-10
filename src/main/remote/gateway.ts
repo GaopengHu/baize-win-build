@@ -5,7 +5,14 @@
 
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
-import { WebSocketServer, WebSocket } from 'ws';
+// IMPORTANT: default import + runtime destructuring (NOT `import { ... } from 'ws'`).
+// ws@8 exports `module.exports = WebSocket` (a class extending EventEmitter).
+// A named import makes Rollup emit its namespace interop helper, whose
+// `for...in` loop walks the prototype chain; under Electron 22 (Node 16) the
+// inherited EventEmitter statics are enumerable but have no own descriptor,
+// crashing the whole bundle at load ("Cannot read properties of undefined
+// (reading 'get')"). See tests/ws-namespace-interop-guard.test.ts.
+import wsLib from 'ws';
 import { createServer, Server as HttpServer, IncomingMessage, ServerResponse } from 'http';
 import { log, logError, logWarn } from '../utils/logger';
 import type {
@@ -20,6 +27,18 @@ import type {
   GatewayEvent,
 } from './types';
 import { MessageRouter } from './message-router';
+
+// Runtime bindings (value space) + matching instance types (type space).
+// ws's CJS exports is the WebSocket class with aliases attached at runtime
+// (WebSocket.WebSocket / WebSocket.WebSocketServer); @types/ws (index.d.mts)
+// models them as module-level named exports. Casting the default import to the
+// module shape bridges the two. Same-name const/type declarations merge, so
+// `new WebSocketServer(...)`, `WebSocket.OPEN`, `ws: WebSocket` and
+// `wss?: WebSocketServer` keep their original semantics.
+type WsModule = typeof import('ws');
+const { WebSocketServer, WebSocket } = wsLib as unknown as WsModule;
+type WebSocket = import('ws').WebSocket;
+type WebSocketServer = import('ws').WebSocketServer;
 
 // WebSocket client connection
 interface WSClient {
