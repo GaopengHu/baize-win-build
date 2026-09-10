@@ -2779,7 +2779,7 @@ ipcMain.handle('memory.setEnabled', (_event, enabled: boolean) => {
   return result;
 });
 
-ipcMain.handle('logs.write', (_event, level: 'info' | 'warn' | 'error', args: unknown[]) => {
+ipcMain.handle('logs.write', (_event, level: 'info' | 'warn' | 'error', ...args: unknown[]) => {
   try {
     if (level === 'warn') {
       logWarn(...args);
@@ -2913,12 +2913,18 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
     case 'session.getMessages':
       return sm.getMessages(event.payload.sessionId);
 
-    case 'session.getMessagesPaginated':
-      return sm.getMessagesPaginated(
+    case 'session.getMessagesPaginated': {
+      const t0 = performance.now();
+      const result = sm.getMessagesPaginated(
         event.payload.sessionId,
         event.payload.limit,
         event.payload.offset
       );
+      const t1 = performance.now();
+      const jsonStr = JSON.stringify(result);
+      logWarn(`[DIAG] getMessagesPaginated: query=${Math.round(t1-t0)}ms stringify=${Math.round(performance.now()-t1)}ms jsonLen=${jsonStr.length}`);
+      return jsonStr;
+    }
 
     case 'session.getTraceSteps':
       return sm.getTraceSteps(event.payload.sessionId);

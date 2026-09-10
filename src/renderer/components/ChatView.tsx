@@ -327,7 +327,18 @@ export function ChatView() {
     return () => container.removeEventListener('scroll', onScroll);
   }, [activeSessionId, hasMoreMessages, loadMoreMessages]);
 
-
+  // Measure render time for first message batch (after paint)
+  useEffect(() => {
+    const count = messages.length;
+    if (count > 0) {
+      const t0 = performance.now();
+      requestAnimationFrame(() => {
+        const elapsed = Math.round(performance.now() - t0);
+        window.electronAPI?.logs?.write?.('warn', `[DIAG] ChatView rendered ${count} messages in ${elapsed}ms`);
+        console.error(`[DIAG] ChatView rendered ${count} messages in ${elapsed}ms`);
+      });
+    }
+  }, [messages.length]);
 
   useEffect(() => {
     const messageCount = messages.length;

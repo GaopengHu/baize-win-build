@@ -179,7 +179,11 @@ export function Sidebar() {
       const existingMessages = currentSessionStates[sessionId]?.messages;
       if ((!existingMessages || existingMessages.length === 0) && isElectron) {
         try {
+          const t0 = performance.now();
           const result = await getSessionMessagesPaginated(sessionId, 50, 0);
+          const t1 = performance.now();
+          window.electronAPI?.logs?.write?.('warn', `[DIAG] IPC round-trip: ${Math.round(t1 - t0)}ms msgs=${result.messages?.length ?? 0}`);
+          console.error(`[DIAG] IPC round-trip: ${Math.round(t1 - t0)}ms msgs=${result.messages?.length ?? 0}`);
           if (result.messages && result.messages.length > 0) {
             setMessages(sessionId, result.messages);
           }

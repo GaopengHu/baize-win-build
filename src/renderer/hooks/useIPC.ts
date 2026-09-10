@@ -740,10 +740,12 @@ export function useIPC() {
       if (!isElectron) {
         return { messages: [], total: 0, hasMore: false };
       }
-      return invoke<{ messages: Message[]; total: number; hasMore: boolean }>({
+      // Handler returns JSON string to bypass Electron's structured clone overhead
+      const jsonStr = await invoke<string>({
         type: 'session.getMessagesPaginated',
         payload: { sessionId, limit, offset },
       });
+      return JSON.parse(jsonStr);
     },
     [invoke]
   );
