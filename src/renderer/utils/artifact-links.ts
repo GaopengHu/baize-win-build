@@ -7,14 +7,43 @@ import { resolveArtifactPath } from './artifact-path';
 import { extractFilePathCandidatesFromText, normalizeArtifactPathValue } from './tool-output-path';
 
 const DOWNLOADABLE_EXTENSIONS = new Set([
-  'pptx', 'ppt', 'key', 'keynote',
-  'docx', 'doc', 'pdf',
-  'xlsx', 'xls', 'csv', 'tsv',
-  'txt', 'md', 'markdown', 'rtf', 'odt', 'ods', 'odp',
-  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg',
-  'mp3', 'wav', 'm4a', 'ogg',
-  'mp4', 'mov', 'mkv', 'webm',
-  'zip', 'rar', '7z', 'tar', 'gz',
+  'pptx',
+  'ppt',
+  'key',
+  'keynote',
+  'docx',
+  'doc',
+  'pdf',
+  'xlsx',
+  'xls',
+  'csv',
+  'tsv',
+  'txt',
+  'md',
+  'markdown',
+  'rtf',
+  'odt',
+  'ods',
+  'odp',
+  'png',
+  'jpg',
+  'jpeg',
+  'gif',
+  'webp',
+  'svg',
+  'mp3',
+  'wav',
+  'm4a',
+  'ogg',
+  'mp4',
+  'mov',
+  'mkv',
+  'webm',
+  'zip',
+  'rar',
+  '7z',
+  'tar',
+  'gz',
 ]);
 
 const FILE_GENERATED_PATTERNS = [
@@ -118,9 +147,16 @@ export function appendFolderOpenLinks(text: string, workingDir?: string | null):
       const line = outputLines[i] ?? '';
       if (!line.trim()) continue;
 
-      const hasFilename = new RegExp(`\b${escapedName}\b`, 'i').test(line);
+      // NOTE: these patterns must escape the backslashes for the RegExp
+      // *source*. Inside a template literal `\[` collapses to `[` and `\b` is
+      // U+0008 (backspace), so the previous version silently compiled
+      // `[microservice-arch\.png]([^)]+)` — a CHARACTER CLASS whose `h-.`
+      // range is invalid. Any generated filename containing `-` threw
+      // "Range out of order in character class" while rendering a message,
+      // which the panel error boundary turned into a blank conversation.
+      const hasFilename = line.trim().toLowerCase() === displayName.toLowerCase();
       const hasResolvedPath = new RegExp(escapedResolved, 'i').test(line);
-      const hasMarkdownLink = new RegExp(`\[${escapedName}\]\([^\)]+\)`, 'i').test(line);
+      const hasMarkdownLink = new RegExp(`\\[${escapedName}\\]\\([^)]+\\)`, 'i').test(line);
 
       if (!hasFilename && !hasResolvedPath && !hasMarkdownLink) {
         continue;

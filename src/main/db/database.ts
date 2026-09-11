@@ -485,7 +485,9 @@ export function initDatabase(): DatabaseInstance {
   `);
 
   const getMessagesPaginatedStmt = rawDb.prepare(`
-    SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?
+    SELECT * FROM messages WHERE session_id = ?
+    ORDER BY timestamp DESC, rowid DESC
+    LIMIT ? OFFSET ?
   `);
 
   const getMessageCountBySessionStmt = rawDb.prepare(`

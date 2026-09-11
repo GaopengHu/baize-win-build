@@ -11,6 +11,7 @@ import {
   useActiveExecutionClock,
   useAppConfig,
   useActiveHasMoreMessages,
+  useLoadingSessionId,
 } from '../store/selectors';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
@@ -57,6 +58,7 @@ export function ChatView() {
   const pendingTurns = usePendingTurns();
   const executionClock = useActiveExecutionClock();
   const appConfig = useAppConfig();
+  const loadingSessionId = useLoadingSessionId();
   const setGlobalNotice = useAppStore((s) => s.setGlobalNotice);
   const { continueSession, stopSession, getSessionMessagesPaginated, isElectron } = useIPC();
   const prependMessages = useAppStore((s) => s.prependMessages);
@@ -125,8 +127,14 @@ export function ChatView() {
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRequestRef = useRef<number | null>(null);
   const isScrollingRef = useRef(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const loadingMoreRef = useRef(false);
   const prevActiveSessionIdRef = useRef<string | null>(null);
+  // While a freshly opened session is being settled at the bottom, scroll
+  // events come from our own code — not the user — so they must not feed
+  // isUserAtBottomRef or trigger pagination.
+  const suppressScrollStateRef = useRef(false);
+  const suppressScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const hasActiveTurn = Boolean(activeTurn);
   const pendingCount = pendingTurns.length;
@@ -136,6 +144,7 @@ export function ChatView() {
   const loadMoreMessages = useCallback(async () => {
     if (!activeSessionId || loadingMoreRef.current || !hasMoreMessages || !isElectron) return;
     loadingMoreRef.current = true;
+    setIsLoadingMore(true);
     try {
       const result = await getSessionMessagesPaginated(activeSessionId, 50, messages.length);
       if (result.messages.length > 0) {
@@ -156,6 +165,7 @@ export function ChatView() {
       console.error('[ChatView] loadMoreMessages failed:', e);
     } finally {
       loadingMoreRef.current = false;
+      setIsLoadingMore(false);
     }
   }, [
     activeSessionId,
@@ -165,6 +175,11 @@ export function ChatView() {
     getSessionMessagesPaginated,
     prependMessages,
   ]);
+
+  // Stable ref for loadMoreMessages so the scroll effect doesn't re-run every
+  // time messages.length changes (which recreates loadMoreMessages).
+  const loadMoreMessagesRef = useRef(loadMoreMessages);
+  loadMoreMessagesRef.current = loadMoreMessages;
 
   useEffect(() => {
     // When switching sessions, restore the input capsule to its widest
@@ -286,28 +301,46 @@ export function ChatView() {
     const container = scrollContainerRef.current;
     if (!container) return;
 
-    // Skip the initial scroll-to-top check when switching sessions.
-    // handleSessionClick already loads messages via IPC; triggering
-    // loadMoreMessages here would cause a duplicate IPC call.
+    // The listener MUST be attached on every run, including the run triggered
+    // by a session switch. An earlier fix returned early here to avoid a
+    // duplicate page-0 load; because the deps below only change when
+    // hasMoreMessages flips, a session whose hasMoreMessages stays at its
+    // default `true` (i.e. any history longer than one page) never re-ran this
+    // effect and therefore never got a scroll listener — scrolling to the top
+    // loaded nothing and long conversations stayed truncated.
     const sessionJustChanged = prevActiveSessionIdRef.current !== activeSessionId;
     prevActiveSessionIdRef.current = activeSessionId;
-    if (sessionJustChanged) return;
 
     const updateScrollState = () => {
+      // Ignore scroll events produced by our own programmatic scrolling: during
+      // the layout pass after a switch distanceToBottom is still huge, and
+      // recording that pinned isUserAtBottomRef=false, leaving the newly opened
+      // conversation stuck at the top.
+      if (suppressScrollStateRef.current || isScrollingRef.current) return;
       const distanceToBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight;
       isUserAtBottomRef.current = distanceToBottom <= 80;
       // Load more messages when scrolling near the top (within 200px)
       if (container.scrollTop <= 200 && hasMoreMessages) {
-        loadMoreMessages();
+        loadMoreMessagesRef.current();
       }
     };
-    updateScrollState();
+
+    // Skip only the *initial* check right after a switch: the container sits at
+    // scrollTop 0 while hasMoreMessages still holds the previous session's
+    // value, which would fire a duplicate page-0 load on top of the one
+    // handleSessionClick already issued.
+    if (!sessionJustChanged) updateScrollState();
+
     // 用户阅读旧消息时，阻止新消息自动滚动打断视线
     const onScroll = () => updateScrollState();
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);
-  }, [activeSessionId, hasMoreMessages, loadMoreMessages]);
+    // hasMoreMessages in deps so re-binding picks up when loadMore becomes a
+    // no-op. loadMoreMessages itself is accessed through the stable ref above
+    // so we don't need to re-bind the scroll listener when it's recreated.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, hasMoreMessages]);
 
   useEffect(() => {
     const messageCount = messages.length;
@@ -342,11 +375,46 @@ export function ChatView() {
     if (!activeSessionId) return;
     // Force scroll to bottom immediately (no animation)
     isUserAtBottomRef.current = true;
+    suppressScrollStateRef.current = true;
+    if (suppressScrollTimerRef.current) clearTimeout(suppressScrollTimerRef.current);
+    // Safety net: an empty session never delivers messages, so nothing would
+    // release the suppression below — always fall back to a timeout.
+    suppressScrollTimerRef.current = setTimeout(() => {
+      suppressScrollStateRef.current = false;
+      suppressScrollTimerRef.current = null;
+    }, 1500);
     const container = scrollContainerRef.current;
     if (container) {
       container.scrollTop = container.scrollHeight;
     }
   }, [activeSessionId]);
+
+  // The switch above runs while the list is still empty (the first page is in
+  // flight), so settle at the bottom once again after it has painted, then hand
+  // control back to the scroll listener.
+  useEffect(() => {
+    if (!activeSessionId || messages.length === 0) return;
+    if (!suppressScrollStateRef.current) return;
+    let innerRaf = 0;
+    const outerRaf = requestAnimationFrame(() => {
+      innerRaf = requestAnimationFrame(() => {
+        const container = scrollContainerRef.current;
+        if (container) {
+          isUserAtBottomRef.current = true;
+          container.scrollTop = container.scrollHeight;
+        }
+        suppressScrollStateRef.current = false;
+        if (suppressScrollTimerRef.current) {
+          clearTimeout(suppressScrollTimerRef.current);
+          suppressScrollTimerRef.current = null;
+        }
+      });
+    });
+    return () => {
+      cancelAnimationFrame(outerRaf);
+      if (innerRaf) cancelAnimationFrame(innerRaf);
+    };
+  }, [activeSessionId, messages.length]);
 
   // Additional scroll trigger for content height changes (e.g., TodoWrite expand/collapse)
   useEffect(() => {
@@ -377,6 +445,9 @@ export function ChatView() {
       }
       if (scrollRequestRef.current) {
         cancelAnimationFrame(scrollRequestRef.current);
+      }
+      if (suppressScrollTimerRef.current) {
+        clearTimeout(suppressScrollTimerRef.current);
       }
     };
   }, []);
@@ -1151,16 +1222,24 @@ export function ChatView() {
           ref={messagesContainerRef}
           className="w-full max-w-[920px] mx-auto py-8 px-5 lg:px-8 space-y-5"
         >
-          {hasMoreMessages && messages.length > 0 && (
+          {isLoadingMore && messages.length > 0 && (
             <div className="flex justify-center py-2">
               <Loader2 className="w-4 h-4 animate-spin text-text-muted" />
             </div>
           )}
           {displayedMessages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">今点通</p>
-              <p className="text-base text-text-secondary">{t('chat.startConversation')}</p>
-            </div>
+            loadingSessionId === activeSessionId ? (
+              // Session data is being loaded — show a subtle loading indicator
+              <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
+                <Loader2 className="w-5 h-5 animate-spin text-accent" />
+                <p className="text-sm text-text-secondary">{t('chat.loadingConversation')}</p>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">今点通</p>
+                <p className="text-base text-text-secondary">{t('chat.startConversation')}</p>
+              </div>
+            )
           ) : (
             roundPlans.map((round) => (
               <div key={round.key} className="space-y-5">
