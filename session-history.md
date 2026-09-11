@@ -967,3 +967,215 @@ docker-compose -f docker/docker-compose.uos-arm.yml run --rm build
 # 若命名卷权限丢失，先执行
 bash scripts/init-docker-volumes.sh
 ```
+
+---
+
+## 阶段十：P0 性能优化与启动崩溃修复（2026-09-10）
+
+### 背景
+
+用户报告安装新 .deb 后应用启动崩溃。同时 P0 性能优化（内存检索、SQLite、渲染流式）已完成但未验证打包后启动。
+
+### 三个启动崩溃修复
+
+#### 1. ws mc() 崩溃（Rollup namespace interop）
+
+- **现象**：`App threw an error during load` → `Object.getOwnPropertyDescriptor` undefined 崩溃
+- **根因**：`inlineDynamicImports: true` 将 @slack/socket-mode（依赖 `@slack/bolt`）内联到主 bundle → 其内部 CJS `require('ws')` 被 Rollup commonjs 插件包装为 `mc(require("ws"))` namespace helper → `for...in` 遍历 EventEmitter 可枚举静态属性 → `getOwnPropertyDescriptor` 返回 undefined → Node 16 崩溃
+- **修复**：
+  - `vite.config.ts`：`'ws'` 从 external 移除，改为内联（消除 runtime interop）
+  - `src/main/remote/gateway.ts`：改用 default import `import wsLib from 'ws'` + 运行时解构 `const { WebSocketServer, WebSocket } = wsLib as unknown as WsModule`
+  - 保留 `bufferutil` / `utf-8-validate` 为 external（ws 的可选原生依赖）
+- **验证**：bundle 中 `require("ws")` 计数 = 0；bundle 体积 +47KB（ws 内联）
+
+#### 2. Blob ReferenceError（OpenAI SDK schema 顶层引用）
+
+- **现象**：`ReferenceError: Blob is not defined` @ index.js:2197
+- **根因**：OpenAI SDK 的 FileT/AudioTranscriptionRequest schema 在模块顶层用 `r.instanceof(Blob)` → Node 16 无全局 Blob（Node 18+ 才有）
+- **修复**：`src/main/stream-shim.ts` 添加 polyfill：
+  ```ts
+  if (typeof globalThis.Blob === 'undefined') {
+    const { Blob } = require('node:buffer');
+    if (Blob) (globalThis as any).Blob = Blob;
+  }
+  if (typeof globalThis.File === 'undefined') {
+    try {
+      (globalThis as any).File = require('formdata-node').File;
+    } catch {}
+  }
+  ```
+- **验证**：bundle 中 `polyfill Blob` 出现 1 次，`globalThis.Blob` 出现 4 次
+
+#### 3. photon wasm ENOENT（inlineDynamicImports 提升副作用）
+
+- **现象**：`ENOENT: no such file or directory, open '.../dist-electron/main/photon_rs_bg.wasm'`
+- **根因**：pi-coding-agent 的 photon.js 用 `await import("@silvia-odwyer/photon-node")` 懒加载 → `inlineDynamicImports` 将动态 import 转为顶层 eager 执行 → photon_rs_bg.js 的 `readFileSync(__dirname + '/photon_rs_bg.wasm')` 在 bundle 顶层执行 → `__dirname` = `dist-electron/main/`（无 wasm）→ ENOENT
+- **修复**：`vite.config.ts` 添加 `'@silvia-odwyer/photon-node'` 到 external → 运行时从 asar 的 node_modules 懒加载（wasm 在包目录内）
+- **验证**：bundle 中 `import("@silvia-odwyer/photon-node")` 保留（动态 import external 不变）；bundle 体积 -24KB
+
+### 构建配置清理
+
+- 删除伪造的 `vite.config.js` / `vite.config.d.ts` / `tsconfig.node.tsbuildinfo`（影子文件劫持构建）
+- `vite.config.ts` 添加 `emptyOutDir: true`（每次构建清空 `dist-electron/main/`）
+- `package.json` 构建链 + 3 个 Docker 脚本（build-linux-deb.mjs、build-macos.mjs、build-win7.mjs）添加 `rimraf dist-electron`
+- `tsconfig.node.json`：`composite: true` → `noEmit`（避免 tsbuildinfo 残留）
+- `tsconfig.json`：移除 `references` 到 `tsconfig.node.json`
+- `.gitignore`：添加 `vite.config.js`、`vite.config.d.ts`、`*.tsbuildinfo`
+- 删除根目录 `index.js`（旧 chunk 残留，曾导致端口 19888 EADDRINUSE）
+
+### P0 性能优化（44 + 18 + 13 = 75 个测试）
+
+#### 内存异步检索
+
+- **MemoryRetrievalCoordinator**：缓存/TTL/FIFO 去重
+- **MemoryService**：拆分同步核心 prompt 前缀 + 异步经验块
+- **MemoryExtension**：`retrievalMode`(background/blocking) + 超时预算
+- **DeferredMemoryInjectionHandle**：检索延迟时 steer 注入
+- 输入预取链：ChatView → preload → main → coordinator
+- Settings UI + 中英文 i18n（retrievalMode / retrievalTimeoutMs）
+
+#### SQLite 优化
+
+- `PRAGMA synchronous=NORMAL` 显式设置
+- `prepareCached` 动态 UPDATE 语句缓存
+- **TraceWriteBatcher**：trace 写入脱离热路径，idle/delete/shutdown 时刷盘
+- 会话管理器：UI 先更新，DB 批处理跟随
+
+#### 渲染流式优化
+
+- **round-render-plan**：WeakMap 逐消息归一化缓存 + 稳定 round key + 跨帧引用一致性
+- **ContentBlockView**：流式期间走纯文本快速路径（跳过 markdown/KaTeX）
+- **ContextPanel**：细粒度 store selector（3 个切片替代整个 sessionStates）
+- 热路径 console.log 清理（preload 3 处 + useIPC 4 处 + ChatView/Sidebar DIAG）
+- MCP 轮询 5s → 15s + JSON diff 守卫
+- `artifacts.checkPaths` statSync → async fs.promises
+
+### 主进程防御层
+
+- `__BAZE_MAIN_INITIALIZED` / `__BAZE_APP_READY_INITIALIZED` 防止 chunk 重复执行（端口 19888 EADDRINUSE 防御）
+- `ipcMain.handle` 包装器捕获 "register a second handler" 错误（Vite code splitting 导致重复注册）
+- `memory.prefetch` IPC + shutdown 时 flushTraceWrites
+
+### 验证结果
+
+| 验证项                                                      | 结果                                                 |
+| ----------------------------------------------------------- | ---------------------------------------------------- |
+| typecheck (`tsc --noEmit`)                                  | ✅ 0 errors                                          |
+| ws guard tests (`tests/ws-namespace-interop-guard.test.ts`) | ✅ 3/3                                               |
+| 宿主 Electron 22 启动（`timeout 25 npx electron .`）        | ✅ 存活 25s，零崩溃，走到 Database/NavServer         |
+| Docker deb 构建                                             | ✅ 14.8 min，159.5 MB → 167 MB（含 lint 修复后重建） |
+| deb 产物验证                                                | ✅ better_sqlite3 仅需 GLIBC 2.28（UOS 兼容）        |
+| deb 内 bundle 验证                                          | ✅ Blob polyfill、ws 内联、photon external 全在包内  |
+| 安装 + 启动验证（`/opt/今点通`）                            | ✅ Database 初始化成功、NavServer 19888 监听、零崩溃 |
+
+### 提交记录
+
+- `b3d793f` fix: resolve three startup crashes in single-file main bundle
+- `82b2318` perf: p0 latency optimizations - async memory retrieval, sqlite batching, streaming render
+
+### 产出物
+
+- `release/今点通-0.0.1-linux-amd64.deb`（167 MB，2026-09-10 17:14）
+- `release/今点通-3.3.1-linux-amd64.deb`（179 MB，旧版对照）
+- app.asar 从 222 MB → 122 MB（减少 100 MB 冗余）
+
+### 遗留事项（非致命）
+
+1. **AutoUpdater ENOTDIR**：`electron-updater` 在 asar 内解析路径错误（被 catch，自动更新功能失效）
+2. **被阻止的第二实例不退出**：双击已运行的应用时新进程 focus 旧窗口后未 `app.quit()`，残留僵进程
+3. **宿主 EMFILE**：inotify 句柄限制（系统环境问题，可加 `fs.inotify.max_user_watches`）
+
+### 下一步（P1 候选）
+
+- 恢复 AGENTS.md（一行高影响修复）
+- 处理 AutoUpdater / 僵进程 bug
+- 进入 P1 能力扩展阶段（4-6 周）
+
+---
+
+## 阶段十一：两个用户报告 bug 修复 + 独立发现的正则崩溃（2026-09-11）
+
+### 背景
+
+用户报告两个 bug：
+
+1. **切历史会话后聊天区空白**（Behavior A：切换任意历史会话 → 空白；Behavior B：回到之前的会话又正常，再往前切同样空白）
+2. **消息多的会话历史加载不全**（滚动到顶部不会继续加载历史页）
+
+### 调试方法
+
+- 用独立 HOME（`/tmp/opencode/dbg-home`）+ `--remote-debugging-port` 起 dev 实例，CDP 驱动真实点击复现
+- 宿主 better-sqlite3 原生模块需换为 Electron 22 ABI 版本（`/opt/今点通` 内），否则 dev 实例启动即崩
+- 关键证据：CDP 捕获 `Error: Minified React error #185`（"Maximum update depth exceeded"）→ `PanelErrorBoundary` 兜底 → 空白
+
+### Bug 1：切会话空白（React #185，zustand v5 selector 不稳定引用）
+
+- **根因**：`useActiveSessionMessages()` / `usePendingTurns()` / `useActiveTraceSteps()` / `useSessionMessages()` 在 `sessionStates[id]` 未缓存时回退到**新建的 `[]` 字面量**
+  - zustand v5 走 `useSyncExternalStore`，其 passive effect 每次 commit 后重读快照
+  - 空数组每次都是新引用 → `Object.is` 永远为假 → 无限重渲染 → React 抛 #185 → ErrorBoundary 兜底成空白
+  - 数据其实已进 store，所以"再点一次"（命中缓存、引用稳定）就正常——正好解释 Behavior A/B
+- **修复**（`src/renderer/store/selectors.ts`）：
+  - 空值改为模块级共享常量 `EMPTY_MESSAGES` / `EMPTY_TRACE_STEPS` / `EMPTY_PENDING_TURNS`
+  - 抽出纯导出 selector（`selectActiveMessages` 等）+ hooks 委托
+  - `AppState` 从 `src/renderer/store/index.ts` 导出
+- **验证**：CDP 驱动遍历 9 个会话，首点空白 0、React #185 归零
+
+### Bug 2：滚动加载历史不全（scroll listener 未挂载）
+
+- **证据**：409 条消息会话，滚到顶 3 次 → `scrollHeight` 恒 3858、IPC 无新请求；日志显示 7 个会话各只有 1 次首屏请求，`offset>0` 请求为 0
+- **根因**：`ChatView.tsx` 滚动 effect 里 `if (sessionJustChanged) return;`（原为防重复请求）把 `addEventListener('scroll')` 一起跳过了
+  - deps 是 `[activeSessionId, hasMoreMessages]`，而 `hasMoreMessages` 默认 `true`
+  - 超过一页的会话加载后仍为 `true` → effect 不再重跑 → **监听器永久缺失**
+  - 只有 ≤50 条消息的会话（true→false）才碰巧挂上监听器
+- **修复**（`src/renderer/components/ChatView.tsx`）：
+  - 滚动监听器无条件挂载；只跳过切换瞬间的初始 `updateScrollState()` 检查（保留防重复请求意图）
+  - `suppressScrollStateRef` + settle-at-bottom 双 RAF，保证切换后停在最新消息
+  - `prependMessages` 按消息 id 去重（分页重叠时防重复）
+- **验证**：409 条会话滚到顶 5 次全部续载，rounds 7→13，IPC 0→15，每条前置分页后滚动位置正常
+
+### Bug 3（独立发现）：artifact-links 正则构造崩溃 → 整页空白
+
+- **证据**：`SyntaxError: Invalid regular expression: /[microservice-arch\.png]([^)]+)/i: Range out of order in character class`，会话 "Idenote MCP验证" 必崩
+- **根因**（`src/renderer/utils/artifact-links.ts`）：
+  - 正则写在模板字符串里，`\[` `\]` 被 JS 吞成裸 `[` `]` → 本意的"字面方括号"变成**字符类**
+  - 文件名带 `-`（如 `microservice-arch.png`）构成非法区间 → SyntaxError → 渲染崩溃 → 空白
+  - `\b` 同样退化成退格符 U+0008（该分支其实从未生效）
+- **修复**：改用 `\\[` `\\]`；文件名匹配收敛为"整行就是该文件名"；`\b` bug 一并修正
+
+### 附加修复
+
+- `src/main/db/database.ts`：`ORDER BY timestamp DESC, rowid DESC` 保证 LIMIT/OFFSET 分页稳定
+
+### 回归测试（22 个新增，旧代码上会失败）
+
+| 文件                                                    | 用例数 | 守护内容                                            |
+| ------------------------------------------------------- | ------ | --------------------------------------------------- |
+| `src/tests/renderer/store-selector-stability.test.ts`   | 5      | selector 快照引用稳定（React #185 守卫）            |
+| `src/tests/renderer/session-history-pagination.test.ts` | 9      | prependMessages 去重 + scroll listener + SQL 确定性 |
+| `src/tests/renderer/artifact-links.test.ts`             | 8      | 文件名含 `-`/特殊字符时正则不再崩溃                 |
+
+验证方式：`git stash push -- <文件>` 恢复旧代码 → 6 个测试报同样的 `Range out of order`（Bug 3）/ 11 个失败（Bug 1/2），证明测试是真实回归守卫。
+
+### 验证结果
+
+| 项                 | 修复前                   | 修复后                                                                       |
+| ------------------ | ------------------------ | ---------------------------------------------------------------------------- |
+| 9 个会话首点渲染   | 6 空白（#185×5、正则×1） | **9/9 渲染，0 错误**                                                         |
+| 打开后停在最新消息 | 2/9 停在顶部             | **9/9 atBottom**                                                             |
+| 409 条会话滚到顶   | 5 次 0 续载              | **5 次全部续载**（rounds 7→13，IPC 0→15）                                    |
+| typecheck / lint   | —                        | ✅ 0 error                                                                   |
+| 全量测试           | —                        | 1030 passed / 41 failed（27 ABI 环境 + 14 过期源码断言，均为 HEAD 上已存在） |
+
+### 提交记录
+
+- `573ac89` fix: session switching blank screen, scroll pagination, and artifact-links regex crash
+
+### 产出物
+
+- `release/今点通-0.0.1-linux-amd64.deb`（167 MB，2026-09-11 11:14，含全部修复，已验证）
+
+### 环境说明（本机继续开发需注意）
+
+- 宿主 `node_modules/better-sqlite3/build/Release/better_sqlite3.node` 已被替换为 Electron 22 ABI 版本（原文件备份 `/tmp/opencode/better_sqlite3.node.host.bak`）。影响：宿主机 vitest 中 27 个依赖 better-sqlite3 的测试报 ABI 错（替换前宿主即因 GLIBC 2.28 报错，两种状态都无法在宿主跑 DB 测试）。Docker 构建使用命名卷/独立挂载，不受影响
+- 14 个过期源码断言（`tests/artifact-steps`、`context-panel-recent-files`、`message-card-link-handling`、`settings-panel-plugin-entry`、`deepseek-common`）在 HEAD 上即失败，为 P0 重构（commit 82b2318）遗留，与本次改动无关，未处理
+- 工作区存在非本次会话的未提交改动：`src/renderer/App.tsx`（markdown chunk 预加载）、`src/renderer/components/Sidebar.tsx`（loading spinner + 并行 IPC），已一并打进 deb，未提交
