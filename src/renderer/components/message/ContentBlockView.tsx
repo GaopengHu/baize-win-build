@@ -14,6 +14,7 @@ import {
   resolveLocalFilePathFromHref,
 } from '../../utils/markdown-local-link';
 import { normalizeLatexDelimiters } from '../../utils/latex-delimiters';
+import { appendFolderOpenLinks } from '../../utils/artifact-links';
 import type { ToolUseContent, ToolResultContent, FileAttachmentContent } from '../../types';
 import { FileText } from 'lucide-react';
 import { CodeBlock } from './CodeBlock';
@@ -49,36 +50,27 @@ export const ContentBlockView = memo(function ContentBlockView({
 
   const resolveFilePath = (value: string) => resolvePathAgainstWorkspace(value, currentWorkingDir);
 
-  const handleDownloadFile = async (filePath: string) => {
-    if (typeof window === 'undefined' || !window.electronAPI?.saveFileToDownloads) {
+  const openContainingFolder = async (filePath: string) => {
+    if (typeof window === 'undefined' || !window.electronAPI?.showItemInFolder) {
       return;
     }
 
     const resolvedPath = resolveFilePath(filePath);
     try {
-      const result = await window.electronAPI.saveFileToDownloads(
+      const revealed = await window.electronAPI.showItemInFolder(
         resolvedPath,
         currentWorkingDir ?? undefined
       );
-      if (!result?.success) {
+      if (!revealed) {
         setGlobalNotice({
-          id: `message-card-download-failed-${Date.now()}`,
+          id: `message-card-reveal-failed-${Date.now()}`,
           type: 'warning',
-          message: result?.error || t('context.revealFailed'),
+          message: t('context.revealFailed'),
         });
-        return;
       }
-
-      setGlobalNotice({
-        id: `message-card-download-success-${Date.now()}`,
-        type: 'success',
-        message: result.savedPath
-          ? `已下载到 ${result.savedPath}`
-          : t('messageCard.downloadSuccess'),
-      });
     } catch (error) {
       setGlobalNotice({
-        id: `message-card-download-failed-${Date.now()}`,
+        id: `message-card-reveal-failed-${Date.now()}`,
         type: 'warning',
         message:
           error instanceof Error && error.message ? error.message : t('context.revealFailed'),
@@ -91,12 +83,12 @@ export const ContentBlockView = memo(function ContentBlockView({
       key={key}
       type="button"
       onClick={() => {
-        void handleDownloadFile(value);
+        void openContainingFolder(value);
       }}
       className={getFileLinkButtonClassName()}
       title={resolveFilePath(value)}
     >
-      {value}
+      <span className="truncate">{value}</span>
     </button>
   );
 
@@ -133,7 +125,7 @@ export const ContentBlockView = memo(function ContentBlockView({
             <button
               type="button"
               onClick={() => {
-                void handleDownloadFile(localFilePath);
+                void openContainingFolder(localFilePath);
               }}
               className={getFileLinkButtonClassName()}
               title={localFilePath}
@@ -245,15 +237,33 @@ export const ContentBlockView = memo(function ContentBlockView({
     case 'text': {
       const textBlock = block as { type: 'text'; text: string };
       const text = textBlock.text || '';
-      const normalizedText = normalizeCitationMarkdownLinks(
-        normalizeLocalFileMarkdownLinks(normalizeLatexDelimiters(text))
-      );
 
       if (!text) {
         return <span className="text-text-muted italic">{t('messageCard.emptyText')}</span>;
       }
 
+      // Streaming fast path: render plain text while tokens are still arriving.
+      // The full markdown pipeline (3 regex normalizers + react-markdown +
+      // remark-math/gfm + rehype-sanitize + KaTeX + highlight.js) re-parses the
+      // ENTIRE accumulated text on every animation frame — O(n²) over a reply.
+      // Plain text keeps each frame O(n) in React only; markdown rendering
+      // happens once when the message finalizes (isStreaming flips false).
+      if (isStreaming) {
+        return (
+          <div className="prose-chat max-w-none text-text-primary whitespace-pre-wrap break-words text-left">
+            {text}
+            <span className="inline-block w-2 h-4 bg-accent ml-1 animate-pulse" />
+          </div>
+        );
+      }
+
+      const normalizedText = normalizeCitationMarkdownLinks(
+        normalizeLocalFileMarkdownLinks(normalizeLatexDelimiters(text))
+      );
+      const augmentedText = appendFolderOpenLinks(normalizedText, currentWorkingDir);
+
       // Simple text display for user messages, Markdown for assistant
+      // Non-user text blocks should render as normal assistant output, not as process-only content.
       if (isUser) {
         return (
           <p className="text-text-primary whitespace-pre-wrap break-words text-left">
@@ -268,14 +278,14 @@ export const ContentBlockView = memo(function ContentBlockView({
           name="MessageMarkdown"
           fallback={
             <div className="prose-chat max-w-none text-text-primary whitespace-pre-wrap break-words">
-              {normalizedText}
+              {augmentedText}
             </div>
           }
         >
           <Suspense
             fallback={
               <div className="prose-chat max-w-none text-text-primary whitespace-pre-wrap break-words">
-                {normalizedText}
+                {augmentedText}
               </div>
             }
           >
@@ -320,8 +330,8 @@ export const ContentBlockView = memo(function ContentBlockView({
       const fileBlock = block as FileAttachmentContent;
 
       return (
-        <div className="flex max-w-full min-w-0 items-center gap-2 px-3 py-2 rounded-lg bg-surface-muted border border-border overflow-hidden">
-          <FileText className="w-4 h-4 text-accent flex-shrink-0" />
+        <div className="flex max-w-full min-w-0 items-center gap-2 px-3 py-2 rounded-lg bg-[#eaf7fd] border border-[#79bfe0]/35 overflow-hidden">
+          <FileText className="w-4 h-4 text-[#2f8bb8] flex-shrink-0" />
           <div className="flex-1 min-w-0">
             <p className="text-sm text-text-primary truncate">{fileBlock.filename}</p>
           </div>

@@ -50,7 +50,7 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
     expect(agentRunnerContent).toContain(
       "if (updateType !== 'text_delta' && updateType !== 'thinking_delta') {"
     );
-    expect(agentRunnerContent).toContain("'[ClaudeAgentRunner] Event: message_end'");
+    expect(agentRunnerContent).toContain('[ClaudeAgentRunner] Event: message_end [api_call #');
     expect(agentRunnerContent).toContain('messageUpdateCounts: getStreamEventSummary()');
     expect(agentRunnerContent).toContain("if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {");
     expect(agentRunnerContent).toContain("'[ClaudeAgentRunner] message_end raw message:'");

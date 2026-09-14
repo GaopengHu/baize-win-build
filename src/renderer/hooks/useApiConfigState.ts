@@ -490,7 +490,15 @@ function translateApiConfigErrorMessage(
   message: string,
   t: ReturnType<typeof useTranslation>['t']
 ): string {
-  if (message === 'Config set name is required') {
+  const normalizedMessage = message.toLocaleLowerCase();
+  if (
+    normalizedMessage.includes('config set name already exists') ||
+    normalizedMessage.includes('方案名称已重复') ||
+    normalizedMessage.includes('scheme name already exists')
+  ) {
+    return '方案名称已重复，请重新命名';
+  }
+  if (normalizedMessage.includes('config set name is required')) {
     return t('api.configSetNameRequired');
   }
   if (message === 'Config set clone source not found') {

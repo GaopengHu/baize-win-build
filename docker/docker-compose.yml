@@ -18,7 +18,9 @@ services:
     volumes:
       # 项目源码 (挂载宿主目录)
       - ..:/app
-      # node_modules: 使用宿主目录（Windows .node 二进制由 prebuild:win 脚本下载覆盖）
+      # node_modules: 用独立命名卷，避免通过 Windows bind mount 写入宿主磁盘
+      # (bind mount 写数万个小文件比 Docker 内部文件系统慢 10~50 倍，是构建慢的根因)
+      - baize-node-modules:/app/node_modules
       # npm 缓存 (加速重复构建)
       - baize-npm-cache:/home/builder/.npm
       # npm prebuilds (better-sqlite3等平台二进制)
@@ -52,6 +54,7 @@ services:
       "
 
 volumes:
+  baize-node-modules:
   baize-npm-cache:
   baize-npm-prebuilds:
   baize-electron-cache:

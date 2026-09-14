@@ -133,6 +133,31 @@ export class LimaBridge implements SandboxExecutor {
   private initPromise: Promise<void> | null = null;
 
   /**
+   * Check if the Lima instance is currently running (fast, no shell access).
+   * Used by the bootstrap cache fast path to avoid full status checks on
+   * every app launch while still guarding against a stopped VM.
+   */
+  static async isInstanceRunning(): Promise<boolean> {
+    try {
+      await execAsync('which limactl', { timeout: 5000 });
+    } catch {
+      return false;
+    }
+    try {
+      const { stdout } = await execAsync('limactl list', { timeout: 10000 });
+      const lines = stdout.trim().split(/\r?\n/);
+      for (const line of lines) {
+        if (line.includes(LIMA_INSTANCE_NAME)) {
+          return line.includes('Running');
+        }
+      }
+    } catch {
+      // fall through to false
+    }
+    return false;
+  }
+
+  /**
    * Check if Lima is available on this system
    */
   static async checkLimaStatus(): Promise<LimaStatus> {

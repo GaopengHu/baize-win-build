@@ -95,7 +95,7 @@ function App() {
     }
   }, []); // Empty deps - run once
 
-  // Apply theme to document root
+  // Apply theme + font scale to document root
   useEffect(() => {
     const effectiveTheme =
       settings.theme === 'system' ? (systemDarkMode ? 'dark' : 'light') : settings.theme;
@@ -105,7 +105,10 @@ function App() {
     } else {
       document.documentElement.classList.remove('light');
     }
-  }, [settings.theme, systemDarkMode]);
+
+    const fontScale = Number.isFinite(settings.fontScale) ? settings.fontScale : 1;
+    document.documentElement.style.setProperty('--app-font-scale', String(fontScale));
+  }, [settings.theme, settings.fontScale, systemDarkMode]);
 
   // Auto-collapse panels based on window width
   useEffect(() => {

@@ -118,7 +118,7 @@ export const ProcessPanel = memo(function ProcessPanel({
   const [expanded, setExpanded] = useState(false);
 
   const thinkingBlocks = blocks.filter((block) => block.type === 'thinking');
-  const processTextBlocks = blocks.filter((block) => block.type === 'text');
+  const textBlocks = blocks.filter((block) => block.type === 'text');
   const fallbackProcessBlocks =
     traceSteps.length > 0
       ? []
@@ -126,7 +126,7 @@ export const ProcessPanel = memo(function ProcessPanel({
 
   if (
     thinkingBlocks.length === 0 &&
-    processTextBlocks.length === 0 &&
+    textBlocks.length === 0 &&
     fallbackProcessBlocks.length === 0 &&
     traceSteps.length === 0
   ) {
@@ -166,17 +166,15 @@ export const ProcessPanel = memo(function ProcessPanel({
               >
                 {(block as { type: 'text'; text: string }).text}
               </div>
-            ) : (
-              traceSteps.length === 0 && (
-                <ContentBlockView
-                  key={'id' in block ? (block as { id: string }).id : `process-block-${index}`}
-                  block={block}
-                  isUser={false}
-                  allBlocks={blocks}
-                  message={message}
-                />
-              )
-            )
+            ) : traceSteps.length === 0 ? (
+              <ContentBlockView
+                key={'id' in block ? (block as { id: string }).id : `process-block-${index}`}
+                block={block}
+                isUser={false}
+                allBlocks={blocks}
+                message={message}
+              />
+            ) : null
           )}
 
           {orderedTraceSteps.map((step) => (

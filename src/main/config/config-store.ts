@@ -144,6 +144,14 @@ export interface MemoryRuntimeConfig {
   useEmbedding: boolean;
   maxNavSteps: number;
   ingestionConcurrency: number;
+  /**
+   * 'background' (default): experience retrieval runs in parallel with the
+   * first LLM request and is injected mid-turn via steering.
+   * 'blocking': await full retrieval before sending the prompt (legacy).
+   */
+  retrievalMode?: 'background' | 'blocking';
+  /** Budget for background retrieval before giving up mid-turn injection. */
+  retrievalTimeoutMs?: number;
   storageRoot?: string;
   evalEnabled?: boolean;
   evalWorkspaces?: string[];
@@ -267,6 +275,8 @@ const defaultConfig: AppConfig = {
     useEmbedding: false,
     maxNavSteps: 2,
     ingestionConcurrency: 4,
+    retrievalMode: 'background',
+    retrievalTimeoutMs: 8000,
     storageRoot: '',
     evalEnabled: false,
     evalWorkspaces: [],
@@ -408,6 +418,14 @@ function normalizeMemoryRuntimeConfig(raw: unknown): MemoryRuntimeConfig {
       typeof value.ingestionConcurrency === 'number' && Number.isFinite(value.ingestionConcurrency)
         ? Math.max(1, Math.min(16, Math.round(value.ingestionConcurrency)))
         : defaultConfig.memoryRuntime.ingestionConcurrency,
+    retrievalMode:
+      value.retrievalMode === 'blocking' || value.retrievalMode === 'background'
+        ? value.retrievalMode
+        : defaultConfig.memoryRuntime.retrievalMode,
+    retrievalTimeoutMs:
+      typeof value.retrievalTimeoutMs === 'number' && Number.isFinite(value.retrievalTimeoutMs)
+        ? Math.max(1000, Math.min(60000, Math.round(value.retrievalTimeoutMs)))
+        : defaultConfig.memoryRuntime.retrievalTimeoutMs,
     storageRoot:
       typeof value.storageRoot === 'string'
         ? value.storageRoot
@@ -856,9 +874,18 @@ export class ConfigStore {
       }
       usedIds.add(nextId);
 
+      const requestedName = toNonEmptyString(rawSet.name) || `方案 ${index + 1}`;
+      const usedNames = new Set(normalized.map((set) => set.name.toLocaleLowerCase()));
+      let normalizedName = requestedName;
+      let nameSuffix = 2;
+      while (usedNames.has(normalizedName.toLocaleLowerCase())) {
+        normalizedName = `${requestedName} (${nameSuffix})`;
+        nameSuffix += 1;
+      }
+
       const normalizedSet = this.normalizeConfigSet(rawSet, {
         id: nextId,
-        name: toNonEmptyString(rawSet.name) || `方案 ${index + 1}`,
+        name: normalizedName,
         provider: legacy.provider,
         customProtocol: legacy.customProtocol,
         activeProfileKey: legacy.activeProfileKey,
@@ -1020,7 +1047,7 @@ export class ConfigStore {
     };
   }
 
-  private buildUniqueConfigSetName(
+  private validateConfigSetName(
     name: string,
     existingSets: ApiConfigSet[],
     excludeId?: string
@@ -1030,21 +1057,15 @@ export class ConfigStore {
       throw new Error('Config set name is required');
     }
 
-    const usedNames = new Set(
-      existingSets.filter((set) => set.id !== excludeId).map((set) => set.name)
+    const normalizedName = trimmed.toLocaleLowerCase();
+    const duplicate = existingSets.some(
+      (set) => set.id !== excludeId && set.name.trim().toLocaleLowerCase() === normalizedName
     );
-
-    if (!usedNames.has(trimmed)) {
-      return trimmed;
+    if (duplicate) {
+      throw new Error('Config set name already exists');
     }
 
-    let suffix = 2;
-    let candidate = `${trimmed} (${suffix})`;
-    while (usedNames.has(candidate) && suffix <= 100) {
-      suffix += 1;
-      candidate = `${trimmed} (${suffix})`;
-    }
-    return candidate;
+    return trimmed;
   }
 
   private generateConfigSetId(existingSets: ApiConfigSet[]): ConfigSetId {
@@ -1149,7 +1170,7 @@ export class ConfigStore {
     }
 
     const id = this.generateConfigSetId(current.configSets);
-    const name = this.buildUniqueConfigSetName(payload.name, current.configSets);
+    const name = this.validateConfigSetName(payload.name, current.configSets);
     const mode: CreateSetMode = payload.mode === 'blank' ? 'blank' : 'clone';
     let newSet: ApiConfigSet;
 
@@ -1202,7 +1223,7 @@ export class ConfigStore {
       throw new Error('Config set not found');
     }
 
-    const nextName = this.buildUniqueConfigSetName(payload.name, current.configSets, payload.id);
+    const nextName = this.validateConfigSetName(payload.name, current.configSets, payload.id);
     const nextSets = current.configSets.map((set) => {
       if (set.id !== payload.id) {
         return this.cloneConfigSet(set);

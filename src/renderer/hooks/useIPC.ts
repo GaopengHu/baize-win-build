@@ -23,6 +23,10 @@ const isElectron = typeof window !== 'undefined' && window.electronAPI !== undef
 // listener, silently dropping subsequent events from main.
 let ipcListenerInstalled = false;
 
+// --- RAF batching buffers (module-level so useCallback can access) ---
+const pendingPartials: Record<string, string[]> = {};
+const pendingThinking: Record<string, string[]> = {};
+
 export function useIPC() {
   // Handle incoming server events - only setup once across all useIPC() callers.
   // See module-level `ipcListenerInstalled` guard above for the full reason.
@@ -43,10 +47,7 @@ export function useIPC() {
     console.log('[useIPC] Setting up IPC listener (once)');
 
     // --- RAF batching for high-frequency events ---
-    const pendingPartials: Record<string, string[]> = {};
     let partialRafId: number | null = null;
-
-    const pendingThinking: Record<string, string[]> = {};
     let thinkingRafId: number | null = null;
 
     const flushPartials = () => {
@@ -128,7 +129,6 @@ export function useIPC() {
 
     const cleanup = window.electronAPI.on((event: ServerEvent) => {
       const store = useAppStore.getState();
-      console.log('[useIPC] Received event:', event.type);
 
       try {
         switch (event.type) {
@@ -146,6 +146,10 @@ export function useIPC() {
               store.clearActiveTurn(event.payload.sessionId);
               store.clearPendingTurns(event.payload.sessionId);
               store.clearQueuedMessages(event.payload.sessionId);
+              delete pendingPartials[event.payload.sessionId];
+              delete pendingThinking[event.payload.sessionId];
+              store.clearPartialMessage(event.payload.sessionId);
+              store.clearPartialThinking(event.payload.sessionId);
             }
             break;
 
@@ -154,12 +158,6 @@ export function useIPC() {
             break;
 
           case 'stream.message':
-            console.log(
-              '[useIPC] stream.message received:',
-              event.payload.message.role,
-              'content:',
-              JSON.stringify(event.payload.message.content)
-            );
             // Clear pending partial buffer to prevent RAF from appending stale chunks
             delete pendingPartials[event.payload.sessionId];
             // Clear thinking buffer too — final thinking is in the message content blocks
@@ -406,20 +404,16 @@ export function useIPC() {
   // Send event to main process
   const send = useCallback((event: ClientEvent) => {
     if (!isElectron) {
-      console.log('[useIPC] Browser mode - would send:', event.type);
       return;
     }
-    console.log('[useIPC] Sending:', event.type);
     window.electronAPI.send(event);
   }, []);
 
   // Invoke and wait for response
   const invoke = useCallback(async <T>(event: ClientEvent): Promise<T> => {
     if (!isElectron) {
-      console.log('[useIPC] Browser mode - would invoke:', event.type);
       return null as T;
     }
-    console.log('[useIPC] Invoking:', event.type);
     return window.electronAPI.invoke<T>(event);
   }, []);
 
@@ -610,6 +604,12 @@ export function useIPC() {
         return;
       }
 
+      // Clear stale streaming buffers from previous aborted turns
+      delete pendingPartials[sessionId];
+      delete pendingThinking[sessionId];
+      useAppStore.getState().clearPartialMessage(sessionId);
+      useAppStore.getState().clearPartialThinking(sessionId);
+
       // Electron mode - send to backend (user message already added above)
       // Immediately activate turn to show processing indicator while waiting for API
       if (!shouldQueue) {
@@ -655,6 +655,10 @@ export function useIPC() {
       clearPendingTurns(sessionId);
       clearActiveTurn(sessionId);
       finishExecutionClock(sessionId);
+      delete pendingPartials[sessionId];
+      delete pendingThinking[sessionId];
+      useAppStore.getState().clearPartialMessage(sessionId);
+      useAppStore.getState().clearPartialThinking(sessionId);
       if (!isElectron) {
         updateSession(sessionId, { status: 'idle' });
         setLoading(false);
@@ -712,6 +716,25 @@ export function useIPC() {
         payload: { sessionId },
       });
       return messages || [];
+    },
+    [invoke]
+  );
+
+  const getSessionMessagesPaginated = useCallback(
+    async (
+      sessionId: string,
+      limit: number,
+      offset: number
+    ): Promise<{ messages: Message[]; total: number; hasMore: boolean }> => {
+      if (!isElectron) {
+        return { messages: [], total: 0, hasMore: false };
+      }
+      // Handler returns JSON string to bypass Electron's structured clone overhead
+      const jsonStr = await invoke<string>({
+        type: 'session.getMessagesPaginated',
+        payload: { sessionId, limit, offset },
+      });
+      return JSON.parse(jsonStr);
     },
     [invoke]
   );
@@ -805,6 +828,7 @@ export function useIPC() {
     batchDeleteSessions,
     listSessions,
     getSessionMessages,
+    getSessionMessagesPaginated,
     getSessionTraceSteps,
     respondToPermission,
     respondToSudoPassword,

@@ -19,9 +19,10 @@ ARG GID=1000
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Debian 10 (buster) 已归档，使用 archive.debian.org
-RUN echo "deb http://archive.debian.org/debian/ buster main contrib non-free" > /etc/apt/sources.list \
-    && echo "deb http://archive.debian.org/debian-security buster/updates main contrib non-free" >> /etc/apt/sources.list \
+# Debian 10 (buster) 已归档，使用阿里云归档镜像加速
+# 注意：基础镜像尚无 ca-certificates，必须先走 HTTP，否则 HTTPS 握手失败
+RUN echo "deb http://mirrors.aliyun.com/debian-archive/debian/ buster main contrib non-free" > /etc/apt/sources.list \
+    && echo "deb http://mirrors.aliyun.com/debian-archive/debian-security buster/updates main contrib non-free" >> /etc/apt/sources.list \
     && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
 
 # Step 1: ca-certificates (用于后续 HTTPS 下载 Node.js)

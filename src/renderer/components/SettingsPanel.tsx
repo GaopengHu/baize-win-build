@@ -50,6 +50,10 @@ type TabId =
   | 'logs'
   | 'general';
 
+// Tabs kept functional but hidden from the settings sidebar.
+// They remain reachable programmatically (e.g. via nav-server __navigate).
+const HIDDEN_TABS = new Set<TabId>(['schedule', 'remote']);
+
 const VALID_TABS = new Set<TabId>([
   'api',
   'sandbox',
@@ -76,16 +80,6 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
   const [activeTab, setActiveTab] = useState<TabId>(resolvedInitial);
   // Track which tabs have been viewed at least once (for lazy loading)
   const [viewedTabs, setViewedTabs] = useState<Set<TabId>>(new Set([resolvedInitial]));
-  const [appVersion, setAppVersion] = useState('');
-  useEffect(() => {
-    try {
-      const v = window.electronAPI?.getVersion?.();
-      if (v instanceof Promise) v.then(setAppVersion);
-      else if (v) setAppVersion(v);
-    } catch {
-      /* ignore */
-    }
-  }, []);
 
   // Consume the store signal and apply tab in one effect
   useEffect(() => {
@@ -158,6 +152,7 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
       description: t('settings.generalDesc'),
     },
   ];
+  const visibleTabs = tabs.filter((tab) => !HIDDEN_TABS.has(tab.id));
   const activeTabMeta = tabs.find((tab) => tab.id === activeTab);
 
   return (
@@ -178,7 +173,7 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
           </div>
         )}
         <div className={`flex-1 ${compactSidebar ? 'p-1.5 space-y-1' : 'p-3 space-y-1.5'}`}>
-          {tabs.map((tab) => (
+          {visibleTabs.map((tab) => (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
@@ -214,7 +209,7 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
           </button>
           {!compactSidebar && (
             <p className="text-[10px] text-text-muted text-center mt-2 select-text">
-              v{appVersion}
+              v0.0.1
             </p>
           )}
         </div>

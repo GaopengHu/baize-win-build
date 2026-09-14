@@ -139,8 +139,15 @@ async function main() {
 
   // 3. Build the application (TypeScript + Vite)
   log('Building TypeScript + Vite...');
-  run('npx tsc', { timeout: 120000 });
-  run('npx vite build', { timeout: 300000 });
+  // Use the local tsc binary directly to avoid npx's /bin/sh spawn and any
+  // network resolution delays inside the container.
+  run('node node_modules/typescript/bin/tsc', { timeout: 900000 });
+  // Vite builds both the renderer and Electron main/preload bundles. On
+  // Docker Desktop with a bind-mounted workspace, the main bundle can take
+  // longer than five minutes while transforming dependencies.
+  // Remove stale main-process chunks so old bundles never leak into the asar
+  run('npx rimraf dist-electron', { timeout: 60000 });
+  run('npx vite build', { timeout: 900000 });
 
   // 4. Pre-build check
   log('Running pre-build check...');
@@ -157,7 +164,9 @@ async function main() {
     ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/',
     ELECTRON_BUILDER_BINARIES_MIRROR: process.env.ELECTRON_BUILDER_BINARIES_MIRROR || 'https://npmmirror.com/mirrors/electron-builder-binaries/',
   };
-  run('npx electron-builder --win --x64', { env, timeout: 1800000 });
+  // Docker Desktop bind mount 文件 I/O 慢 + 依赖树重复包多，打包/asar/NSIS 阶段
+  // 实测可超过 30 分钟，超时放宽到 90 分钟。
+  run('npx electron-builder --win --x64', { env, timeout: 5400000 });
 
   // 7. Verify
   const productName = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8')).productName;

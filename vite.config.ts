@@ -47,9 +47,21 @@ export default defineConfig({
                 'chokidar',
                 'archiver',
                 'ngrok',
-                'ws',
+                // NOTE: 'ws' must stay BUNDLED (not external). Its CJS exports is a
+                // class extending EventEmitter; under Electron 22 (Node 16) the
+                // inherited EventEmitter statics are enumerable, so Rollup's
+                // namespace interop helper (for...in + getOwnPropertyDescriptor)
+                // crashes at bundle top level. Bundled by both gateway.ts and
+                // @slack/socket-mode. Its optional native deps stay external:
                 'glob',
                 'dotenv',
+                // photon-node reads photon_rs_bg.wasm relative to its own package
+                // dir at init. Bundling it inlines the glue into the main chunk,
+                // where __dirname becomes dist-electron/main/ (no wasm) and the
+                // lazy init gets hoisted to top level by inlineDynamicImports →
+                // ENOENT at startup. Keep external: the package ships inside the
+                // asar as a production dependency of pi-coding-agent.
+                '@silvia-odwyer/photon-node',
               ],
               output: {
                 // Ensure consistent interop for CJS/ESM

@@ -1,3 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-var-requires */
+// Node 16 (Electron 22) web API polyfills. Lazy `require` + `any` casts are
+// intentional: each shim must resolve at runtime, tolerate missing modules,
+// and assign onto globalThis without importing Node 18+ typings.
 import { TransformStream, ReadableStream, WritableStream } from 'stream/web';
 if (typeof globalThis.TransformStream === 'undefined') {
   (globalThis as any).TransformStream = TransformStream;
@@ -22,6 +26,35 @@ if (typeof globalThis.structuredClone === 'undefined') {
 if (typeof globalThis.FormData === 'undefined') {
   const { FormData } = require('formdata-node');
   (globalThis as any).FormData = FormData;
+}
+
+// Polyfill Blob for Node 16 (Electron 22)
+// The bundled OpenAI SDK schemas build `z.instanceof(Blob)` validators at
+// module top level; without a global Blob the whole bundle throws
+// "ReferenceError: Blob is not defined" during load. Node 16 ships Blob in
+// 'node:buffer' (since 15.7) but does not expose it globally (Node 18+).
+if (typeof globalThis.Blob === 'undefined') {
+  try {
+    const { Blob } = require('node:buffer') as any;
+    if (Blob) {
+      (globalThis as any).Blob = Blob;
+    }
+  } catch (e) {
+    console.error('[stream-shim] Failed to polyfill Blob:', e);
+  }
+}
+
+// Polyfill File for Node 16 (Electron 22)
+// Same reason as Blob: OpenAI SDK blob-like schemas reference the global File.
+// buffer.File only exists in Node 20+, so fall back to formdata-node's File
+// (already a dependency, used for the FormData polyfill above).
+if (typeof globalThis.File === 'undefined') {
+  try {
+    const { File } = require('formdata-node');
+    (globalThis as any).File = File;
+  } catch (e) {
+    console.error('[stream-shim] Failed to polyfill File:', e);
+  }
 }
 
 // Polyfill fetch etc. for Node 16 (Electron 22)

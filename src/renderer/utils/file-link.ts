@@ -2,7 +2,7 @@ export type FileTextPart = { type: 'text'; value: string } | { type: 'file'; val
 export type FileChildPart = FileTextPart | { type: 'node'; value: unknown };
 
 const fileLinkButtonClassName =
-  'text-accent hover:text-accent-hover underline underline-offset-2 text-left break-all inline-block';
+  'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#79bfe0]/35 bg-[#eaf7fd] text-[#2f8bb8] hover:bg-[#dff3fb] hover:border-[#5daed6] hover:text-[#237aa7] transition-colors text-left break-all shadow-sm';
 
 export function getFileLinkButtonClassName(): string {
   return fileLinkButtonClassName;

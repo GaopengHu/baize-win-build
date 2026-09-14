@@ -14,6 +14,12 @@ export interface BeforeSessionRunContext {
 export interface BeforeSessionRunResult {
   promptPrefix?: string;
   customTools?: AgentRuntimeCustomTool[];
+  /**
+   * Context that is retrieved asynchronously (e.g. experience memory) and can
+   * be injected mid-turn via steering instead of blocking the first token.
+   * Resolves to '' when there is nothing to inject. Never rejects.
+   */
+  deferredExperience?: Promise<string>;
 }
 
 export interface AfterSessionRunContext {

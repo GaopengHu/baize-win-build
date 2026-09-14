@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { useState, useRef, useEffect, useMemo, useCallback, useLayoutEffect } from 'react';
+import { useResizablePanel } from '../hooks/useResizablePanel';
 import { useTranslation } from 'react-i18next';
 import {
   useActiveSessionId,
@@ -9,15 +10,29 @@ import {
   usePendingTurns,
   useActiveExecutionClock,
   useAppConfig,
+  useActiveHasMoreMessages,
+  useLoadingSessionId,
 } from '../store/selectors';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
 import { ProcessPanel } from './message/ProcessPanel';
 import { ContentBlockView } from './message/ContentBlockView';
-import { isProcessBlock, mergeThinkingBlocks } from '../utils/content-block-partition';
+import { buildRoundRenderPlans } from '../utils/round-render-plan';
 import type { Message, ContentBlock } from '../types';
-import { Send, Square, Plus, Loader2, Plug, X, Clock } from 'lucide-react';
+import {
+  Send,
+  Square,
+  Plus,
+  Loader2,
+  Plug,
+  X,
+  Clock,
+  ChevronDown,
+  ChevronRight,
+  Check,
+  Cpu,
+} from 'lucide-react';
 
 type AttachedFile = {
   name: string;
@@ -27,39 +42,9 @@ type AttachedFile = {
   inlineDataBase64?: string;
 };
 
-type Round = {
-  userMessage: Message | null;
-  assistantMessages: Message[];
-};
-
-function groupMessagesIntoRounds(messages: Message[]): Round[] {
-  const rounds: Round[] = [];
-  let currentRound: Round = { userMessage: null, assistantMessages: [] };
-
-  for (const message of messages) {
-    if (message.role === 'user') {
-      if (currentRound.userMessage || currentRound.assistantMessages.length > 0) {
-        rounds.push(currentRound);
-      }
-      currentRound = { userMessage: message, assistantMessages: [] };
-    } else {
-      currentRound.assistantMessages.push(message);
-    }
-  }
-
-  if (currentRound.userMessage || currentRound.assistantMessages.length > 0) {
-    rounds.push(currentRound);
-  }
-
-  return rounds;
-}
-
-function getMessageContentBlocks(message: Message): ContentBlock[] {
-  const rawContent = message.content as unknown;
-  return Array.isArray(rawContent)
-    ? (rawContent as ContentBlock[])
-    : [{ type: 'text', text: String(rawContent ?? '') } as ContentBlock];
-}
+// Model quick-switch entries shown in the chat input dropdown.
+// Populated from the configured config sets (see useAppConfig configSets).
+type QuickSwitchModel = { id: string; label: string };
 
 export function ChatView() {
   const { t } = useTranslation();
@@ -68,14 +53,42 @@ export function ChatView() {
   const activeSession = useCurrentSession();
   const messages = useActiveSessionMessages();
   const { partialMessage, partialThinking } = useActivePartialContent();
+  const hasMoreMessages = useActiveHasMoreMessages();
   const activeTurn = useActiveTurn();
   const pendingTurns = usePendingTurns();
   const executionClock = useActiveExecutionClock();
   const appConfig = useAppConfig();
+  const loadingSessionId = useLoadingSessionId();
   const setGlobalNotice = useAppStore((s) => s.setGlobalNotice);
-  const { continueSession, stopSession, isElectron } = useIPC();
+  const { continueSession, stopSession, getSessionMessagesPaginated, isElectron } = useIPC();
+  const prependMessages = useAppStore((s) => s.prependMessages);
+
+  // Model quick-switch entries populated from the configured config sets.
+  // Each config set is a fully configured model profile (provider, key, url...).
+  const quickSwitchModels = useMemo<QuickSwitchModel[]>(() => {
+    const sets = appConfig?.configSets ?? [];
+    const list: QuickSwitchModel[] = sets.map((set) => {
+      const activeProfile = set.profiles[set.activeProfileKey];
+      const modelLabel =
+        activeProfile?.model ||
+        set.profiles.anthropic?.model ||
+        set.profiles.openai?.model ||
+        set.profiles.gemini?.model ||
+        '';
+      const schemeName = set.name.trim() || t('chat.noConfigSet');
+      const resolvedModel = modelLabel || t('chat.noModel');
+      return {
+        id: set.id,
+        label: `${schemeName}：${resolvedModel}`,
+      };
+    });
+    return list;
+  }, [appConfig?.configSets, t]);
+
+  const activeConfigSetId = appConfig?.activeConfigSetId;
   const [prompt, setPrompt] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [inputHeight, setInputHeight] = useState(56);
   const [activeConnectors, setActiveConnectors] = useState<
     { id: string; name: string; connected: boolean; toolCount: number }[]
   >([]);
@@ -88,8 +101,23 @@ export function ChatView() {
   >([]);
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const inputBoxMaxWidth = 1320;
+  const {
+    size: inputBoxSize,
+    setSize: setInputBoxSize,
+    startResize,
+  } = useResizablePanel({
+    defaultWidth: 920,
+    defaultHeight: 180,
+    minWidth: 640,
+    minHeight: 150,
+    maxWidth: inputBoxMaxWidth,
+    maxHeight: 360,
+  });
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const modelMenuRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const isUserAtBottomRef = useRef(true);
   const isComposingRef = useRef(false);
@@ -99,11 +127,68 @@ export function ChatView() {
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRequestRef = useRef<number | null>(null);
   const isScrollingRef = useRef(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const loadingMoreRef = useRef(false);
+  const prevActiveSessionIdRef = useRef<string | null>(null);
+  // While a freshly opened session is being settled at the bottom, scroll
+  // events come from our own code — not the user — so they must not feed
+  // isUserAtBottomRef or trigger pagination.
+  const suppressScrollStateRef = useRef(false);
+  const suppressScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const hasActiveTurn = Boolean(activeTurn);
   const pendingCount = pendingTurns.length;
   const isSessionRunning = activeSession?.status === 'running';
   const canStop = isSessionRunning || hasActiveTurn || pendingCount > 0;
+
+  const loadMoreMessages = useCallback(async () => {
+    if (!activeSessionId || loadingMoreRef.current || !hasMoreMessages || !isElectron) return;
+    loadingMoreRef.current = true;
+    setIsLoadingMore(true);
+    try {
+      const result = await getSessionMessagesPaginated(activeSessionId, 50, messages.length);
+      if (result.messages.length > 0) {
+        const container = scrollContainerRef.current;
+        const prevHeight = container?.scrollHeight ?? 0;
+        prependMessages(activeSessionId, result.messages, result.hasMore);
+        // Restore scroll position so user doesn't jump to bottom after prepend
+        requestAnimationFrame(() => {
+          if (container) {
+            const newHeight = container.scrollHeight;
+            container.scrollTop += newHeight - prevHeight;
+          }
+        });
+      } else {
+        prependMessages(activeSessionId, [], false);
+      }
+    } catch (e) {
+      console.error('[ChatView] loadMoreMessages failed:', e);
+    } finally {
+      loadingMoreRef.current = false;
+      setIsLoadingMore(false);
+    }
+  }, [
+    activeSessionId,
+    hasMoreMessages,
+    isElectron,
+    messages.length,
+    getSessionMessagesPaginated,
+    prependMessages,
+  ]);
+
+  // Stable ref for loadMoreMessages so the scroll effect doesn't re-run every
+  // time messages.length changes (which recreates loadMoreMessages).
+  const loadMoreMessagesRef = useRef(loadMoreMessages);
+  loadMoreMessagesRef.current = loadMoreMessages;
+
+  useEffect(() => {
+    // When switching sessions, restore the input capsule to its widest
+    // comfortable size so the composer looks balanced by default.
+    setInputBoxSize((prev) => ({
+      ...prev,
+      width: inputBoxMaxWidth,
+    }));
+  }, [activeSessionId, setInputBoxSize]);
 
   const displayedMessages = useMemo(() => {
     if (!activeSessionId) return messages;
@@ -137,6 +222,11 @@ export function ChatView() {
 
     return [...messages.slice(0, insertIndex), streamingMessage, ...messages.slice(insertIndex)];
   }, [activeSessionId, activeTurn?.userMessageId, messages, partialMessage, partialThinking]);
+
+  // Memoized render plans: unchanged rounds keep identical plan/block array
+  // references across streaming frames, so memoized children (ProcessPanel,
+  // ContentBlockView, ...) skip re-rendering entirely. See round-render-plan.ts.
+  const roundPlans = useMemo(() => buildRoundRenderPlans(displayedMessages), [displayedMessages]);
 
   // Format execution time for display
   const formatExecutionTime = useCallback((ms: number): string => {
@@ -210,17 +300,47 @@ export function ChatView() {
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
+
+    // The listener MUST be attached on every run, including the run triggered
+    // by a session switch. An earlier fix returned early here to avoid a
+    // duplicate page-0 load; because the deps below only change when
+    // hasMoreMessages flips, a session whose hasMoreMessages stays at its
+    // default `true` (i.e. any history longer than one page) never re-ran this
+    // effect and therefore never got a scroll listener — scrolling to the top
+    // loaded nothing and long conversations stayed truncated.
+    const sessionJustChanged = prevActiveSessionIdRef.current !== activeSessionId;
+    prevActiveSessionIdRef.current = activeSessionId;
+
     const updateScrollState = () => {
+      // Ignore scroll events produced by our own programmatic scrolling: during
+      // the layout pass after a switch distanceToBottom is still huge, and
+      // recording that pinned isUserAtBottomRef=false, leaving the newly opened
+      // conversation stuck at the top.
+      if (suppressScrollStateRef.current || isScrollingRef.current) return;
       const distanceToBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight;
       isUserAtBottomRef.current = distanceToBottom <= 80;
+      // Load more messages when scrolling near the top (within 200px)
+      if (container.scrollTop <= 200 && hasMoreMessages) {
+        loadMoreMessagesRef.current();
+      }
     };
-    updateScrollState();
+
+    // Skip only the *initial* check right after a switch: the container sits at
+    // scrollTop 0 while hasMoreMessages still holds the previous session's
+    // value, which would fire a duplicate page-0 load on top of the one
+    // handleSessionClick already issued.
+    if (!sessionJustChanged) updateScrollState();
+
     // 用户阅读旧消息时，阻止新消息自动滚动打断视线
     const onScroll = () => updateScrollState();
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);
-  }, []);
+    // hasMoreMessages in deps so re-binding picks up when loadMore becomes a
+    // no-op. loadMoreMessages itself is accessed through the stable ref above
+    // so we don't need to re-bind the scroll listener when it's recreated.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, hasMoreMessages]);
 
   useEffect(() => {
     const messageCount = messages.length;
@@ -255,11 +375,46 @@ export function ChatView() {
     if (!activeSessionId) return;
     // Force scroll to bottom immediately (no animation)
     isUserAtBottomRef.current = true;
+    suppressScrollStateRef.current = true;
+    if (suppressScrollTimerRef.current) clearTimeout(suppressScrollTimerRef.current);
+    // Safety net: an empty session never delivers messages, so nothing would
+    // release the suppression below — always fall back to a timeout.
+    suppressScrollTimerRef.current = setTimeout(() => {
+      suppressScrollStateRef.current = false;
+      suppressScrollTimerRef.current = null;
+    }, 1500);
     const container = scrollContainerRef.current;
     if (container) {
       container.scrollTop = container.scrollHeight;
     }
   }, [activeSessionId]);
+
+  // The switch above runs while the list is still empty (the first page is in
+  // flight), so settle at the bottom once again after it has painted, then hand
+  // control back to the scroll listener.
+  useEffect(() => {
+    if (!activeSessionId || messages.length === 0) return;
+    if (!suppressScrollStateRef.current) return;
+    let innerRaf = 0;
+    const outerRaf = requestAnimationFrame(() => {
+      innerRaf = requestAnimationFrame(() => {
+        const container = scrollContainerRef.current;
+        if (container) {
+          isUserAtBottomRef.current = true;
+          container.scrollTop = container.scrollHeight;
+        }
+        suppressScrollStateRef.current = false;
+        if (suppressScrollTimerRef.current) {
+          clearTimeout(suppressScrollTimerRef.current);
+          suppressScrollTimerRef.current = null;
+        }
+      });
+    });
+    return () => {
+      cancelAnimationFrame(outerRaf);
+      if (innerRaf) cancelAnimationFrame(innerRaf);
+    };
+  }, [activeSessionId, messages.length]);
 
   // Additional scroll trigger for content height changes (e.g., TodoWrite expand/collapse)
   useEffect(() => {
@@ -291,12 +446,77 @@ export function ChatView() {
       if (scrollRequestRef.current) {
         cancelAnimationFrame(scrollRequestRef.current);
       }
+      if (suppressScrollTimerRef.current) {
+        clearTimeout(suppressScrollTimerRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
     textareaRef.current?.focus();
   }, [activeSessionId]);
+
+  useEffect(() => {
+    setPrompt('');
+    setPastedImages((prev) => {
+      for (const image of prev) {
+        URL.revokeObjectURL(image.url);
+      }
+      return [];
+    });
+    setAttachedFiles([]);
+    setInputHeight(56);
+    if (textareaRef.current) {
+      textareaRef.current.value = '';
+      textareaRef.current.style.height = 'auto';
+    }
+  }, [activeSessionId]);
+
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+
+    el.style.height = 'auto';
+    const nextHeight = Math.min(Math.max(el.scrollHeight, 24), 180);
+    el.style.height = `${nextHeight}px`;
+    setInputHeight(nextHeight + 24);
+  }, [prompt, activeSessionId]);
+
+  // Warm up experience-memory retrieval while the user types so the deferred
+  // mid-turn injection is usually a cache hit when the message is sent.
+  const memoryPrefetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastPrefetchedDraftRef = useRef('');
+
+  const handlePromptChange = useCallback(
+    (value: string) => {
+      setPrompt(value);
+      if (typeof window === 'undefined' || !window.electronAPI || !activeSessionId) return;
+      if (memoryPrefetchTimerRef.current) clearTimeout(memoryPrefetchTimerRef.current);
+      const draft = value.trim();
+      if (draft.length < 8 || draft === lastPrefetchedDraftRef.current) return;
+      memoryPrefetchTimerRef.current = setTimeout(() => {
+        memoryPrefetchTimerRef.current = null;
+        lastPrefetchedDraftRef.current = draft;
+        window.electronAPI?.send({
+          type: 'memory.prefetch',
+          payload: { sessionId: activeSessionId, draft },
+        });
+      }, 600);
+    },
+    [activeSessionId]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (memoryPrefetchTimerRef.current) clearTimeout(memoryPrefetchTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (inputHeight < 56) {
+      setInputHeight(56);
+    }
+  }, [inputHeight]);
 
   // Handle paste event for images
   const handlePaste = async (e: React.ClipboardEvent) => {
@@ -545,6 +765,52 @@ export function ChatView() {
     }
   };
 
+  // Close the model dropdown when clicking outside or pressing Escape
+  useEffect(() => {
+    if (!modelMenuOpen) {
+      return;
+    }
+    const handlePointerDown = (e: MouseEvent) => {
+      if (modelMenuRef.current && !modelMenuRef.current.contains(e.target as Node)) {
+        setModelMenuOpen(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setModelMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', handlePointerDown);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', handlePointerDown);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [modelMenuOpen]);
+
+  // Switch to a different config set (model profile) by calling the
+  // config.switchSet IPC handler, which persists the active set id.
+  const handleModelSwitch = useCallback(
+    async (setId: string) => {
+      if (isElectron && typeof window !== 'undefined' && window.electronAPI) {
+        try {
+          const { config } = await window.electronAPI.config.switchSet({ id: setId });
+          useAppStore.getState().setAppConfig(config);
+          useAppStore.getState().setIsConfigured(Boolean(config.isConfigured));
+        } catch (err) {
+          console.error('Failed to switch model:', err);
+          useAppStore.getState().setGlobalNotice({
+            id: `notice-model-switch-${Date.now()}`,
+            type: 'error',
+            message: err instanceof Error ? err.message : '切换模型失败，请稍后重试',
+          });
+        }
+      }
+      setModelMenuOpen(false);
+    },
+    [isElectron]
+  );
+
   // Load active MCP connectors
   useEffect(() => {
     if (isElectron && typeof window !== 'undefined' && window.electronAPI) {
@@ -555,14 +821,19 @@ export function ChatView() {
             (
               statuses as Array<{ id: string; name: string; connected: boolean; toolCount: number }>
             )?.filter((s) => s.connected && s.toolCount > 0) || [];
-          setActiveConnectors(active);
+          // Only touch state when the connector set actually changed — a new
+          // array every tick re-rendered the whole chat view for nothing.
+          setActiveConnectors((prev) =>
+            JSON.stringify(prev) === JSON.stringify(active) ? prev : active
+          );
         } catch (err) {
           console.error('Failed to load MCP connectors:', err);
         }
       };
       loadConnectors();
-      // Refresh every 5 seconds
-      const interval = setInterval(loadConnectors, 5000);
+      // Connector status changes rarely; 15s keeps the header fresh without
+      // a constant IPC + render heartbeat on the chat view.
+      const interval = setInterval(loadConnectors, 15000);
       return () => clearInterval(interval);
     }
   }, [isElectron]);
@@ -652,7 +923,9 @@ export function ChatView() {
       setPrompt('');
       if (textareaRef.current) {
         textareaRef.current.value = '';
+        textareaRef.current.style.height = 'auto';
       }
+      setInputHeight(56);
       pastedImages.forEach((img) => URL.revokeObjectURL(img.url));
       setPastedImages([]);
       setAttachedFiles([]);
@@ -669,8 +942,234 @@ export function ChatView() {
 
   if (!activeSession) {
     return (
-      <div className="flex-1 flex items-center justify-center text-text-muted">
-        <span>{t('chat.loadingConversation')}</span>
+      <div className="flex-1 flex items-center justify-center bg-background px-5">
+        <div className="w-full max-w-[980px] space-y-8">
+          <div className="flex flex-col items-center justify-center text-center space-y-5 pt-10">
+            <div className="space-y-2">
+              <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">今点通</p>
+              <p className="text-3xl font-semibold tracking-[-0.04em] text-text-primary">
+                {t('welcome.title')}
+              </p>
+              <p className="text-sm text-text-muted">{t('chat.startConversation')}</p>
+            </div>
+          </div>
+
+          <div className="border-t border-border-muted bg-background/92 backdrop-blur-md rounded-[2rem] shadow-soft p-4 lg:p-5">
+            <div
+              className="mx-auto relative flex flex-col"
+              style={{
+                width: `${inputBoxSize.width}px`,
+                maxWidth: '100%',
+                minHeight: `${Math.max(inputHeight, inputBoxSize.height)}px`,
+              }}
+            >
+              <div className="relative w-full flex-1 flex flex-col">
+                <div
+                  className={`relative flex items-end gap-2 p-3.5 rounded-[1.75rem] bg-background/88 border border-border-muted shadow-soft transition-colors ${
+                    isDragging ? 'ring-2 ring-accent bg-accent/5' : ''
+                  }`}
+                >
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('x', -1)(e);
+                    }}
+                    className="absolute top-2 bottom-2 -left-1.5 w-2 cursor-ew-resize group/handle"
+                    title={t('chat.resizeWidth') || 'Drag to resize width'}
+                  >
+                    <div className="absolute inset-y-0 left-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('x', 1)(e);
+                    }}
+                    className="absolute top-2 bottom-2 -right-1.5 w-2 cursor-ew-resize group/handle"
+                    title={t('chat.resizeWidth') || 'Drag to resize width'}
+                  >
+                    <div className="absolute inset-y-0 right-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('y', -1)(e);
+                    }}
+                    className="absolute -top-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                    title={t('chat.resizeHeight') || 'Drag to resize height'}
+                  >
+                    <div className="absolute inset-x-0 top-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+                  <div
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startResize('y', 1)(e);
+                    }}
+                    className="absolute -bottom-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                    title={t('chat.resizeHeight') || 'Drag to resize height'}
+                  >
+                    <div className="absolute inset-x-0 bottom-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleFileSelect}
+                    className="w-9 h-9 rounded-2xl flex items-center justify-center text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
+                    title={t('welcome.attachFiles')}
+                  >
+                    <Plus className="w-5 h-5" />
+                  </button>
+
+                  <textarea
+                    ref={textareaRef}
+                    value={prompt}
+                    onChange={(e) => handlePromptChange(e.target.value)}
+                    style={{ minHeight: '24px', maxHeight: '180px' }}
+                    onCompositionStart={() => {
+                      isComposingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                      isComposingRef.current = false;
+                    }}
+                    onPaste={handlePaste}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        if (e.nativeEvent.isComposing || isComposingRef.current) return;
+                        e.preventDefault();
+                        handleSubmit();
+                      }
+                    }}
+                    placeholder={t('welcome.placeholder')}
+                    disabled={isSubmitting}
+                    rows={1}
+                    className="flex-1 resize-none bg-transparent border-none outline-none text-text-primary placeholder:text-text-muted text-[15px] py-2"
+                  />
+
+                  <div className="flex items-center gap-2">
+                    <div className="relative" ref={modelMenuRef}>
+                      <button
+                        type="button"
+                        onClick={() => setModelMenuOpen((v) => !v)}
+                        className="hidden sm:inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-border-subtle bg-background/60 text-xs text-text-muted hover:bg-surface-hover hover:text-text-primary transition-colors"
+                        title={t('chat.switchModel') || 'Switch model'}
+                      >
+                        <Cpu className="w-3 h-3" />
+                        <span className="max-w-[120px] truncate">
+                          {quickSwitchModels.find((item) => item.id === activeConfigSetId)?.label ||
+                            t('chat.noConfigSet')}
+                        </span>
+                        <ChevronDown className="w-3 h-3 shrink-0" />
+                      </button>
+                      {modelMenuOpen && (
+                        <div className="absolute bottom-full mb-2 right-0 w-64 bg-background border border-border rounded-xl shadow-elevated overflow-hidden z-50">
+                          <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-text-muted border-b border-border-muted">
+                            {t('chat.switchModel') || 'Switch model'}
+                          </div>
+                          <div className="py-1 max-h-60 overflow-y-auto">
+                            {quickSwitchModels.map((m) => {
+                              const isActive = activeConfigSetId === m.id;
+                              return (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  onClick={() => handleModelSwitch(m.id)}
+                                  className={`w-full text-left px-3 py-2 flex items-center gap-2 text-sm transition-colors ${
+                                    isActive
+                                      ? 'bg-accent/10 text-accent'
+                                      : 'text-text-primary hover:bg-surface-hover'
+                                  }`}
+                                >
+                                  <span className="flex-1 truncate">{m.label}</span>
+                                  {isActive && <Check className="w-3.5 h-3.5 shrink-0" />}
+                                </button>
+                              );
+                            })}
+                            {appConfig?.configSets &&
+                              appConfig.configSets.length > 0 &&
+                              quickSwitchModels.length === 0 && (
+                                <div className="px-3 py-2 flex items-center gap-2 text-sm text-text-muted">
+                                  <span className="flex-1 truncate">{t('chat.noConfigSet')}</span>
+                                </div>
+                              )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleSubmit}
+                      disabled={
+                        (!prompt.trim() &&
+                          pastedImages.length === 0 &&
+                          attachedFiles.length === 0) ||
+                        isSubmitting
+                      }
+                      className="inline-flex items-center gap-2 rounded-full bg-accent px-4 py-2.5 text-white shadow-sm hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {isSubmitting ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <>
+                          {t('welcome.letsGo')}
+                          <ChevronRight className="w-4 h-4" />
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex items-center justify-between gap-3 px-1">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">
+                    <span className="hidden sm:inline">{t('welcome.defaultWorkingDir')}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {pastedImages.length > 0 && (
+              <div className="w-full max-w-[760px] flex flex-wrap gap-2 justify-center mx-auto">
+                {pastedImages.map((img, index) => (
+                  <div key={img.url} className="relative">
+                    <img
+                      src={img.url}
+                      alt={t('welcome.pastedImageAlt', { index: index + 1 })}
+                      className="h-16 w-16 rounded-lg object-cover border border-border-muted"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removeImage(index)}
+                      className="absolute -top-2 -right-2 rounded-full bg-background border border-border-muted p-1 text-text-muted hover:text-error"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {attachedFiles.length > 0 && (
+              <div className="w-full max-w-[760px] space-y-2 mx-auto">
+                {attachedFiles.map((file, index) => (
+                  <div
+                    key={file.path || `attached-file-${index}`}
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-muted border border-border group"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-text-primary truncate">{file.name}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeFile(index)}
+                      className="w-6 h-6 rounded-full bg-error/10 hover:bg-error/20 text-error flex items-center justify-center"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     );
   }
@@ -723,72 +1222,64 @@ export function ChatView() {
           ref={messagesContainerRef}
           className="w-full max-w-[920px] mx-auto py-8 px-5 lg:px-8 space-y-5"
         >
-          {displayedMessages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">
-                今点通
-              </p>
-              <p className="text-base text-text-secondary">{t('chat.startConversation')}</p>
+          {isLoadingMore && messages.length > 0 && (
+            <div className="flex justify-center py-2">
+              <Loader2 className="w-4 h-4 animate-spin text-text-muted" />
             </div>
+          )}
+          {displayedMessages.length === 0 ? (
+            loadingSessionId === activeSessionId ? (
+              // Session data is being loaded — show a subtle loading indicator
+              <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
+                <Loader2 className="w-5 h-5 animate-spin text-accent" />
+                <p className="text-sm text-text-secondary">{t('chat.loadingConversation')}</p>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">今点通</p>
+                <p className="text-base text-text-secondary">{t('chat.startConversation')}</p>
+              </div>
+            )
           ) : (
-            groupMessagesIntoRounds(displayedMessages).map((round, roundIndex) => {
-              const roundProcessBlocks = round.assistantMessages.flatMap((assistantMessage) => {
-                const blocks = getMessageContentBlocks(assistantMessage);
-                const merged = mergeThinkingBlocks(blocks);
-                return merged.some(isProcessBlock) ? merged : [];
-              });
+            roundPlans.map((round) => (
+              <div key={round.key} className="space-y-5">
+                {round.userMessage && (
+                  <div key={round.userMessage.id}>
+                    <MessageCard message={round.userMessage} />
+                  </div>
+                )}
+                {round.items.length > 0 && (
+                  <div className="space-y-1.5">
+                    <ProcessPanel
+                      blocks={round.processBlocks}
+                      message={round.lastAssistantMessage}
+                    />
+                    {round.items.map((item) => {
+                      if (item.visibleBlocks.length === 0) return null;
 
-              return (
-                <div key={roundIndex} className="space-y-5">
-                  {round.userMessage && (
-                    <div key={round.userMessage.id}>
-                      <MessageCard message={round.userMessage} />
-                    </div>
-                  )}
-                  {round.assistantMessages.length > 0 && (
-                    <div className="space-y-1.5">
-                      <ProcessPanel
-                        blocks={roundProcessBlocks}
-                        message={round.assistantMessages[round.assistantMessages.length - 1]}
-                      />
-                      {round.assistantMessages.map((message) => {
-                        const isStreaming =
-                          typeof message.id === 'string' && message.id.startsWith('partial-');
-                        const blocks = getMessageContentBlocks(message);
-                        const merged = mergeThinkingBlocks(blocks);
-                        const hasProcessContent = merged.some(isProcessBlock);
-                        const visibleBlocks = hasProcessContent
-                          ? merged.filter(
-                              (block) =>
-                                !isProcessBlock(block) && block.type !== 'text'
-                            )
-                          : merged;
-                        if (visibleBlocks.length === 0) return null;
-
-                        return (
-                          <div key={message.id} className="space-y-1.5">
-                            {visibleBlocks.map((block, index) => (
-                              <ContentBlockView
-                                key={
-                                  'id' in block
-                                    ? (block as { id: string }).id
-                                    : `block-${block.type}-${index}`
-                                }
-                                block={block}
-                                isUser={false}
-                                isStreaming={isStreaming}
-                                allBlocks={merged}
-                                message={message}
-                              />
-                            ))}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            })
+                      return (
+                        <div key={item.message.id} className="space-y-1.5">
+                          {item.visibleBlocks.map((block, index) => (
+                            <ContentBlockView
+                              key={
+                                'id' in block
+                                  ? (block as { id: string }).id
+                                  : `block-${block.type}-${index}`
+                              }
+                              block={block}
+                              isUser={false}
+                              isStreaming={item.isStreaming}
+                              allBlocks={item.mergedBlocks}
+                              message={item.message}
+                            />
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ))
           )}
 
           {/* Processing indicator - show when we have an active turn but no streaming content yet */}
@@ -819,13 +1310,20 @@ export function ChatView() {
 
       {/* Input */}
       <div className="border-t border-border-muted bg-background/92 backdrop-blur-md">
-        <div className="max-w-[920px] mx-auto px-5 lg:px-8 py-5">
+        <div
+          className="mx-auto px-5 lg:px-8 py-5 relative flex flex-col"
+          style={{
+            width: `${inputBoxSize.width}px`,
+            maxWidth: '100%',
+            minHeight: `${Math.max(inputHeight, inputBoxSize.height)}px`,
+          }}
+        >
           <form
             onSubmit={handleSubmit}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            className="relative w-full"
+            className="relative w-full flex-1 flex flex-col"
           >
             {/* Image previews */}
             {pastedImages.length > 0 && (
@@ -873,10 +1371,52 @@ export function ChatView() {
             )}
 
             <div
-              className={`flex items-end gap-2 p-3.5 rounded-[1.75rem] bg-background/88 border border-border-muted shadow-soft transition-colors ${
+              className={`relative flex items-end gap-2 p-3.5 rounded-[1.75rem] bg-background/88 border border-border-muted shadow-soft transition-colors ${
                 isDragging ? 'ring-2 ring-accent bg-accent/5' : ''
               }`}
             >
+              {/* Resize handles - anchored to the rounded input capsule */}
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('x', -1)(e);
+                }}
+                className="absolute top-2 bottom-2 -left-1.5 w-2 cursor-ew-resize group/handle"
+                title={t('chat.resizeWidth') || 'Drag to resize width'}
+              >
+                <div className="absolute inset-y-0 left-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('x', 1)(e);
+                }}
+                className="absolute top-2 bottom-2 -right-1.5 w-2 cursor-ew-resize group/handle"
+                title={t('chat.resizeWidth') || 'Drag to resize width'}
+              >
+                <div className="absolute inset-y-0 right-1 w-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('y', -1)(e);
+                }}
+                className="absolute -top-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                title={t('chat.resizeHeight') || 'Drag to resize height'}
+              >
+                <div className="absolute inset-x-0 top-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+              <div
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  startResize('y', 1)(e);
+                }}
+                className="absolute -bottom-1.5 left-2 right-2 h-2 cursor-ns-resize group/handle"
+                title={t('chat.resizeHeight') || 'Drag to resize height'}
+              >
+                <div className="absolute inset-x-0 bottom-1 h-0.5 rounded-full bg-border-muted group-hover/handle:bg-accent/50 transition-colors" />
+              </div>
+
               <button
                 type="button"
                 onClick={handleFileSelect}
@@ -889,7 +1429,8 @@ export function ChatView() {
               <textarea
                 ref={textareaRef}
                 value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
+                onChange={(e) => handlePromptChange(e.target.value)}
+                style={{ minHeight: '24px', maxHeight: '180px' }}
                 onCompositionStart={() => {
                   isComposingRef.current = true;
                 }}
@@ -914,10 +1455,59 @@ export function ChatView() {
               />
 
               <div className="flex items-center gap-2">
-                {/* Model display */}
-                <span className="hidden sm:inline-flex px-2.5 py-1 rounded-full border border-border-subtle bg-background/60 text-xs text-text-muted">
-                  {appConfig?.model || t('chat.noModel')}
-                </span>
+                {/* Model quick-switch dropdown */}
+                <div className="relative" ref={modelMenuRef}>
+                  <button
+                    type="button"
+                    onClick={() => setModelMenuOpen((v) => !v)}
+                    className="hidden sm:inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-border-subtle bg-background/60 text-xs text-text-muted hover:bg-surface-hover hover:text-text-primary transition-colors"
+                    title={t('chat.switchModel') || 'Switch model'}
+                  >
+                    <Cpu className="w-3 h-3" />
+                    <span className="max-w-[120px] truncate">
+                      {appConfig?.model || t('chat.noModel')}
+                    </span>
+                    <ChevronDown className="w-3 h-3 shrink-0" />
+                  </button>
+                  {modelMenuOpen && (
+                    <div className="absolute bottom-full mb-2 right-0 w-64 bg-background border border-border rounded-xl shadow-elevated overflow-hidden z-50">
+                      <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-text-muted border-b border-border-muted">
+                        {t('chat.switchModel') || 'Switch model'}
+                      </div>
+                      <div className="py-1 max-h-60 overflow-y-auto">
+                        {quickSwitchModels.map((m) => {
+                          const isActive = activeConfigSetId === m.id;
+                          return (
+                            <button
+                              key={m.id}
+                              type="button"
+                              onClick={() => handleModelSwitch(m.id)}
+                              className={`w-full text-left px-3 py-2 flex items-center gap-2 text-sm transition-colors ${
+                                isActive
+                                  ? 'bg-accent/10 text-accent'
+                                  : 'text-text-primary hover:bg-surface-hover'
+                              }`}
+                            >
+                              <span className="flex-1 truncate">{m.label}</span>
+                              {isActive && <Check className="w-3.5 h-3.5 shrink-0" />}
+                            </button>
+                          );
+                        })}
+                        {/* Fallback: show the current active config set if the config was
+                            loaded before configSets were initialized */}
+                        {appConfig?.configSets &&
+                          appConfig.configSets.length > 0 &&
+                          quickSwitchModels.length === 0 && (
+                            <div className="px-3 py-2 flex items-center gap-2 text-sm text-text-muted">
+                              <span className="flex-1 truncate">
+                                {appConfig.model || appConfig.activeConfigSetId}
+                              </span>
+                            </div>
+                          )}
+                      </div>
+                    </div>
+                  )}
+                </div>
 
                 {canStop && (
                   <button

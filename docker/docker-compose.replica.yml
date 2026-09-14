@@ -20,6 +20,8 @@ services:
     volumes:
       # 项目源码 (挂载宿主目录, 构建产物直接写入宿主 release/)
       - ..:/app
+      # node_modules: 用独立命名卷，避免 bind mount 写入宿主的性能瓶颈
+      - zhinengti-replica-node-modules:/app/node_modules
       # npm 缓存 (共享宿主 ~/.npm, 避免重复下载)
       - ~/.npm:/home/builder/.npm
       # Electron 二进制缓存 (共享宿主 ~/.cache/electron)
@@ -39,3 +41,6 @@ services:
         node scripts/build-win7.mjs &&
         echo 'Done! Installer at release/今点通-*-win-x64.exe'
       "
+
+volumes:
+  zhinengti-replica-node-modules:

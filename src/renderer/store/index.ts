@@ -41,6 +41,7 @@ export interface SessionState {
   executionClock: SessionExecutionClock;
   traceSteps: TraceStep[];
   contextWindow: number;
+  hasMoreMessages: boolean;
 }
 
 const DEFAULT_SESSION_STATE: SessionState = {
@@ -52,6 +53,7 @@ const DEFAULT_SESSION_STATE: SessionState = {
   executionClock: { startAt: null, endAt: null },
   traceSteps: [],
   contextWindow: 0,
+  hasMoreMessages: true,
 };
 
 // Helper to immutably update a single session's state within the record
@@ -72,10 +74,12 @@ function getSession(states: Record<string, SessionState>, sessionId: string): Se
   return states[sessionId] ?? DEFAULT_SESSION_STATE;
 }
 
-interface AppState {
+export interface AppState {
   // Sessions
   sessions: Session[];
   activeSessionId: string | null;
+  /** Session whose messages are being loaded from storage (null when idle). */
+  loadingSessionId: string | null;
 
   // Per-session state (messages, partials, turns, traces, etc.)
   sessionStates: Record<string, SessionState>;
@@ -125,6 +129,7 @@ interface AppState {
   removeSession: (sessionId: string) => void;
   removeSessions: (sessionIds: string[]) => void;
   setActiveSession: (sessionId: string | null) => void;
+  setLoadingSessionId: (sessionId: string | null) => void;
 
   addMessage: (sessionId: string, message: Message) => void;
   updateMessage: (sessionId: string, messageId: string, updates: Partial<Message>) => void;
@@ -132,6 +137,8 @@ interface AppState {
   finishExecutionClock: (sessionId: string, endAt?: number) => void;
   clearExecutionClock: (sessionId: string) => void;
   setMessages: (sessionId: string, messages: Message[]) => void;
+  prependMessages: (sessionId: string, messages: Message[], hasMore: boolean) => void;
+  setHasMoreMessages: (sessionId: string, hasMore: boolean) => void;
   setPartialMessage: (sessionId: string, partial: string) => void;
   clearPartialMessage: (sessionId: string) => void;
   setPartialThinking: (sessionId: string, delta: string) => void;
@@ -189,6 +196,39 @@ interface AppState {
   setSystemDarkMode: (dark: boolean) => void;
 }
 
+const SETTINGS_STORAGE_KEY = 'nowlink.renderer.settings.v1';
+
+function clampFontScale(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return 1;
+  return Math.min(1.2, Math.max(0.85, numeric));
+}
+
+function loadPersistedSettings(): Partial<Settings> | null {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<Settings>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      ...parsed,
+      fontScale: clampFontScale(parsed.fontScale),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistSettings(settings: Settings): void {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    /* ignore */
+  }
+}
+
 const defaultSettings: Settings = {
   theme: 'light',
   defaultTools: [
@@ -217,12 +257,14 @@ const defaultSettings: Settings = {
   globalSkillsPath: '',
   memoryStrategy: 'auto',
   maxContextTokens: 180000,
+  fontScale: 1,
 };
 
 export const useAppStore = create<AppState>((set) => ({
   // Initial state
   sessions: [],
   activeSessionId: null,
+  loadingSessionId: null,
   sessionStates: {},
   isLoading: false,
   sidebarCollapsed: false,
@@ -231,7 +273,7 @@ export const useAppStore = create<AppState>((set) => ({
   settingsTab: null,
   pendingPermission: null,
   pendingSudoPassword: null,
-  settings: defaultSettings,
+  settings: { ...defaultSettings, ...loadPersistedSettings() },
   appConfig: null,
   isConfigured: false,
   showConfigModal: false,
@@ -289,6 +331,8 @@ export const useAppStore = create<AppState>((set) => ({
     }),
 
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
+
+  setLoadingSessionId: (sessionId) => set({ loadingSessionId: sessionId }),
 
   // Message actions
   addMessage: (sessionId, message) =>
@@ -378,6 +422,33 @@ export const useAppStore = create<AppState>((set) => ({
   setMessages: (sessionId, messages) =>
     set((state) => ({
       sessionStates: patchSession(state.sessionStates, sessionId, { messages }),
+    })),
+
+  prependMessages: (sessionId, newMessages, hasMore) =>
+    set((state) => {
+      const ss = getSession(state.sessionStates, sessionId);
+      // Older pages can overlap with what is already loaded: the offset is
+      // derived from the renderer's message count, which drifts when new
+      // messages are appended while a page is in flight. Duplicate ids would
+      // become duplicate React keys in the list, so filter them out here.
+      const existingIds = new Set(ss.messages.map((m) => m.id));
+      const older = newMessages.filter((m) => !existingIds.has(m.id));
+      if (older.length === 0 && ss.hasMoreMessages === hasMore) {
+        return {};
+      }
+      return {
+        sessionStates: patchSession(state.sessionStates, sessionId, {
+          messages: [...older, ...ss.messages],
+          hasMoreMessages: hasMore,
+        }),
+      };
+    }),
+
+  setHasMoreMessages: (sessionId, hasMore) =>
+    set((state) => ({
+      sessionStates: patchSession(state.sessionStates, sessionId, {
+        hasMoreMessages: hasMore,
+      }),
     })),
 
   setPartialMessage: (sessionId, partial) =>
@@ -553,9 +624,11 @@ export const useAppStore = create<AppState>((set) => ({
 
   // Settings actions
   setSettings: (updates) =>
-    set((state) => ({
-      settings: { ...state.settings, ...updates },
-    })),
+    set((state) => {
+      const next = { ...state.settings, ...updates };
+      persistSettings(next);
+      return { settings: next };
+    }),
   updateSettings: (updates) => {
     if (typeof window !== 'undefined' && window.electronAPI) {
       window.electronAPI.send({
@@ -563,9 +636,11 @@ export const useAppStore = create<AppState>((set) => ({
         payload: updates as Record<string, unknown>,
       });
     }
-    set((state) => ({
-      settings: { ...state.settings, ...updates },
-    }));
+    set((state) => {
+      const next = { ...state.settings, ...updates };
+      persistSettings(next);
+      return { settings: next };
+    });
   },
 
   // Config actions

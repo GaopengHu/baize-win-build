@@ -48,7 +48,11 @@ import { setMaxListeners } from 'node:events';
 import { getSandboxAdapter } from '../sandbox/sandbox-adapter';
 import { pathConverter } from '../sandbox/wsl-bridge';
 import { SandboxSync } from '../sandbox/sandbox-sync';
-import { extractArtifactsFromText, buildArtifactTraceSteps } from '../utils/artifact-parser';
+import {
+  extractArtifactsFromText,
+  buildArtifactTraceSteps,
+  buildArtifactCompletionText,
+} from '../utils/artifact-parser';
 import { getDefaultShell } from '../utils/shell-resolver';
 import { detectCommandTools, formatDetectedTools } from '../utils/detect-command-tools';
 import { PluginRuntimeService } from '../skills/plugin-runtime-service';
@@ -74,6 +78,10 @@ import {
 } from './pi-model-resolution';
 import { buildPiSessionRuntimeSignature } from './pi-session-runtime';
 import { ThinkTagStreamParser } from './think-tag-parser';
+import {
+  attachDeferredMemoryInjection,
+  type DeferredMemoryInjectionHandle,
+} from './deferred-memory-injector';
 import {
   LoopGuard,
   buildAbortUserMessage,
@@ -2158,7 +2166,37 @@ If your answer uses linkable content from MCP tools, include a "Sources:" sectio
 Tool routing:
 - If user explicitly asks to use Chrome/browser/web navigation, prioritize Chrome MCP tools (mcp__Chrome__*) over generic WebSearch/WebFetch.
 - Use WebSearch/WebFetch only when Chrome MCP is unavailable or the user explicitly asks for generic web search.
+
+Tool parameter naming (CRITICAL - incorrect parameter names will cause validation errors):
+- read tool: use \`path\` (NOT \`file_path\` or \`filePath\`)
+- write tool: use \`path\` and \`content\` (NOT \`file_path\` or \`filePath\`)
+- edit tool: use \`path\`, \`oldText\`, and \`newText\` (NOT \`file_path\`, \`old_string\`, or \`new_string\`)
+- bash tool: use \`command\` and optionally \`timeout\`
 </tool_behavior>`,
+        `<code_quality_rules>
+When writing or modifying code:
+1. DEPENDENCY CHECK: Before using any library, verify it exists in package.json (or equivalent manifest). If not available, install it first or use an existing alternative.
+2. READ BEFORE WRITE: Always read existing files before modifying them. Never assume file contents or structure.
+3. ERROR HANDLING: Include proper error handling (try-catch, null checks, boundary validation). Never silently swallow errors.
+4. SECURITY: Validate user inputs. Never hardcode secrets or API keys. Use parameterized queries for databases.
+5. CODE STYLE: Match the existing project style — indentation, naming conventions, import patterns, and comment style.
+6. VERIFICATION: After making changes, run available verification commands (lint, typecheck, test) if defined in package.json scripts or equivalent.
+7. MINIMAL CHANGES: Make the smallest change that achieves the goal. Do not refactor unrelated code unless asked.
+8. EXPLAIN BRIEFLY: After completing changes, summarize what was done and why in 2-3 sentences.
+</code_quality_rules>`,
+        `<document_generation_rules>
+When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
+
+1. READ SKILL DOCS FIRST: Read the relevant SKILL.md to understand the API and best practices before writing code. Do not skip this step — understanding the API prevents errors.
+
+2. ONE COMPLETE SCRIPT: Plan the full document content, then write ONE script that generates everything in a single execution.
+
+3. EXECUTE AND FIX: Run the script. If it fails, read the error carefully, fix the issue, and re-run. Maximum 3 retry attempts. Do not rewrite from scratch — fix the specific error.
+
+4. BUDGET: Aim for 5-10 tool calls total for a complete document. Complex documents may require more.
+
+5. CONTENT FIRST: Focus on delivering correct, complete content the user asked for. Use clean, simple formatting unless the user explicitly requests elaborate styling.
+</document_generation_rules>`,
         this.getBundledPathHints(),
       ]
         .filter((section): section is string => Boolean(section && section.trim()))
@@ -2262,6 +2300,9 @@ Tool routing:
           cwd: effectiveCwd,
           additionalSkillPaths: skillPaths,
           appendSystemPrompt: coworkAppendPrompt,
+          agentsFilesOverride: () => ({
+            agentsFiles: [],
+          }),
         });
         await resourceLoader.reload();
 
@@ -2389,6 +2430,9 @@ Tool routing:
       const thinkParser = new ThinkTagStreamParser();
       const promptStartedAt = Date.now();
       const streamEventCounts = new Map<string, number>();
+      // Per-API-call timing: track each LLM round-trip within the agent loop
+      let messageStartTime: number | undefined;
+      let apiCallCount = 0;
 
       // ── Loop guard: protect against runaway tool-call loops ──
       // (e.g. gemini-3.1-pro with thinking=off has been observed producing hundreds
@@ -2598,13 +2642,16 @@ Tool routing:
               log(`[ClaudeAgentRunner] Event: ${event.type} → ${updateType}`);
             }
           } else if (event.type === 'message_start') {
+            messageStartTime = Date.now();
+            apiCallCount++;
             log(
-              '[ClaudeAgentRunner] Event: message_start',
+              `[ClaudeAgentRunner] Event: message_start [api_call #${apiCallCount}]`,
               safeStringify(summarizeMessageForLog(event.message), 2)
             );
           } else if (event.type === 'message_end') {
+            const apiCallDuration = messageStartTime ? Date.now() - messageStartTime : -1;
             log(
-              '[ClaudeAgentRunner] Event: message_end',
+              `[ClaudeAgentRunner] Event: message_end [api_call #${apiCallCount}, ${apiCallDuration}ms]`,
               safeStringify(
                 {
                   message: summarizeMessageForLog(event.message),
@@ -2613,6 +2660,7 @@ Tool routing:
                 2
               )
             );
+            messageStartTime = undefined;
           } else if (event.type === 'turn_end') {
             log(`[ClaudeAgentRunner] Event: ${event.type}`);
           } else {
@@ -2697,6 +2745,26 @@ Tool routing:
               }
 
               const msg = event.message;
+              // Defensive: drop malformed toolCall blocks (empty/missing name) from the
+              // LIVE SDK message. A model/gateway may return a tool call with an empty
+              // function name; if left in the conversation it (a) can never be executed
+              // ("Tool not found") and (b) is forwarded verbatim to the upstream gateway
+              // on the follow-up request, which 500s ('str' object has no attribute
+              // 'items'). Removing it here means the SDK's tool-execution filter
+              // (agent-loop) never sees it, so the turn continues cleanly and history
+              // stays free of the broken block. `event.message` is the same object
+              // instance held in the SDK session state, so mutating it takes effect
+              // before the agent-loop scans `message.content` for pending tool calls.
+              if (msg && Array.isArray((msg as { content?: unknown }).content)) {
+                const content = (msg as { content: Array<{ type?: string; name?: string }> })
+                  .content;
+                const filtered = content.filter(
+                  (b) => !(b && b.type === 'toolCall' && (!b.name || String(b.name).trim() === ''))
+                );
+                if (filtered.length !== content.length) {
+                  (msg as { content: unknown }).content = filtered;
+                }
+              }
               if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
                 log('[ClaudeAgentRunner] message_end raw message:', safeStringify(msg, 2));
               }
@@ -2740,6 +2808,10 @@ Tool routing:
                     if (artifacts.length > 0) {
                       for (const step of buildArtifactTraceSteps(artifacts)) {
                         this.sendTraceStep(session.id, step);
+                      }
+                      const completionText = buildArtifactCompletionText(artifacts);
+                      if (completionText) {
+                        contentBlocks.push({ type: 'text', text: completionText });
                       }
                     }
                   } else if (block.type === 'toolCall') {
@@ -2937,6 +3009,39 @@ Tool routing:
         }
       });
 
+      // ── Deferred memory injection ──
+      // Background experience retrieval (see MemoryExtension) resolves in
+      // parallel with the first LLM request; when it lands while the turn is
+      // still running we inject it via pi's steering channel. This keeps the
+      // first-token path free of memory LLM round-trips.
+      let promptInProgress = false;
+      let memoryInjectionHandle: DeferredMemoryInjectionHandle | undefined;
+      if (extensionResult.deferredExperience) {
+        const retrievalTimeoutMs = configStore.get('memoryRuntime')?.retrievalTimeoutMs ?? 8000;
+        memoryInjectionHandle = attachDeferredMemoryInjection(extensionResult.deferredExperience, {
+          timeoutMs: retrievalTimeoutMs,
+          isTurnActive: () => promptInProgress && !controller.signal.aborted,
+          sendSteer: (text) => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const sessionAny = piSession as any;
+            if (typeof sessionAny.sendUserMessage !== 'function') {
+              throw new Error('piSession.sendUserMessage is not available');
+            }
+            return Promise.resolve(sessionAny.sendUserMessage(text, { deliverAs: 'steer' }));
+          },
+          onInjected: () => {
+            log('[ClaudeAgentRunner] Deferred memory context injected via steering');
+            this.sendTraceStep(session.id, {
+              id: uuidv4(),
+              type: 'thinking',
+              status: 'completed',
+              title: 'Memory context injected',
+              timestamp: Date.now(),
+            });
+          },
+        });
+      }
+
       // Execute the prompt — unsubscribe in finally to prevent event listener leak
       try {
         resetActivityTimeout();
@@ -2954,12 +3059,16 @@ Tool routing:
             })
           );
         }
+        promptInProgress = true;
         const promptResult = await piSession.prompt(contextualPrompt);
+        promptInProgress = false;
         log(
           '[ClaudeAgentRunner] prompt() returned:',
           JSON.stringify(promptResult ?? 'void').substring(0, 1000)
         );
       } finally {
+        promptInProgress = false;
+        memoryInjectionHandle?.cancel();
         try {
           unsubscribe();
         } catch (e) {
@@ -2969,7 +3078,7 @@ Tool routing:
         if (ollamaColdStartTimerId) clearTimeout(ollamaColdStartTimerId);
       }
 
-      logTiming('agent prompt completed', runStartTime);
+      logTiming(`agent prompt completed (${apiCallCount} API calls)`, runStartTime);
 
       // If the SDK swallowed the AbortError and returned void, detect timeout here
       if (controller.signal.aborted && abortedByTimeout) {

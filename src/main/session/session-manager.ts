@@ -25,6 +25,7 @@ import type {
   FileAttachmentContent,
 } from '../../renderer/types';
 import type { DatabaseInstance, TraceStepRow } from '../db/database';
+import { TraceWriteBatcher } from '../db/trace-write-batcher';
 import { PathResolver } from '../sandbox/path-resolver';
 import {
   SandboxAdapter,
@@ -95,6 +96,13 @@ export class SessionManager {
   private titleGenerationTokens: Map<string, symbol> = new Map();
   private messageCache: Map<string, Message[]> = new Map();
   private static readonly MAX_CACHE_SIZE = 100;
+  /**
+   * Trace persistence is batched so the synchronous SQLite writes no longer
+   * sit on the event-forwarding hot path (UI receives trace events first).
+   * Flushed at turn end (status→idle), before session deletion, and on
+   * shutdown via flushTraceWrites().
+   */
+  private readonly traceWriteBatcher: TraceWriteBatcher;
 
   constructor(
     db: DatabaseInstance,
@@ -103,14 +111,24 @@ export class SessionManager {
     extensionManager?: AgentRuntimeExtensionManager
   ) {
     this.db = db;
+    this.traceWriteBatcher = new TraceWriteBatcher({
+      flushIntervalMs: 200,
+      maxPending: 20,
+      onError: (error) => {
+        logError('[SessionManager] Batched trace write failed:', error);
+      },
+    });
     this.sendToRenderer = (event) => {
+      // Forward to the renderer FIRST — persistence must never delay the UI.
+      sendToRenderer(event);
       if (event.type === 'trace.step') {
-        this.saveTraceStep(event.payload.sessionId, event.payload.step);
+        const { sessionId, step } = event.payload;
+        this.traceWriteBatcher.enqueue(() => this.saveTraceStep(sessionId, step));
       }
       if (event.type === 'trace.update') {
-        this.updateTraceStep(event.payload.stepId, event.payload.updates);
+        const { stepId, updates } = event.payload;
+        this.traceWriteBatcher.enqueue(() => this.updateTraceStep(stepId, updates));
       }
-      sendToRenderer(event);
     };
     this.pathResolver = new PathResolver();
     this.sandboxAdapter = getSandboxAdapter();
@@ -981,6 +999,9 @@ export class SessionManager {
     }
 
     // Delete from database (messages will be deleted automatically via CASCADE)
+    // Flush pending trace writes FIRST so no queued insert fires after deletion
+    // (which would violate the session FK or resurrect deleted rows).
+    this.flushTraceWrites();
     this.db.sessions.delete(sessionId);
     this.messageCache.delete(sessionId);
     this.sessionTitleAttempts.delete(sessionId);
@@ -1010,20 +1031,33 @@ export class SessionManager {
       const scriptExtensions = ['.py', '.sh', '.mjs', '.js', '.ts'];
       // Product extensions to preserve (final products)
       const productExtensions = [
-        '.docx', '.pptx', '.xlsx', '.pdf', '.md', '.txt', '.json', '.csv',
-        '.png', '.jpg', '.jpeg', '.gif', '.svg', '.html', '.css'
+        '.docx',
+        '.pptx',
+        '.xlsx',
+        '.pdf',
+        '.md',
+        '.txt',
+        '.json',
+        '.csv',
+        '.png',
+        '.jpg',
+        '.jpeg',
+        '.gif',
+        '.svg',
+        '.html',
+        '.css',
       ];
 
       const files = fs.readdirSync(workDir, { withFileTypes: true });
-      
+
       for (const file of files) {
         if (!file.isFile()) continue;
-        
+
         const ext = path.extname(file.name).toLowerCase();
-        
+
         // Skip if it's a product file
         if (productExtensions.includes(ext)) continue;
-        
+
         // Delete if it's a script file
         if (scriptExtensions.includes(ext)) {
           const filePath = path.join(workDir, file.name);
@@ -1064,6 +1098,8 @@ export class SessionManager {
     }
 
     // Perform all SQLite deletions atomically
+    // Flush pending trace writes first (same FK/resurrection guard as deleteSession).
+    this.flushTraceWrites();
     this.db.raw.transaction(() => {
       for (const sessionId of sessionIds) {
         this.db.sessions.delete(sessionId);
@@ -1089,12 +1125,24 @@ export class SessionManager {
 
   // Update session status
   private updateSessionStatus(sessionId: string, status: Session['status']): void {
+    if (status === 'idle') {
+      // Turn finished: persist any pending trace writes before flipping status.
+      this.flushTraceWrites();
+    }
     this.db.sessions.update(sessionId, { status, updated_at: Date.now() });
 
     this.sendToRenderer({
       type: 'session.status',
       payload: { sessionId, status },
     });
+  }
+
+  /**
+   * Persists all pending batched trace writes synchronously. Called at turn
+   * end, before session deletion, and during app shutdown.
+   */
+  flushTraceWrites(): void {
+    this.traceWriteBatcher.flush();
   }
 
   private updateSessionTitle(sessionId: string, title: string): boolean {
@@ -1155,7 +1203,7 @@ export class SessionManager {
       id: message.id,
       session_id: message.sessionId,
       role: message.role,
-      content: JSON.stringify(message.content),
+      content: JSON.stringify(this.sanitizeContentBlocks(message.content)),
       timestamp: message.timestamp,
       token_usage: message.tokenUsage ? JSON.stringify(message.tokenUsage) : null,
       execution_time_ms: message.executionTimeMs ?? null,
@@ -1185,18 +1233,102 @@ export class SessionManager {
       return [...cached];
     }
 
+    const loadStart = Date.now();
     const rows = this.db.messages.getBySessionId(sessionId);
-    const messages = rows.map((row) => ({
+    const messages: Message[] = new Array(rows.length);
+    for (let i = 0; i < rows.length; i++) {
+      messages[i] = this.createLazyMessage(rows[i]);
+    }
+    this.messageCache.set(sessionId, messages);
+    log(
+      `[SessionManager] getMessages: loaded ${rows.length} messages (lazy) in ${Date.now() - loadStart}ms for session ${sessionId}`
+    );
+    return [...messages];
+  }
+
+  /**
+   * Create a message with lazily-parsed content and tokenUsage fields.
+   * JSON.parse is deferred until the property is first accessed, which
+   * significantly speeds up initial load for sessions with many messages.
+   * The parsed result is cached on the message object itself.
+   */
+  private createLazyMessage(row: {
+    id: string;
+    session_id: string;
+    role: string;
+    content: string;
+    timestamp: number;
+    token_usage: string | null;
+    execution_time_ms: number | null;
+  }): Message {
+    let _content: ContentBlock[] | undefined;
+    let _tokenUsage: Message['tokenUsage'] | undefined;
+    let _contentParsed = false;
+    let _tokenUsageParsed = false;
+    const rawContent = row.content;
+    const rawTokenUsage = row.token_usage;
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- `self` is captured for lazy getters on the msg object literal, where `this` refers to the message, not the manager
+    const self = this;
+
+    const msg: Message = {
       id: row.id,
       sessionId: row.session_id,
       role: row.role as Message['role'],
-      content: this.normalizeContent(row.content),
       timestamp: row.timestamp,
-      tokenUsage: row.token_usage ? JSON.parse(row.token_usage) : undefined,
       executionTimeMs: row.execution_time_ms ?? undefined,
-    }));
-    this.messageCache.set(sessionId, messages);
-    return [...messages];
+      get content(): ContentBlock[] {
+        if (!_contentParsed) {
+          const normalized = self.normalizeContent(rawContent);
+          _content = self.sanitizeContentBlocks(normalized);
+          _contentParsed = true;
+        }
+        return _content!;
+      },
+      get tokenUsage(): Message['tokenUsage'] {
+        if (!_tokenUsageParsed) {
+          _tokenUsage = rawTokenUsage
+            ? (JSON.parse(rawTokenUsage) as Message['tokenUsage'])
+            : undefined;
+          _tokenUsageParsed = true;
+        }
+        return _tokenUsage;
+      },
+    };
+    return msg;
+  }
+
+  getMessagesPaginated(
+    sessionId: string,
+    limit: number,
+    offset: number
+  ): { messages: Message[]; total: number; hasMore: boolean } {
+    const total = this.db.messages.getCountBySessionId(sessionId);
+    const rows = this.db.messages.getPaginated(sessionId, limit, offset);
+    // DB returns DESC (newest first), reverse to ASC for chronological order
+    rows.reverse();
+    // Pre-parse content and tokenUsage into plain objects so IPC structured clone
+    // does not trigger lazy getters. This keeps the parsing controlled in the main
+    // process and avoids redundant parse cycles during transfer + render.
+    const messages: Message[] = rows.map((row) => {
+      const content = this.sanitizeContentBlocks(this.normalizeContent(row.content));
+      const tokenUsage = row.token_usage
+        ? (JSON.parse(row.token_usage) as Message['tokenUsage'])
+        : undefined;
+      return {
+        id: row.id,
+        sessionId: row.session_id,
+        role: row.role as Message['role'],
+        timestamp: row.timestamp,
+        executionTimeMs: row.execution_time_ms ?? undefined,
+        content,
+        tokenUsage,
+      };
+    });
+    return {
+      messages,
+      total,
+      hasMore: offset + limit < total,
+    };
   }
 
   private normalizeContent(raw: string): ContentBlock[] {
@@ -1220,6 +1352,48 @@ export class SessionManager {
     } catch {
       return [{ type: 'text', text: raw } as TextContent];
     }
+  }
+
+  /**
+   * Drop malformed tool_use / tool_result blocks that cannot be validly replayed
+   * to the model. A tool_use with an empty/blank `name` or `id` (or a tool_result
+   * with an empty/blank `toolUseId`) is corruption produced when an upstream model
+   * returns a broken tool call. Once persisted it poisons every future turn of the
+   * conversation. We remove these blocks both when reading history (self-heal) and
+   * when writing (defense), so a single broken response never becomes permanent.
+   */
+  private sanitizeContentBlocks(blocks: ContentBlock[]): ContentBlock[] {
+    if (!Array.isArray(blocks) || blocks.length === 0) return blocks;
+    let changed = false;
+    const filtered = blocks.filter((b) => {
+      if (b.type === 'tool_use') {
+        const nameOk = typeof b.name === 'string' && b.name.trim().length > 0;
+        const idOk = typeof b.id === 'string' && b.id.trim().length > 0;
+        if (!nameOk || !idOk) {
+          changed = true;
+          return false;
+        }
+        return true;
+      }
+      if (b.type === 'tool_result') {
+        const idOk = typeof b.toolUseId === 'string' && b.toolUseId.trim().length > 0;
+        if (!idOk) {
+          changed = true;
+          return false;
+        }
+        return true;
+      }
+      return true;
+    });
+    if (!changed) return blocks;
+    if (filtered.length === 0) {
+      const note: TextContent = {
+        type: 'text',
+        text: '[此消息包含损坏的工具调用数据（名称为空），已在加载时自动清理]',
+      };
+      return [note];
+    }
+    return filtered;
   }
 
   getTraceSteps(sessionId: string): TraceStep[] {
