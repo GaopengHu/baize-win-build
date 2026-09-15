@@ -282,11 +282,15 @@
   }
 
   .prose-chat a {
-    color: theme('colors.accent.DEFAULT');
+    color: #2f8bb8;
     text-decoration-line: underline;
     text-decoration-thickness: 0.08em;
     text-underline-offset: 0.22em;
     text-decoration-skip-ink: auto;
+  }
+
+  .prose-chat a:hover {
+    color: #237aa7;
   }
 
   /* Some model outputs wrap citation links in ~...~; keep links readable */

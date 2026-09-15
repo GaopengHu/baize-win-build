@@ -13,6 +13,7 @@ import {
   normalizeLocalFileMarkdownLinks,
   resolveLocalFilePathFromHref,
 } from '../../utils/markdown-local-link';
+import { decodeCjkPercentEncoding } from '../../../shared/local-file-path';
 import { normalizeLatexDelimiters } from '../../utils/latex-delimiters';
 import { appendFolderOpenLinks } from '../../utils/artifact-links';
 import type { ToolUseContent, ToolResultContent, FileAttachmentContent } from '../../types';
@@ -48,7 +49,8 @@ export const ContentBlockView = memo(function ContentBlockView({
   const activeSession = activeSessionId ? sessions.find((s) => s.id === activeSessionId) : null;
   const currentWorkingDir = activeSession?.cwd || workingDir;
 
-  const resolveFilePath = (value: string) => resolvePathAgainstWorkspace(value, currentWorkingDir);
+  const resolveFilePath = (value: string) =>
+    resolvePathAgainstWorkspace(decodeCjkPercentEncoding(value), currentWorkingDir);
 
   const openContainingFolder = async (filePath: string) => {
     if (typeof window === 'undefined' || !window.electronAPI?.showItemInFolder) {
@@ -119,8 +121,21 @@ export const ContentBlockView = memo(function ContentBlockView({
   const markdownComponents = useMemo(
     () => ({
       a({ children, href }: { children?: React.ReactNode; href?: string }) {
+        // href 里可能带着模型回吐的 %E8%A5%BF… 编码中文名。
+        // 幸运的是 normalizeLocalFileMarkdownLinks 在渲染前已把本地 href
+        // 转成 file:// 编码 URL，而 resolveLocalFilePathFromHref 内部经
+        // localPathFromFileUrl 会解码——点击目标天然是真实路径。
+        // 这里只对"可见按钮文字"做 CJK 解码，保证文件名显示正常；
+        // href 本体不二次解码，避免破坏 file:// URL 的 #/%23 边界。
         const localFilePath = resolveLocalFilePathFromHref(href, currentWorkingDir);
         if (localFilePath) {
+          const displayChildren = Array.isArray(children)
+            ? children.map((c) =>
+                typeof c === 'string' ? decodeCjkPercentEncoding(c) : c
+              )
+            : typeof children === 'string'
+              ? decodeCjkPercentEncoding(children)
+              : children;
           return (
             <button
               type="button"
@@ -130,23 +145,26 @@ export const ContentBlockView = memo(function ContentBlockView({
               className={getFileLinkButtonClassName()}
               title={localFilePath}
             >
-              {children}
+              {displayChildren}
             </button>
           );
         }
 
         const safeHref = href && /^(?:https?:|mailto:|#)/i.test(href) ? href : undefined;
+        if (!safeHref) {
+          return <span className="text-text-primary">{children}</span>;
+        }
         return (
           <a
             href={safeHref}
             rel="noreferrer"
             onClick={(event) => {
               event.preventDefault();
-              if (safeHref && typeof window !== 'undefined' && window.electronAPI?.openExternal) {
+              if (typeof window !== 'undefined' && window.electronAPI?.openExternal) {
                 void window.electronAPI.openExternal(safeHref);
               }
             }}
-            className="text-accent hover:text-accent-hover"
+            className="text-[#2f8bb8] hover:text-[#237aa7] underline decoration-[#79bfe0]/40 transition-colors"
           >
             {children}
           </a>
@@ -164,10 +182,17 @@ export const ContentBlockView = memo(function ContentBlockView({
         const isInline = !match;
 
         if (isInline) {
-          const raw = String(children);
+          let raw = String(children).replace(/\s*[\(（]\s*\d+(\.\d+)?\s*(B|KB|MB|GB)\s*[\)）]\s*$/i, '');
           const parts = splitTextByFileMentions(raw);
           if (parts.length === 1 && parts[0]?.type === 'file') {
             return renderFileButton(parts[0].value);
+          }
+          if (parts.some((p) => p.type === 'file')) {
+            return (
+              <span className="inline-flex flex-wrap gap-1 items-center">
+                {renderFileMentionParts(parts as ReturnType<typeof splitChildrenByFileMentions>, 'code')}
+              </span>
+            );
           }
           return (
             <code
@@ -236,6 +261,10 @@ export const ContentBlockView = memo(function ContentBlockView({
   switch (block.type) {
     case 'text': {
       const textBlock = block as { type: 'text'; text: string };
+      // 渲染链文本管线：先 Latex 规整、再 file:// markdown 链接规整。
+      // %E8%A5%BF… 类 CJK 百分比编码的解码不放在这里做——它下沉到链接/
+      // 文件按钮/产物面板的提取层，保证"同一文件名只认一个真实路径"，
+      // 避免正文与候选项对不上造成重复链接。
       const text = textBlock.text || '';
       const normalizedText = normalizeCitationMarkdownLinks(
         normalizeLocalFileMarkdownLinks(normalizeLatexDelimiters(text))
@@ -274,7 +303,7 @@ export const ContentBlockView = memo(function ContentBlockView({
             }
           >
             <MessageMarkdown
-              normalizedText={normalizedText}
+              normalizedText={augmentedText}
               isStreaming={isStreaming}
               components={markdownComponents}
             />

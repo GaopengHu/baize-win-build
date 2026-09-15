@@ -19,6 +19,22 @@ import type { Skill, PluginInstallResult } from '../../renderer/types';
 import type { DatabaseInstance } from '../db/database';
 import { log, logError, logWarn } from '../utils/logger';
 import { isPathWithinRoot } from '../tools/path-containment';
+import type { SkillsAdapter } from './skills-adapter';
+
+/**
+ * Built-in skills that are enabled by default on first run.
+ * Any other skill dropped into the built-in skills directory
+ * (e.g. `.claude/skills/<name>/SKILL.md`) defaults to disabled
+ * until the user flips its power toggle in settings.
+ */
+const DEFAULT_ENABLED_BUILTIN_SKILLS = new Set([
+  'docx',
+  'pdf',
+  'pptx',
+  'xlsx',
+  'skill-creator',
+  'gov-procurement-review',
+]);
 
 /**
  * Validate that a skill name is safe for use as a directory name.
@@ -95,7 +111,7 @@ export interface SetGlobalSkillsPathResult {
  * 2. Global: <userData>/claude/skills/ (includes ~/.claude/skills read-only)
  * 3. Built-in skills
  */
-export class SkillsManager {
+export class SkillsManager implements SkillsAdapter {
   private db: DatabaseInstance;
   private loadedSkills: Map<string, Skill> = new Map();
   private runningServers: Map<string, { process: unknown; skill: Skill }> = new Map();
@@ -155,17 +171,23 @@ export class SkillsManager {
           const metadata = this.getSkillMetadata(skillPath);
           if (!metadata) continue;
 
+          const existing = this.loadedSkills.get(`builtin-${dir}`);
+          const enabled = this.getPersistedEnabled(
+            `builtin-${dir}`,
+            DEFAULT_ENABLED_BUILTIN_SKILLS.has(dir.toLowerCase())
+          );
+
           const skill: Skill = {
             id: `builtin-${dir}`,
             name: metadata.name,
             description: metadata.description,
             type: 'builtin',
-            enabled: true,
-            createdAt: Date.now(),
+            enabled,
+            createdAt: existing?.createdAt ?? Date.now(),
           };
 
           this.loadedSkills.set(skill.id, skill);
-          log(`Loaded built-in skill: ${skill.name}`);
+          log(`Loaded built-in skill: ${skill.name} (enabled=${enabled})`);
         }
       } catch (error) {
         logError('Failed to load built-in skills from .claude/skills:', error);
@@ -605,7 +627,7 @@ export class SkillsManager {
               name: metadata.name,
               description: metadata.description,
               type: 'custom',
-              enabled: true,
+              enabled: this.getPersistedEnabled(`${source}-${entry}`, true),
               createdAt: Date.now(),
             };
 
@@ -624,7 +646,13 @@ export class SkillsManager {
               name: config.name,
               description: config.description,
               type: config.type === 'mcp' ? 'mcp' : 'custom',
-              enabled: config.enabled !== false,
+              enabled:
+                config.enabled !== undefined
+                  ? config.enabled
+                  : this.getPersistedEnabled(
+                      `${source}-${path.basename(entry, '.json')}`,
+                      true
+                    ),
               config: config.mcp ? { mcp: config.mcp } : undefined,
               createdAt: Date.now(),
             };
@@ -678,6 +706,63 @@ export class SkillsManager {
     }
 
     return skills;
+  }
+
+  /**
+   * Implement SkillsAdapter: return skill directories for enabled skills only.
+   * Used by the agent runner to feed the SDK's resource loader, so disabled
+   * skills are never exposed to the model.
+   *
+   * When the same skill name exists as both a builtin and a global entry
+   * (e.g. the app copies builtins into the global dir, or the user installed
+   * it before adding the builtin), the builtin entry takes precedence: its
+   * enabled state decides whether the skill is exposed at all.
+   */
+  async getSkillPaths(): Promise<string[]> {
+    const byName = new Map<string, { type: string; path: string; enabled: boolean }>();
+
+    const addCandidate = (
+      name: string,
+      type: string,
+      path: string,
+      enabled: boolean
+    ) => {
+      const key = name.toLowerCase();
+      const existing = byName.get(key);
+      if (existing && existing.type === 'builtin') {
+        return; // builtin already decided this skill
+      }
+      if (!existing || type === 'builtin') {
+        byName.set(key, { type, path, enabled });
+      }
+    };
+
+    const builtinRoot = this.getBuiltinSkillsPath();
+    for (const skill of this.loadedSkills.values()) {
+      if (skill.type !== 'builtin' || !builtinRoot || !skill.id.startsWith('builtin-')) {
+        continue;
+      }
+      const dir = skill.id.slice('builtin-'.length);
+      const p = path.join(builtinRoot, dir);
+      if (fs.existsSync(path.join(p, 'SKILL.md'))) {
+        addCandidate(skill.name, 'builtin', p, skill.enabled);
+      }
+    }
+
+    const globalSkills = await this.loadGlobalSkills();
+    const globalRoot = this.getGlobalSkillsPath();
+    for (const skill of globalSkills) {
+      if (!skill.id.startsWith('global-')) continue;
+      const dir = skill.id.slice('global-'.length);
+      const p = path.join(globalRoot, dir);
+      if (fs.existsSync(path.join(p, 'SKILL.md'))) {
+        addCandidate(skill.name, 'global', p, skill.enabled);
+      }
+    }
+
+    return Array.from(byName.values())
+      .filter((candidate) => candidate.enabled)
+      .map((candidate) => candidate.path);
   }
 
   /**
@@ -747,6 +832,21 @@ export class SkillsManager {
       if (!enabled && skill.type === 'mcp') {
         this.stopMcpServer(skillId);
       }
+
+      // Persist toggle state so builtin/custom skills survive restarts.
+      const stmt = this.db.prepare(`
+        INSERT OR REPLACE INTO skills (id, name, description, type, enabled, config, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(
+        skill.id,
+        skill.name,
+        skill.description || null,
+        skill.type,
+        skill.enabled ? 1 : 0,
+        skill.config ? JSON.stringify(skill.config) : null,
+        skill.createdAt
+      );
     }
   }
 
@@ -897,6 +997,22 @@ export class SkillsManager {
     } catch (error) {
       logError(`Failed to parse SKILL.md from ${skillPath}:`, error);
       return null;
+    }
+  }
+
+  /**
+   * Read a skill's persisted enabled state from the DB.
+   * Returns the provided default when no row exists (first run).
+   */
+  private getPersistedEnabled(skillId: string, fallback: boolean): boolean {
+    try {
+      const row = this.db
+        .prepare('SELECT enabled FROM skills WHERE id = ?')
+        .get(skillId) as { enabled?: number } | undefined;
+      return row?.enabled !== undefined ? Boolean(row.enabled) : fallback;
+    } catch (error) {
+      logError(`Failed to read persisted enabled state for ${skillId}:`, error);
+      return fallback;
     }
   }
 

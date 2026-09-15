@@ -27,6 +27,8 @@ const FINAL_ARTIFACT_EXTENSIONS = new Set([
   'pdf',
   'html',
   'htm',
+  'srt',
+  'vtt',
   'png',
   'jpg',
   'jpeg',
@@ -126,7 +128,7 @@ export function getPrimaryArtifact(artifacts: ArtifactInfo[]): ArtifactInfo | nu
     return finalArtifacts.reduce((best, current) => {
       const bestExt = getArtifactExtension(best.path);
       const currentExt = getArtifactExtension(current.path);
-      const priorityOrder = ['docx', 'doc', 'pptx', 'ppt', 'xlsx', 'xls', 'csv', 'pdf', 'txt', 'html', 'htm'];
+      const priorityOrder = ['docx', 'doc', 'pptx', 'ppt', 'xlsx', 'xls', 'csv', 'pdf', 'txt', 'srt', 'vtt', 'html', 'htm'];
       const bestScore = priorityOrder.indexOf(bestExt) === -1 ? 999 : priorityOrder.indexOf(bestExt);
       const currentScore = priorityOrder.indexOf(currentExt) === -1 ? 999 : priorityOrder.indexOf(currentExt);
       return currentScore < bestScore ? current : best;

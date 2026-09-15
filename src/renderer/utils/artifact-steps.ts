@@ -145,6 +145,8 @@ const FINAL_DELIVERABLE_EXTENSIONS = new Set([
   'odt',
   'ods',
   'odp',
+  'srt',
+  'vtt',
   'png',
   'jpg',
   'jpeg',
@@ -212,7 +214,10 @@ function isLikelySidecarArtifact(pathValue: string): boolean {
 
 
 export function shouldDisplayArtifactPath(pathValue: string): boolean {
-  const ext = getFileExtension(pathValue);
+  // Candidates may arrive as file:// URLs or percent-encoded mojibake —
+  // normalize so the panel sees real filenames.
+  const normalizedValue = normalizeArtifactPathValue(pathValue).trim();
+  const ext = getFileExtension(normalizedValue);
   if (!ext) {
     return false;
   }
@@ -221,10 +226,10 @@ export function shouldDisplayArtifactPath(pathValue: string): boolean {
     return false;
   }
 
-  const trimmed = pathValue.trim();
+  const trimmed = normalizedValue;
   const normalized = trimmed.replace(/\\/g, '/');
 
-  // A URL is not a local deliverable (e.g. https://host/README.md).
+  // Remote URLs are not local deliverables (https://host/README.md).
   if (normalized.includes('://') || /^www\./i.test(normalized)) {
     return false;
   }
@@ -275,7 +280,9 @@ type ArtifactCandidate = {
 
 export function getArtifactLabel(pathValue: string, name?: string): string {
   const trimmedName = name?.trim();
-  const trimmedPath = pathValue.trim();
+  // file:// URLs and percent-encoded CJK leak into trace outputs —
+  // normalize so the label shows the decoded filename.
+  const trimmedPath = normalizeArtifactPathValue(pathValue).trim();
   if (trimmedPath) {
     const normalized = trimmedPath.replace(/\\/g, '/');
     const parts = normalized.split('/');

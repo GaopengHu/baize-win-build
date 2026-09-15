@@ -40,6 +40,30 @@ type AttachedFile = {
   inlineDataBase64?: string;
 };
 
+// Audio/video extensions the asr-transcribe skill accepts. Attaching any of
+// these signals a likely heavy local transcription; low-memory machines are
+// the most common trigger of the blank-window (renderer OOM) issue.
+const ASR_AUDIO_EXTENSIONS = new Set([
+  'm4a',
+  'mp3',
+  'wav',
+  'aac',
+  'flac',
+  'ogg',
+  'mp4',
+  'mov',
+  'wma',
+  'amr',
+]);
+
+function isAudioAttachment(file: { name: string; type?: string }): boolean {
+  const ext = file.name.toLowerCase().split('.').pop() || '';
+  if (ASR_AUDIO_EXTENSIONS.has(ext)) {
+    return true;
+  }
+  return /^audio\//i.test(file.type || '');
+}
+
 // Model quick-switch entries shown in the chat input dropdown.
 // Populated from the configured config sets (see useAppConfig configSets).
 type QuickSwitchModel = { id: string; label: string };
@@ -152,6 +176,8 @@ export function ChatView() {
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRequestRef = useRef<number | null>(null);
   const isScrollingRef = useRef(false);
+  /** Warn about low memory for ASR only once per mount to avoid nagging. */
+  const lowMemoryWarnedRef = useRef(false);
 
   const hasActiveTurn = Boolean(activeTurn);
   const pendingCount = pendingTurns.length;
@@ -748,6 +774,46 @@ export function ChatView() {
       isSubmitting
     )
       return;
+
+    // 低内存预警：附加了音视频且提交文案疑似要转写时，先给用户一次引导提示，
+    // 避免本地 FunASR 加载把内存耗尽导致渲染进程白屏/崩溃。
+    const hasAudioAttachments = attachedFiles.some(isAudioAttachment);
+    const soundsLikeTranscribe =
+      /转写|转文字|语音|录音|转录|字幕|听一下|把这段音频|识别成文字|asr/i.test(currentPrompt);
+    if (
+      hasAudioAttachments &&
+      soundsLikeTranscribe &&
+      !lowMemoryWarnedRef.current &&
+      isElectron &&
+      window.electronAPI
+    ) {
+      try {
+        const memInfo = await window.electronAPI.getMemoryInfo();
+        const LOW_TOTAL_GB = 8;
+        const LOW_FREE_GB = 1.5;
+        if (
+          (memInfo.totalGB > 0 && memInfo.totalGB <= LOW_TOTAL_GB) ||
+          (memInfo.freeGB > 0 && memInfo.freeGB < LOW_FREE_GB)
+        ) {
+          lowMemoryWarnedRef.current = true;
+          setGlobalNotice({
+            id: `low-memory-asr-${Date.now()}`,
+            type: 'warning',
+            message: t('chat.lowMemoryAsrWarning', {
+              totalGB: memInfo.totalGB.toFixed(1),
+              freeGB: memInfo.freeGB.toFixed(1),
+            }),
+            messageKey: 'chat.lowMemoryAsrWarning',
+            messageValues: {
+              totalGB: memInfo.totalGB.toFixed(1),
+              freeGB: memInfo.freeGB.toFixed(1),
+            },
+          });
+        }
+      } catch (err) {
+        console.warn('[ChatView] Failed to check memory info:', err);
+      }
+    }
 
     setIsSubmitting(true);
     try {

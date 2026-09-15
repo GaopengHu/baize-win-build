@@ -289,6 +289,33 @@ function resolveBundledToolsBinDir(): string | null {
 }
 
 /**
+ * Resolve bundled ffmpeg executable (used by the ASR skill for audio decode).
+ * Dev: <projectRoot>/resources/ffmpeg/<platform>/ffmpeg[.exe]
+ * Packaged: <process.resourcesPath>/ffmpeg/<platform>/ffmpeg[.exe]
+ */
+function resolveBundledFfmpegPath(): string | null {
+  const isWin = process.platform === 'win32';
+  const exeName = isWin ? 'ffmpeg.exe' : 'ffmpeg';
+
+  const candidates: string[] = [];
+  if (!app.isPackaged) {
+    const projectRoot = path.join(__dirname, '..', '..');
+    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'windows', 'ffmpeg.exe'));
+    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'macos', 'ffmpeg'));
+    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'linux', 'ffmpeg'));
+  } else {
+    const platformDir = process.platform === 'win32' ? 'windows' : process.platform;
+    candidates.push(path.join(process.resourcesPath, 'ffmpeg', platformDir, exeName));
+    candidates.push(path.join(process.resourcesPath, 'ffmpeg', 'windows', 'ffmpeg.exe'));
+  }
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
  * One-time enrichment of process.env.PATH for build (production) mode.
  *
  * In dev mode, Electron inherits the user's full shell PATH, so Skill commands
@@ -305,9 +332,40 @@ function resolveBundledToolsBinDir(): string | null {
  */
 let pathEnriched = false;
 
+/**
+ * Resolve the directory that holds bundled whisper models (read-only, shipped with the app).
+ * Dev: <projectRoot>/resources/whisper-models  Packaged: <process.resourcesPath>/whisper-models
+ */
+function resolveBundledWhisperModelsDir(): string | null {
+  const candidates: string[] = [];
+  if (!app.isPackaged) {
+    const projectRoot = path.join(__dirname, '..', '..');
+    candidates.push(path.join(projectRoot, 'resources', 'whisper-models'));
+  } else {
+    candidates.push(path.join(process.resourcesPath, 'whisper-models'));
+  }
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 async function enrichProcessPathForBuild(): Promise<void> {
   if (pathEnriched) return;
   pathEnriched = true;
+
+  // ASR model dir resolution order:
+  // 1. Bundled models shipped inside the app (resources/whisper-models) — read-only, no download needed.
+  // 2. Per-user writable cache in userData/models/whisper — used when the app ships no bundled model.
+  const bundledWhisperModels = resolveBundledWhisperModelsDir();
+  const asrModelDir = bundledWhisperModels ?? path.join(app.getPath('userData'), 'models', 'whisper');
+  if (!process.env.ASR_WHISPER_MODEL_DIR) {
+    process.env.ASR_WHISPER_MODEL_DIR = asrModelDir;
+    log(
+      `[ClaudeAgentRunner] ASR_WHISPER_MODEL_DIR=${asrModelDir}${bundledWhisperModels ? ' (bundled, read-only)' : ' (userData cache)'}`
+    );
+  }
 
   if (!app.isPackaged) {
     log('[ClaudeAgentRunner] Dev mode — skipping PATH enrichment');
@@ -377,6 +435,14 @@ async function enrichProcessPathForBuild(): Promise<void> {
   const toolsBinDir = resolveBundledToolsBinDir();
   if (toolsBinDir) {
     bundledDirs.push(toolsBinDir);
+  }
+
+  const ffmpegPath = resolveBundledFfmpegPath();
+  if (ffmpegPath) {
+    process.env.ASR_FFMPEG_PATH = ffmpegPath;
+    const ffmpegDir = path.dirname(ffmpegPath);
+    bundledDirs.push(ffmpegDir);
+    log(`[ClaudeAgentRunner] Using bundled ffmpeg: ${ffmpegPath}`);
   }
 
   // 3. Merge: bundled (highest) → shell → current process, deduplicate
@@ -675,7 +741,7 @@ ${hints.join('\n')}
 
   private async resolveSkillPaths(sessionId?: string): Promise<string[]> {
     const basePaths = this._skillsAdapter
-      ? this._skillsAdapter.getSkillPaths()
+      ? await this._skillsAdapter.getSkillPaths()
       : this.legacySkillPaths();
     const mergedPaths = new Set(
       basePaths.filter((item): item is string => Boolean(item && fs.existsSync(item)))

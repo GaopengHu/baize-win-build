@@ -1,5 +1,6 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
 import {
@@ -15,6 +16,8 @@ import {
   ListChecks,
   Check,
   Pencil,
+  MoreHorizontal,
+  CheckCircle2,
 } from 'lucide-react';
 import type { Session } from '../types';
 
@@ -32,6 +35,35 @@ type ContextMenuState = {
   y: number;
 } | null;
 
+/**
+ * 任务条目可视状态（唯一真相来源，侧边栏所有行都走这里）。
+ *
+ * 优先级是关键——运行中永远压过一切：
+ * 1. running：session.status === 'running'，或本地仍有未结束的回合
+ *    （activeTurn / pendingTurns / 执行时钟未结束 / 还有流式残留）。
+ *    运行中途会产生中间 assistant/tool 消息，绝不能因此判完成 → … + 整条标黄。
+ * 2. completed：上面都不命中，且本轮结局是 completed（正常跑完、有最终
+ *    回答）。lastTurnOutcome 只在新一轮 running 到达时清 null、在"缓冲已空"
+ *    的 idle 落定瞬间写入 completed/stopped——中间 assistant/tool 消息和
+ *    停止后抢救的半截回复都不会把它置绿 → √ + 整条标绿。
+ * 3. idle：新任务、停止/中止、无最终回答、重启后历史任务等，一律不打标记。
+ */
+type SessionVisualStatus = 'running' | 'completed' | 'idle';
+
+const sessionVisualCache = new Map<
+  string,
+  { localRunning: boolean; lastTurnOutcome: 'completed' | 'stopped' | null }
+>();
+
+function getSessionStatusVisual(
+  status: Session['status'],
+  opts: { localRunning: boolean; lastTurnOutcome: 'completed' | 'stopped' | null }
+): SessionVisualStatus {
+  if (status === 'running' || opts.localRunning) return 'running';
+  if (opts.lastTurnOutcome === 'completed') return 'completed';
+  return 'idle';
+}
+
 export function Sidebar() {
   const { t } = useTranslation();
   const sessions = useAppStore((s) => s.sessions);
@@ -46,6 +78,54 @@ export function Sidebar() {
   const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const setShowSettings = useAppStore((s) => s.setShowSettings);
+  // 侧边栏每一行都有的两个本地信号：
+  // - localRunning：activeTurn / pendingTurns / 执行时钟未结束 / 流式残留 /
+  //   user 追问还排着队。发消息瞬间 main 的 running 事件还没到，或
+  //   session.list 刷新用落库的 idle 覆盖了 running 时，这是"还在处理却差点
+  //   打勾"的唯一兜底，running 优先级最高。
+  // - lastTurnOutcome：本轮结局（completed=正常跑完有最终回答；stopped=停止/
+  //   中止/超时）。由 useIPC 在 session.status(idle) 落定或最终消息到达时写入，
+  //   新一轮 running 到达时清 null——详见 store 里的 lastTurnOutcome 注释。
+  const sessionVisuals = useAppStore(
+    useShallow((s) => {
+      const map: Record<string, { localRunning: boolean; lastTurnOutcome: 'completed' | 'stopped' | null }> = {};
+      for (const session of s.sessions) {
+        const ss = s.sessionStates[session.id];
+        const messages = ss?.messages ?? [];
+        const localRunning =
+          Boolean(ss?.activeTurn) ||
+          (ss?.pendingTurns?.length ?? 0) > 0 ||
+          (ss?.executionClock != null &&
+            ss.executionClock.startAt !== null &&
+            ss.executionClock.endAt === null) ||
+          Boolean(ss?.partialMessage || ss?.partialThinking) ||
+          // 排队中的追问（并发槽未释放、等待启动）同样算"还在处理"
+          messages.some((m) => m.localStatus === 'queued');
+        const lastTurnOutcome = ss?.lastTurnOutcome ?? null;
+        // 复用引用：值没变就沿用缓存对象，useShallow 才能判等、
+        // 流式 tick 时侧边栏才不会跟着每一帧重渲染。
+        const prev = sessionVisualCache.get(session.id);
+        if (
+          prev &&
+          prev.localRunning === localRunning &&
+          prev.lastTurnOutcome === lastTurnOutcome
+        ) {
+          map[session.id] = prev;
+        } else {
+          const next = { localRunning, lastTurnOutcome };
+          sessionVisualCache.set(session.id, next);
+          map[session.id] = next;
+        }
+      }
+      // 清理已删除会话的缓存，避免 Map 无限增长（每次都对账，
+      // 删除+新建等长替换的场景也能覆盖）
+      const alive = new Set(s.sessions.map((x) => x.id));
+      for (const key of Array.from(sessionVisualCache.keys())) {
+        if (!alive.has(key)) sessionVisualCache.delete(key);
+      }
+      return map;
+    })
+  );
   const {
     deleteSession,
     batchDeleteSessions,
@@ -448,6 +528,18 @@ export function Sidebar() {
                   {group.sessions.map((session) => {
                     const isActive = activeSessionId === session.id;
                     const isSelected = selectedIds.has(session.id);
+                    const visual =
+                      sessionVisuals[session.id] ?? { localRunning: false, lastTurnOutcome: null };
+                    const visualStatus = getSessionStatusVisual(session.status, visual);
+                    const isRunning = visualStatus === 'running';
+                    const isCompleted = visualStatus === 'completed';
+                    // 方案B：整行高亮 — 运行中淡黄、已完成淡绿；选中态优先
+                    const statusBgClass =
+                      !isSelectMode && isRunning
+                        ? 'bg-warning/12 border border-warning/30 !border-l-2 !border-l-warning/70'
+                        : !isSelectMode && isCompleted
+                          ? 'bg-success/10 border border-success/20 !border-l-2 !border-l-success/60'
+                          : 'border border-transparent';
                     return (
                       <div
                         key={session.id}
@@ -461,12 +553,25 @@ export function Sidebar() {
                         onContextMenu={(e) => handleContextMenu(e, session.id)}
                         onMouseEnter={() => setHoveredSession(session.id)}
                         onMouseLeave={() => setHoveredSession(null)}
-                        className={`group relative cursor-pointer rounded-lg px-2.5 py-1.5 transition-colors ${
+                        title={
+                          isRunning
+                            ? '任务运行中'
+                            : isCompleted
+                              ? '任务已完成'
+                              : undefined
+                        }
+                        className={`group relative cursor-pointer rounded-lg px-2.5 py-1.5 transition-colors ${statusBgClass} ${
                           isSelectMode && isSelected
-                            ? 'bg-accent-muted/20'
+                            ? '!bg-accent-muted/20 !border-accent/30'
                             : isActive && !isSelectMode
-                              ? 'bg-surface-hover/80'
-                              : 'hover:bg-surface-hover/60'
+                              ? isRunning
+                                ? 'bg-warning/20'
+                                : isCompleted
+                                  ? 'bg-success/15'
+                                  : 'bg-surface-hover/80'
+                              : !isRunning && !isCompleted
+                                ? 'hover:bg-surface-hover/60'
+                                : ''
                         }`}
                       >
                         <div className={`flex items-center gap-2 ${!isSelectMode ? 'pr-6' : ''}`}>
@@ -480,6 +585,23 @@ export function Sidebar() {
                             >
                               {isSelected && <Check className="w-2.5 h-2.5" />}
                             </div>
+                          )}
+                          {/* 方案A：状态图标 — 运行中 … / 已完成 √ ；跟随 visualStatus 自动切换 */}
+                          {!isSelectMode && isRunning && (
+                            <span
+                              className="w-5 h-5 rounded-full bg-warning/15 border border-warning/30 flex items-center justify-center flex-shrink-0"
+                              aria-label="任务运行中"
+                            >
+                              <MoreHorizontal className="w-3 h-3 text-warning animate-pulse" />
+                            </span>
+                          )}
+                          {!isSelectMode && isCompleted && (
+                            <span
+                              className="w-5 h-5 rounded-full bg-success/15 border border-success/25 flex items-center justify-center flex-shrink-0"
+                              aria-label="任务已完成"
+                            >
+                              <CheckCircle2 className="w-3 h-3 text-success" />
+                            </span>
                           )}
                           <div className="min-w-0 flex-1">
                             {renameSessionId === session.id ? (
