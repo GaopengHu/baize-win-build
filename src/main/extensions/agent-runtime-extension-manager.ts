@@ -36,6 +36,7 @@ export class AgentRuntimeExtensionManager {
   async beforeSessionRun(context: BeforeSessionRunContext): Promise<BeforeSessionRunResult> {
     const promptPrefixes: string[] = [];
     const customTools: AgentRuntimeCustomTool[] = [];
+    const deferredParts: Array<Promise<string>> = [];
 
     for (const extension of this.extensions) {
       if (!extension.beforeSessionRun) {
@@ -52,6 +53,9 @@ export class AgentRuntimeExtensionManager {
         if (result.customTools?.length) {
           customTools.push(...result.customTools);
         }
+        if (result.deferredExperience) {
+          deferredParts.push(result.deferredExperience);
+        }
       } catch (error) {
         logError(
           `[AgentRuntimeExtensionManager] beforeSessionRun failed for ${extension.name}:`,
@@ -63,6 +67,14 @@ export class AgentRuntimeExtensionManager {
     return {
       promptPrefix: promptPrefixes.join('\n\n').trim() || undefined,
       customTools: mergeCustomTools(customTools),
+      deferredExperience: deferredParts.length
+        ? Promise.all(deferredParts).then((parts) =>
+            parts
+              .map((part) => part.trim())
+              .filter(Boolean)
+              .join('\n\n')
+          )
+        : undefined,
     };
   }
 

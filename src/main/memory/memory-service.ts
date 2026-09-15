@@ -13,6 +13,7 @@ import { MemoryIngestionQueue } from './memory-ingestion-queue';
 import type { MemoryLLMClientLike } from './memory-llm-client';
 import { MemoryLLMClient } from './memory-llm-client';
 import { MemoryNavigator } from './memory-navigator';
+import { MemoryRetrievalCoordinator } from './memory-retrieval-coordinator';
 import { DEFAULT_MEMORY_PROMPTS, type MemoryPromptSet } from './memory-prompts';
 import { MemoryRetriever } from './memory-retriever';
 import { MemorySessionStateStore } from './memory-state-store';
@@ -152,6 +153,7 @@ export class MemoryService {
   private coreStore: CoreMemoryStore | null = null;
   private stateStore: MemorySessionStateStore | null = null;
   private experienceStore: ExperienceMemoryStore | null = null;
+  private retrievalCoordinator: MemoryRetrievalCoordinator | null = null;
 
   constructor(
     private readonly db: DatabaseInstance,
@@ -353,9 +355,9 @@ export class MemoryService {
     }
 
     const sections: string[] = [];
-    const corePromptBlock = this.getCoreStore().toPromptBlock();
-    if (corePromptBlock !== 'None') {
-      sections.push(`<core_memory>\n${escapeMemoryContextText(corePromptBlock)}\n</core_memory>`);
+    const coreSection = this.buildCoreSection();
+    if (coreSection) {
+      sections.push(coreSection);
     }
 
     const experienceContext = await this.buildExperienceContext(
@@ -368,10 +370,73 @@ export class MemoryService {
       );
     }
 
+    return this.wrapMemoryContext(sections);
+  }
+
+  /**
+   * Synchronous fast path: core memory (user profile/preferences) only.
+   * Safe to call on the first-token critical path (<10ms).
+   */
+  buildCorePromptPrefix(): string {
+    if (!this.isEnabled()) {
+      return '';
+    }
+    return this.wrapMemoryContext([this.buildCoreSection()].filter(Boolean) as string[]);
+  }
+
+  /**
+   * Asynchronous deep path: experience-memory retrieval (lexical + navigator
+   * LLM decisions). Must NOT be awaited on the first-token critical path;
+   * use prefetchExperience/acquireExperience for background injection.
+   */
+  async buildExperiencePromptBlock(session: { cwd?: string }, prompt: string): Promise<string> {
+    if (!this.isEnabled()) {
+      return '';
+    }
+    const experienceContext = await this.buildExperienceContext(
+      prompt,
+      normalizeWorkspaceKey(session.cwd)
+    );
+    if (!experienceContext.trim()) {
+      return '';
+    }
+    return this.wrapMemoryContext([
+      `<experience_memory>\n${escapeMemoryContextText(experienceContext)}\n</experience_memory>`,
+    ]);
+  }
+
+  /** Fire-and-forget warm-up (e.g. while the user is typing a draft). */
+  prefetchExperience(sessionId: string, prompt: string): void {
+    if (!this.isEnabled()) {
+      return;
+    }
+    this.getRetrievalCoordinator().prefetch(sessionId, prompt);
+  }
+
+  /** Returns cached/in-flight experience retrieval, or starts a new one. */
+  acquireExperience(sessionId: string, prompt: string): Promise<string> {
+    if (!this.isEnabled()) {
+      return Promise.resolve('');
+    }
+    return this.getRetrievalCoordinator().acquire(sessionId, prompt);
+  }
+
+  clearExperienceCache(sessionId: string): void {
+    this.retrievalCoordinator?.clearSession(sessionId);
+  }
+
+  private buildCoreSection(): string {
+    const corePromptBlock = this.getCoreStore().toPromptBlock();
+    if (corePromptBlock === 'None') {
+      return '';
+    }
+    return `<core_memory>\n${escapeMemoryContextText(corePromptBlock)}\n</core_memory>`;
+  }
+
+  private wrapMemoryContext(sections: string[]): string {
     if (!sections.length) {
       return '';
     }
-
     return [
       '<memory_context>',
       'Use the following saved memory when it is relevant to the current request.',
@@ -383,6 +448,18 @@ export class MemoryService {
       ...sections,
       '</memory_context>',
     ].join('\n');
+  }
+
+  private getRetrievalCoordinator(): MemoryRetrievalCoordinator {
+    if (!this.retrievalCoordinator) {
+      this.retrievalCoordinator = new MemoryRetrievalCoordinator({
+        retrieve: (sessionId, prompt) => {
+          const row = this.db.sessions.get(sessionId);
+          return this.buildExperiencePromptBlock({ cwd: row?.cwd ?? undefined }, prompt);
+        },
+      });
+    }
+    return this.retrievalCoordinator;
   }
 
   enqueueIngestion(input: MemoryIngestionInput): Promise<void> {

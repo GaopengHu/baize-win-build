@@ -10,13 +10,15 @@ import {
   usePendingTurns,
   useActiveExecutionClock,
   useAppConfig,
+  useActiveHasMoreMessages,
+  useLoadingSessionId,
 } from '../store/selectors';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
 import { ProcessPanel } from './message/ProcessPanel';
 import { ContentBlockView } from './message/ContentBlockView';
-import { normalizeAssistantBlocks } from '../utils/content-block-partition';
+import { buildRoundRenderPlans } from '../utils/round-render-plan';
 import type { Message, ContentBlock } from '../types';
 import {
   Send,
@@ -68,40 +70,6 @@ function isAudioAttachment(file: { name: string; type?: string }): boolean {
 // Populated from the configured config sets (see useAppConfig configSets).
 type QuickSwitchModel = { id: string; label: string };
 
-type Round = {
-  userMessage: Message | null;
-  assistantMessages: Message[];
-};
-
-function groupMessagesIntoRounds(messages: Message[]): Round[] {
-  const rounds: Round[] = [];
-  let currentRound: Round = { userMessage: null, assistantMessages: [] };
-
-  for (const message of messages) {
-    if (message.role === 'user') {
-      if (currentRound.userMessage || currentRound.assistantMessages.length > 0) {
-        rounds.push(currentRound);
-      }
-      currentRound = { userMessage: message, assistantMessages: [] };
-    } else {
-      currentRound.assistantMessages.push(message);
-    }
-  }
-
-  if (currentRound.userMessage || currentRound.assistantMessages.length > 0) {
-    rounds.push(currentRound);
-  }
-
-  return rounds;
-}
-
-function getMessageContentBlocks(message: Message): ContentBlock[] {
-  const rawContent = message.content as unknown;
-  return Array.isArray(rawContent)
-    ? (rawContent as ContentBlock[])
-    : [{ type: 'text', text: String(rawContent ?? '') } as ContentBlock];
-}
-
 export function ChatView() {
   const { t } = useTranslation();
   // Scoped selectors — each subscription only re-renders when its slice changes
@@ -109,12 +77,15 @@ export function ChatView() {
   const activeSession = useCurrentSession();
   const messages = useActiveSessionMessages();
   const { partialMessage, partialThinking } = useActivePartialContent();
+  const hasMoreMessages = useActiveHasMoreMessages();
   const activeTurn = useActiveTurn();
   const pendingTurns = usePendingTurns();
   const executionClock = useActiveExecutionClock();
   const appConfig = useAppConfig();
+  const loadingSessionId = useLoadingSessionId();
   const setGlobalNotice = useAppStore((s) => s.setGlobalNotice);
-  const { continueSession, stopSession, isElectron } = useIPC();
+  const { continueSession, stopSession, getSessionMessagesPaginated, isElectron } = useIPC();
+  const prependMessages = useAppStore((s) => s.prependMessages);
 
   // Model quick-switch entries populated from the configured config sets.
   // Each config set is a fully configured model profile (provider, key, url...).
@@ -156,7 +127,11 @@ export function ChatView() {
   const [isDragging, setIsDragging] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const inputBoxMaxWidth = 1320;
-  const { size: inputBoxSize, setSize: setInputBoxSize, startResize } = useResizablePanel({
+  const {
+    size: inputBoxSize,
+    setSize: setInputBoxSize,
+    startResize,
+  } = useResizablePanel({
     defaultWidth: 920,
     defaultHeight: 180,
     minWidth: 640,
@@ -178,11 +153,59 @@ export function ChatView() {
   const isScrollingRef = useRef(false);
   /** Warn about low memory for ASR only once per mount to avoid nagging. */
   const lowMemoryWarnedRef = useRef(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const loadingMoreRef = useRef(false);
+  const prevActiveSessionIdRef = useRef<string | null>(null);
+  // While a freshly opened session is being settled at the bottom, scroll
+  // events come from our own code — not the user — so they must not feed
+  // isUserAtBottomRef or trigger pagination.
+  const suppressScrollStateRef = useRef(false);
+  const suppressScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const hasActiveTurn = Boolean(activeTurn);
   const pendingCount = pendingTurns.length;
   const isSessionRunning = activeSession?.status === 'running';
   const canStop = isSessionRunning || hasActiveTurn || pendingCount > 0;
+
+  const loadMoreMessages = useCallback(async () => {
+    if (!activeSessionId || loadingMoreRef.current || !hasMoreMessages || !isElectron) return;
+    loadingMoreRef.current = true;
+    setIsLoadingMore(true);
+    try {
+      const result = await getSessionMessagesPaginated(activeSessionId, 50, messages.length);
+      if (result.messages.length > 0) {
+        const container = scrollContainerRef.current;
+        const prevHeight = container?.scrollHeight ?? 0;
+        prependMessages(activeSessionId, result.messages, result.hasMore);
+        // Restore scroll position so user doesn't jump to bottom after prepend
+        requestAnimationFrame(() => {
+          if (container) {
+            const newHeight = container.scrollHeight;
+            container.scrollTop += newHeight - prevHeight;
+          }
+        });
+      } else {
+        prependMessages(activeSessionId, [], false);
+      }
+    } catch (e) {
+      console.error('[ChatView] loadMoreMessages failed:', e);
+    } finally {
+      loadingMoreRef.current = false;
+      setIsLoadingMore(false);
+    }
+  }, [
+    activeSessionId,
+    hasMoreMessages,
+    isElectron,
+    messages.length,
+    getSessionMessagesPaginated,
+    prependMessages,
+  ]);
+
+  // Stable ref for loadMoreMessages so the scroll effect doesn't re-run every
+  // time messages.length changes (which recreates loadMoreMessages).
+  const loadMoreMessagesRef = useRef(loadMoreMessages);
+  loadMoreMessagesRef.current = loadMoreMessages;
 
   useEffect(() => {
     // When switching sessions, restore the input capsule to its widest
@@ -225,6 +248,11 @@ export function ChatView() {
 
     return [...messages.slice(0, insertIndex), streamingMessage, ...messages.slice(insertIndex)];
   }, [activeSessionId, activeTurn?.userMessageId, messages, partialMessage, partialThinking]);
+
+  // Memoized render plans: unchanged rounds keep identical plan/block array
+  // references across streaming frames, so memoized children (ProcessPanel,
+  // ContentBlockView, ...) skip re-rendering entirely. See round-render-plan.ts.
+  const roundPlans = useMemo(() => buildRoundRenderPlans(displayedMessages), [displayedMessages]);
 
   // Format execution time for display
   const formatExecutionTime = useCallback((ms: number): string => {
@@ -298,17 +326,47 @@ export function ChatView() {
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
+
+    // The listener MUST be attached on every run, including the run triggered
+    // by a session switch. An earlier fix returned early here to avoid a
+    // duplicate page-0 load; because the deps below only change when
+    // hasMoreMessages flips, a session whose hasMoreMessages stays at its
+    // default `true` (i.e. any history longer than one page) never re-ran this
+    // effect and therefore never got a scroll listener — scrolling to the top
+    // loaded nothing and long conversations stayed truncated.
+    const sessionJustChanged = prevActiveSessionIdRef.current !== activeSessionId;
+    prevActiveSessionIdRef.current = activeSessionId;
+
     const updateScrollState = () => {
+      // Ignore scroll events produced by our own programmatic scrolling: during
+      // the layout pass after a switch distanceToBottom is still huge, and
+      // recording that pinned isUserAtBottomRef=false, leaving the newly opened
+      // conversation stuck at the top.
+      if (suppressScrollStateRef.current || isScrollingRef.current) return;
       const distanceToBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight;
       isUserAtBottomRef.current = distanceToBottom <= 80;
+      // Load more messages when scrolling near the top (within 200px)
+      if (container.scrollTop <= 200 && hasMoreMessages) {
+        loadMoreMessagesRef.current();
+      }
     };
-    updateScrollState();
+
+    // Skip only the *initial* check right after a switch: the container sits at
+    // scrollTop 0 while hasMoreMessages still holds the previous session's
+    // value, which would fire a duplicate page-0 load on top of the one
+    // handleSessionClick already issued.
+    if (!sessionJustChanged) updateScrollState();
+
     // 用户阅读旧消息时，阻止新消息自动滚动打断视线
     const onScroll = () => updateScrollState();
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);
-  }, []);
+    // hasMoreMessages in deps so re-binding picks up when loadMore becomes a
+    // no-op. loadMoreMessages itself is accessed through the stable ref above
+    // so we don't need to re-bind the scroll listener when it's recreated.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, hasMoreMessages]);
 
   useEffect(() => {
     const messageCount = messages.length;
@@ -343,11 +401,46 @@ export function ChatView() {
     if (!activeSessionId) return;
     // Force scroll to bottom immediately (no animation)
     isUserAtBottomRef.current = true;
+    suppressScrollStateRef.current = true;
+    if (suppressScrollTimerRef.current) clearTimeout(suppressScrollTimerRef.current);
+    // Safety net: an empty session never delivers messages, so nothing would
+    // release the suppression below — always fall back to a timeout.
+    suppressScrollTimerRef.current = setTimeout(() => {
+      suppressScrollStateRef.current = false;
+      suppressScrollTimerRef.current = null;
+    }, 1500);
     const container = scrollContainerRef.current;
     if (container) {
       container.scrollTop = container.scrollHeight;
     }
   }, [activeSessionId]);
+
+  // The switch above runs while the list is still empty (the first page is in
+  // flight), so settle at the bottom once again after it has painted, then hand
+  // control back to the scroll listener.
+  useEffect(() => {
+    if (!activeSessionId || messages.length === 0) return;
+    if (!suppressScrollStateRef.current) return;
+    let innerRaf = 0;
+    const outerRaf = requestAnimationFrame(() => {
+      innerRaf = requestAnimationFrame(() => {
+        const container = scrollContainerRef.current;
+        if (container) {
+          isUserAtBottomRef.current = true;
+          container.scrollTop = container.scrollHeight;
+        }
+        suppressScrollStateRef.current = false;
+        if (suppressScrollTimerRef.current) {
+          clearTimeout(suppressScrollTimerRef.current);
+          suppressScrollTimerRef.current = null;
+        }
+      });
+    });
+    return () => {
+      cancelAnimationFrame(outerRaf);
+      if (innerRaf) cancelAnimationFrame(innerRaf);
+    };
+  }, [activeSessionId, messages.length]);
 
   // Additional scroll trigger for content height changes (e.g., TodoWrite expand/collapse)
   useEffect(() => {
@@ -378,6 +471,9 @@ export function ChatView() {
       }
       if (scrollRequestRef.current) {
         cancelAnimationFrame(scrollRequestRef.current);
+      }
+      if (suppressScrollTimerRef.current) {
+        clearTimeout(suppressScrollTimerRef.current);
       }
     };
   }, []);
@@ -411,6 +507,36 @@ export function ChatView() {
     el.style.height = `${nextHeight}px`;
     setInputHeight(nextHeight + 24);
   }, [prompt, activeSessionId]);
+
+  // Warm up experience-memory retrieval while the user types so the deferred
+  // mid-turn injection is usually a cache hit when the message is sent.
+  const memoryPrefetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastPrefetchedDraftRef = useRef('');
+
+  const handlePromptChange = useCallback(
+    (value: string) => {
+      setPrompt(value);
+      if (typeof window === 'undefined' || !window.electronAPI || !activeSessionId) return;
+      if (memoryPrefetchTimerRef.current) clearTimeout(memoryPrefetchTimerRef.current);
+      const draft = value.trim();
+      if (draft.length < 8 || draft === lastPrefetchedDraftRef.current) return;
+      memoryPrefetchTimerRef.current = setTimeout(() => {
+        memoryPrefetchTimerRef.current = null;
+        lastPrefetchedDraftRef.current = draft;
+        window.electronAPI?.send({
+          type: 'memory.prefetch',
+          payload: { sessionId: activeSessionId, draft },
+        });
+      }, 600);
+    },
+    [activeSessionId]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (memoryPrefetchTimerRef.current) clearTimeout(memoryPrefetchTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (inputHeight < 56) {
@@ -702,8 +828,7 @@ export function ChatView() {
           useAppStore.getState().setGlobalNotice({
             id: `notice-model-switch-${Date.now()}`,
             type: 'error',
-            message:
-              err instanceof Error ? err.message : '切换模型失败，请稍后重试',
+            message: err instanceof Error ? err.message : '切换模型失败，请稍后重试',
           });
         }
       }
@@ -722,14 +847,19 @@ export function ChatView() {
             (
               statuses as Array<{ id: string; name: string; connected: boolean; toolCount: number }>
             )?.filter((s) => s.connected && s.toolCount > 0) || [];
-          setActiveConnectors(active);
+          // Only touch state when the connector set actually changed — a new
+          // array every tick re-rendered the whole chat view for nothing.
+          setActiveConnectors((prev) =>
+            JSON.stringify(prev) === JSON.stringify(active) ? prev : active
+          );
         } catch (err) {
           console.error('Failed to load MCP connectors:', err);
         }
       };
       loadConnectors();
-      // Refresh every 5 seconds
-      const interval = setInterval(loadConnectors, 5000);
+      // Connector status changes rarely; 15s keeps the header fresh without
+      // a constant IPC + render heartbeat on the chat view.
+      const interval = setInterval(loadConnectors, 15000);
       return () => clearInterval(interval);
     }
   }, [isElectron]);
@@ -958,7 +1088,7 @@ export function ChatView() {
                   <textarea
                     ref={textareaRef}
                     value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
+                    onChange={(e) => handlePromptChange(e.target.value)}
                     style={{ minHeight: '24px', maxHeight: '180px' }}
                     onCompositionStart={() => {
                       isComposingRef.current = true;
@@ -1035,7 +1165,9 @@ export function ChatView() {
                       type="button"
                       onClick={handleSubmit}
                       disabled={
-                        (!prompt.trim() && pastedImages.length === 0 && attachedFiles.length === 0) ||
+                        (!prompt.trim() &&
+                          pastedImages.length === 0 &&
+                          attachedFiles.length === 0) ||
                         isSubmitting
                       }
                       className="inline-flex items-center gap-2 rounded-full bg-accent px-4 py-2.5 text-white shadow-sm hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
@@ -1156,65 +1288,64 @@ export function ChatView() {
           ref={messagesContainerRef}
           className="w-full max-w-[920px] mx-auto py-8 px-5 lg:px-8 space-y-5"
         >
-          {displayedMessages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">
-                今点通
-              </p>
-              <p className="text-base text-text-secondary">{t('chat.startConversation')}</p>
+          {isLoadingMore && messages.length > 0 && (
+            <div className="flex justify-center py-2">
+              <Loader2 className="w-4 h-4 animate-spin text-text-muted" />
             </div>
+          )}
+          {displayedMessages.length === 0 ? (
+            loadingSessionId === activeSessionId ? (
+              // Session data is being loaded — show a subtle loading indicator
+              <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
+                <Loader2 className="w-5 h-5 animate-spin text-accent" />
+                <p className="text-sm text-text-secondary">{t('chat.loadingConversation')}</p>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-28 text-text-muted space-y-3 text-center">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-text-muted/80">今点通</p>
+                <p className="text-base text-text-secondary">{t('chat.startConversation')}</p>
+              </div>
+            )
           ) : (
-            groupMessagesIntoRounds(displayedMessages).map((round, roundIndex) => {
-              const roundProcessBlocks = round.assistantMessages.flatMap((assistantMessage) => {
-                const blocks = getMessageContentBlocks(assistantMessage);
-                const normalized = normalizeAssistantBlocks(blocks);
-                return normalized.hasTools ? normalized.processBlocks : [];
-              });
+            roundPlans.map((round) => (
+              <div key={round.key} className="space-y-5">
+                {round.userMessage && (
+                  <div key={round.userMessage.id}>
+                    <MessageCard message={round.userMessage} />
+                  </div>
+                )}
+                {round.items.length > 0 && (
+                  <div className="space-y-1.5">
+                    <ProcessPanel
+                      blocks={round.processBlocks}
+                      message={round.lastAssistantMessage}
+                    />
+                    {round.items.map((item) => {
+                      if (item.visibleBlocks.length === 0) return null;
 
-              return (
-                <div key={roundIndex} className="space-y-5">
-                  {round.userMessage && (
-                    <div key={round.userMessage.id}>
-                      <MessageCard message={round.userMessage} />
-                    </div>
-                  )}
-                  {round.assistantMessages.length > 0 && (
-                    <div className="space-y-1.5">
-                      <ProcessPanel
-                        blocks={roundProcessBlocks}
-                        message={round.assistantMessages[round.assistantMessages.length - 1]}
-                      />
-                      {round.assistantMessages.map((message) => {
-                        const isStreaming =
-                          typeof message.id === 'string' && message.id.startsWith('partial-');
-                        const blocks = getMessageContentBlocks(message);
-                        const { mergedBlocks, visibleBlocks } = normalizeAssistantBlocks(blocks);
-                        if (visibleBlocks.length === 0) return null;
-
-                        return (
-                          <div key={message.id} className="space-y-1.5">
-                            {visibleBlocks.map((block, index) => (
-                              <ContentBlockView
-                                key={
-                                  'id' in block
-                                    ? (block as { id: string }).id
-                                    : `block-${block.type}-${index}`
-                                }
-                                block={block}
-                                isUser={false}
-                                isStreaming={isStreaming}
-                                allBlocks={mergedBlocks}
-                                message={message}
-                              />
-                            ))}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            })
+                      return (
+                        <div key={item.message.id} className="space-y-1.5">
+                          {item.visibleBlocks.map((block, index) => (
+                            <ContentBlockView
+                              key={
+                                'id' in block
+                                  ? (block as { id: string }).id
+                                  : `block-${block.type}-${index}`
+                              }
+                              block={block}
+                              isUser={false}
+                              isStreaming={item.isStreaming}
+                              allBlocks={item.mergedBlocks}
+                              message={item.message}
+                            />
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ))
           )}
 
           {/* Processing indicator - show when we have an active turn but no streaming content yet */}
@@ -1364,7 +1495,7 @@ export function ChatView() {
               <textarea
                 ref={textareaRef}
                 value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
+                onChange={(e) => handlePromptChange(e.target.value)}
                 style={{ minHeight: '24px', maxHeight: '180px' }}
                 onCompositionStart={() => {
                   isComposingRef.current = true;

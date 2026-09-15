@@ -17,7 +17,57 @@
 import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from './index';
 import type { Session, Message, TraceStep, Settings, AppConfig } from '../types';
-import type { GlobalNotice, SessionExecutionClock } from './index';
+import type { AppState, GlobalNotice, SessionExecutionClock } from './index';
+
+/** Minimal state shape the pure selectors below read from. */
+export type SelectorState = Pick<AppState, 'activeSessionId' | 'sessionStates'>;
+
+// ---------------------------------------------------------------------------
+// Stable empty values
+// ---------------------------------------------------------------------------
+//
+// zustand v5 subscribes through React's `useSyncExternalStore`, whose passive
+// effect re-reads the snapshot after EVERY commit and forces another render
+// when `Object.is(prev, next)` is false. A selector that returns a fresh `[]`
+// literal therefore never settles: render -> effect sees a new reference ->
+// re-render -> ... until React aborts with error #185 ("Maximum update depth
+// exceeded"), which the panel error boundary turns into a blank view.
+//
+// This surfaced as: clicking a not-yet-loaded session (sessionStates[id] is
+// undefined, so every selector below falls back to its empty value) blew up
+// ChatView, while re-clicking the same session — now cached, so the selector
+// returns the stable stored array — rendered fine.
+//
+// Every fallback below MUST be one of these shared constants. They are never
+// mutated — every store action replaces arrays instead of editing in place.
+const EMPTY_MESSAGES: Message[] = [];
+const EMPTY_TRACE_STEPS: TraceStep[] = [];
+const EMPTY_PENDING_TURNS: string[] = [];
+
+/**
+ * Pure (hook-free) selector bodies.
+ *
+ * Exported so tests can assert snapshot stability without mounting React:
+ * calling a selector twice on the same state MUST return the identical
+ * reference, otherwise `useSyncExternalStore` loops (see above).
+ */
+export const selectActiveMessages = (s: SelectorState): Message[] =>
+  s.activeSessionId
+    ? (s.sessionStates[s.activeSessionId]?.messages ?? EMPTY_MESSAGES)
+    : EMPTY_MESSAGES;
+
+export const selectSessionMessages = (s: SelectorState, sessionId: string): Message[] =>
+  s.sessionStates[sessionId]?.messages ?? EMPTY_MESSAGES;
+
+export const selectActivePendingTurns = (s: SelectorState): string[] =>
+  s.activeSessionId
+    ? (s.sessionStates[s.activeSessionId]?.pendingTurns ?? EMPTY_PENDING_TURNS)
+    : EMPTY_PENDING_TURNS;
+
+export const selectActiveTraceSteps = (s: SelectorState): TraceStep[] =>
+  s.activeSessionId
+    ? (s.sessionStates[s.activeSessionId]?.traceSteps ?? EMPTY_TRACE_STEPS)
+    : EMPTY_TRACE_STEPS;
 
 // ---------------------------------------------------------------------------
 // Session domain
@@ -31,6 +81,11 @@ export function useSessions(): Session[] {
 /** Returns the ID of the currently active session (may be null). */
 export function useActiveSessionId(): string | null {
   return useAppStore((s) => s.activeSessionId);
+}
+
+/** Returns the ID of the session currently being loaded (may be null). */
+export function useLoadingSessionId(): string | null {
+  return useAppStore((s) => s.loadingSessionId);
 }
 
 /**
@@ -60,9 +115,7 @@ export function useIsSessionRunning(): boolean {
 
 /** Returns the committed messages for the active session. */
 export function useActiveSessionMessages(): Message[] {
-  return useAppStore((s) =>
-    s.activeSessionId ? (s.sessionStates[s.activeSessionId]?.messages ?? []) : []
-  );
+  return useAppStore(selectActiveMessages);
 }
 
 /**
@@ -70,7 +123,7 @@ export function useActiveSessionMessages(): Message[] {
  * Useful in list components that render session previews.
  */
 export function useSessionMessages(sessionId: string): Message[] {
-  return useAppStore((s) => s.sessionStates[sessionId]?.messages ?? []);
+  return useAppStore((s) => selectSessionMessages(s, sessionId));
 }
 
 /** Returns the in-progress (streaming) text of the active session's response. */
@@ -117,9 +170,7 @@ export function useActiveTurn(): { stepId: string; userMessageId: string } | nul
 
 /** Returns the list of pending turn message IDs for the active session. */
 export function usePendingTurns(): string[] {
-  return useAppStore((s) =>
-    s.activeSessionId ? (s.sessionStates[s.activeSessionId]?.pendingTurns ?? []) : []
-  );
+  return useAppStore(selectActivePendingTurns);
 }
 
 /**
@@ -163,15 +214,20 @@ export function useActiveExecutionClock(): SessionExecutionClock | undefined {
 
 /** Returns the trace steps for the active session. */
 export function useActiveTraceSteps(): TraceStep[] {
-  return useAppStore((s) =>
-    s.activeSessionId ? (s.sessionStates[s.activeSessionId]?.traceSteps ?? []) : []
-  );
+  return useAppStore(selectActiveTraceSteps);
 }
 
 /** Returns the context window size (token count) for the active session. */
 export function useActiveContextWindow(): number | undefined {
   return useAppStore((s) =>
     s.activeSessionId ? s.sessionStates[s.activeSessionId]?.contextWindow : undefined
+  );
+}
+
+/** Returns whether there are more (older) messages to load for the active session. */
+export function useActiveHasMoreMessages(): boolean {
+  return useAppStore((s) =>
+    s.activeSessionId ? (s.sessionStates[s.activeSessionId]?.hasMoreMessages ?? true) : true
   );
 }
 

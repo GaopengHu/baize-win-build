@@ -128,6 +128,8 @@ async function main() {
   // 3. Build the application (TypeScript + Vite)
   log('Building TypeScript + Vite...');
   run('npx tsc', { timeout: 120000 });
+  // Remove stale main-process chunks so old bundles never leak into the asar
+  run('npx rimraf dist-electron', { timeout: 60000 });
   run('npx vite build', { timeout: 300000 });
 
   // 4. Pre-build check

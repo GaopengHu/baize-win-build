@@ -122,7 +122,11 @@
     "clearCoreConfirm": "Clear all global core memory? This cannot be undone.",
     "rebuildSuccess": "Workspace memory rebuilt",
     "clearWorkspaceSuccess": "Workspace memory cleared",
-    "clearCoreSuccess": "Core memory cleared"
+    "clearCoreSuccess": "Core memory cleared",
+    "retrievalMode": "Memory retrieval mode",
+    "retrievalModeBackground": "Fast (background retrieval, never blocks replies)",
+    "retrievalModeBlocking": "Deep (wait for retrieval before replying)",
+    "retrievalTimeoutMs": "Background retrieval injection budget (ms)"
   },
   "language": {
     "english": "English",

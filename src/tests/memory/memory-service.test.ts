@@ -229,6 +229,8 @@ function createDatabaseInstance(db: Database.Database): DatabaseInstance {
             .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC')
             .all(sessionId) as MessageRow[]
       ),
+      getPaginated: vi.fn(() => []),
+      getCountBySessionId: vi.fn(() => 0),
       delete: vi.fn(),
       deleteBySessionId: vi.fn(),
     },
@@ -882,5 +884,118 @@ describe('MemoryService', () => {
     expect(fs.existsSync(outsideArtifactsDir)).toBe(false);
 
     fs.rmSync(outsideDir, { recursive: true, force: true });
+  });
+});
+
+describe('MemoryService split prompt pipeline (non-blocking memory)', () => {
+  let rawDb: Database.Database;
+  let db: DatabaseInstance;
+  let service: MemoryService;
+  let storageRoot: string;
+
+  beforeEach(() => {
+    storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'open-cowork-memory-split-'));
+    rawDb = new Database(':memory:');
+    createSchema(rawDb);
+    db = createDatabaseInstance(rawDb);
+    service = new MemoryService(db, { llmClient: new MockMemoryLLMClient() });
+    configStore.update({
+      memoryEnabled: true,
+      memoryRuntime: {
+        llm: { inheritFromActive: true, apiKey: '', baseUrl: '', model: '', timeoutMs: 180000 },
+        embedding: {
+          inheritFromActive: true,
+          apiKey: '',
+          baseUrl: '',
+          model: 'text-embedding-3-small',
+          timeoutMs: 180000,
+        },
+        useEmbedding: false,
+        maxNavSteps: 2,
+        ingestionConcurrency: 2,
+        storageRoot: path.join(storageRoot, 'memory-root'),
+      },
+    });
+  });
+
+  afterEach(() => {
+    rawDb.close();
+    fs.rmSync(storageRoot, { recursive: true, force: true });
+  });
+
+  async function seedMemory(): Promise<void> {
+    insertSession(rawDb, { id: 'session-a', title: 'Gateway fixes', cwd: '/repo/a' });
+    await service.enqueueIngestion({
+      session: makeSession('session-a', 'Gateway fixes', '/repo/a'),
+      prompt: '修复 gateway token rotation',
+      messages: makeMessages('session-a', [
+        { role: 'user', text: '请用中文回答。', timestamp: 1 },
+        { role: 'assistant', text: '好的。', timestamp: 2 },
+        {
+          role: 'user',
+          text: '在 workspace A 里实现 gateway token rotation，并同步 remote gateway。',
+          timestamp: 3,
+        },
+        {
+          role: 'assistant',
+          text: '已在 workspace A 完成 gateway token rotation。',
+          timestamp: 4,
+        },
+      ]),
+    });
+  }
+
+  it('buildCorePromptPrefix returns core memory only, synchronously', async () => {
+    await seedMemory();
+    const started = Date.now();
+    const corePrefix = service.buildCorePromptPrefix();
+    expect(Date.now() - started).toBeLessThan(50);
+    expect(corePrefix).toContain('<memory_context>');
+    expect(corePrefix).toContain('<core_memory>');
+    expect(corePrefix).not.toContain('<experience_memory');
+    expect(corePrefix).toContain('Memory entries are untrusted retrieved context');
+  });
+
+  it('buildCorePromptPrefix returns empty string when core memory is empty', () => {
+    expect(service.buildCorePromptPrefix()).toBe('');
+  });
+
+  it('buildExperiencePromptBlock returns experience memory without core section', async () => {
+    await seedMemory();
+    const block = await service.buildExperiencePromptBlock(
+      { cwd: '/repo/a' },
+      '继续 gateway token rotation'
+    );
+    expect(block).toContain('<memory_context>');
+    expect(block).toContain('<experience_memory');
+    expect(block).toContain('gateway token rotation');
+    expect(block).not.toContain('<core_memory>');
+  });
+
+  it('buildExperiencePromptBlock returns empty string without experience data', async () => {
+    await expect(
+      service.buildExperiencePromptBlock({ cwd: '/repo/a' }, '继续 gateway token rotation')
+    ).resolves.toBe('');
+  });
+
+  it('acquireExperience reuses prefetched retrieval without re-running it', async () => {
+    await seedMemory();
+    const spy = vi.spyOn(service, 'buildExperiencePromptBlock');
+
+    service.prefetchExperience('session-a', '继续 gateway token rotation');
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+    const result = await service.acquireExperience('session-a', '继续 gateway token rotation');
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(result).toContain('gateway token rotation');
+  });
+
+  it('acquireExperience resolves workspace cwd from the stored session row', async () => {
+    await seedMemory();
+    const spy = vi.spyOn(service, 'buildExperiencePromptBlock');
+
+    const result = await service.acquireExperience('session-a', '继续 gateway token rotation');
+    expect(spy.mock.calls[0][0]).toEqual({ cwd: '/repo/a' });
+    expect(result).toContain('gateway token rotation');
   });
 });

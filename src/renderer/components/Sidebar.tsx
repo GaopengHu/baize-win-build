@@ -71,6 +71,7 @@ export function Sidebar() {
   const settings = useAppStore((s) => s.settings);
   const setActiveSession = useAppStore((s) => s.setActiveSession);
   const setMessages = useAppStore((s) => s.setMessages);
+  const setHasMoreMessages = useAppStore((s) => s.setHasMoreMessages);
   const setTraceSteps = useAppStore((s) => s.setTraceSteps);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const updateSession = useAppStore((s) => s.updateSession);
@@ -129,7 +130,7 @@ export function Sidebar() {
   const {
     deleteSession,
     batchDeleteSessions,
-    getSessionMessages,
+    getSessionMessagesPaginated,
     getSessionTraceSteps,
     isElectron,
   } = useIPC();
@@ -258,10 +259,11 @@ export function Sidebar() {
       const existingMessages = currentSessionStates[sessionId]?.messages;
       if ((!existingMessages || existingMessages.length === 0) && isElectron) {
         try {
-          const messages = await getSessionMessages(sessionId);
-          if (messages && messages.length > 0) {
-            setMessages(sessionId, messages);
+          const result = await getSessionMessagesPaginated(sessionId, 50, 0);
+          if (result.messages && result.messages.length > 0) {
+            setMessages(sessionId, result.messages);
           }
+          setHasMoreMessages(sessionId, result.hasMore);
         } catch (error) {
           console.error('[Sidebar] Failed to load messages:', error);
         }
@@ -279,11 +281,12 @@ export function Sidebar() {
     },
     [
       activeSessionId,
-      getSessionMessages,
+      getSessionMessagesPaginated,
       getSessionTraceSteps,
       isElectron,
       setActiveSession,
       setMessages,
+      setHasMoreMessages,
       setShowSettings,
       setTraceSteps,
     ]
@@ -447,69 +450,69 @@ export function Sidebar() {
   return (
     <>
       <aside className="w-[17.5rem] bg-surface/96 border-r border-border-muted flex flex-col overflow-hidden">
-      <div className="px-4 pt-5 pb-4 border-b border-border-muted">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0 flex items-center gap-3">
-            <img
-              src={sidebarLogoSrc}
-              alt={t('common.appLogoAlt')}
-              className="w-10 h-10 rounded-2xl object-cover border border-border-subtle bg-background/60 flex-shrink-0"
-            />
-            <div className="min-w-0">
-              <h1 className="text-[1.34rem] leading-none font-semibold tracking-[-0.035em] text-text-primary">
-                今点通
-              </h1>
-            </div>
-          </div>
-          <button
-            onClick={toggleSidebar}
-            className="w-8 h-8 rounded-xl flex items-center justify-center hover:bg-surface-hover transition-colors text-text-secondary flex-shrink-0"
-            title={t('context.collapsePanel')}
-          >
-            <ChevronLeft className="w-4 h-4" />
-          </button>
-        </div>
-
-        <button
-          onClick={handleNewSession}
-          className="mt-3 w-full flex items-center gap-2 rounded-xl bg-background/60 px-3 py-2 text-left text-text-primary hover:bg-surface-hover transition-colors"
-        >
-          <Plus className="w-4 h-4 text-text-secondary flex-shrink-0" />
-          <span className="text-[13px] font-medium">{t('sidebar.newTask')}</span>
-        </button>
-
-        {sessions.length > 0 && (
-          <div className="mt-2 flex items-center gap-2">
-            <div className="relative flex-1 min-w-0">
-              <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-muted" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder={t('sidebar.search')}
-                className="w-full rounded-xl border border-transparent bg-background/50 pl-9 pr-3 py-2 text-[13px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-border focus:bg-background transition-colors"
+        <div className="px-4 pt-5 pb-4 border-b border-border-muted">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 flex items-center gap-3">
+              <img
+                src={sidebarLogoSrc}
+                alt={t('common.appLogoAlt')}
+                className="w-10 h-10 rounded-2xl object-cover border border-border-subtle bg-background/60 flex-shrink-0"
               />
+              <div className="min-w-0">
+                <h1 className="text-[1.34rem] leading-none font-semibold tracking-[-0.035em] text-text-primary">
+                  今点通
+                </h1>
+              </div>
             </div>
             <button
-              onClick={() => {
-                if (isSelectMode) {
-                  exitSelectMode();
-                } else {
-                  setIsSelectMode(true);
-                }
-              }}
-              className={`w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors ${
-                isSelectMode
-                  ? 'bg-accent text-white'
-                  : 'text-text-secondary hover:text-text-primary hover:bg-surface-hover'
-              }`}
-              title={t('sidebar.manage')}
+              onClick={toggleSidebar}
+              className="w-8 h-8 rounded-xl flex items-center justify-center hover:bg-surface-hover transition-colors text-text-secondary flex-shrink-0"
+              title={t('context.collapsePanel')}
             >
-              <ListChecks className="w-3.5 h-3.5" />
+              <ChevronLeft className="w-4 h-4" />
             </button>
           </div>
-        )}
-      </div>
+
+          <button
+            onClick={handleNewSession}
+            className="mt-3 w-full flex items-center gap-2 rounded-xl bg-background/60 px-3 py-2 text-left text-text-primary hover:bg-surface-hover transition-colors"
+          >
+            <Plus className="w-4 h-4 text-text-secondary flex-shrink-0" />
+            <span className="text-[13px] font-medium">{t('sidebar.newTask')}</span>
+          </button>
+
+          {sessions.length > 0 && (
+            <div className="mt-2 flex items-center gap-2">
+              <div className="relative flex-1 min-w-0">
+                <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-muted" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder={t('sidebar.search')}
+                  className="w-full rounded-xl border border-transparent bg-background/50 pl-9 pr-3 py-2 text-[13px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-border focus:bg-background transition-colors"
+                />
+              </div>
+              <button
+                onClick={() => {
+                  if (isSelectMode) {
+                    exitSelectMode();
+                  } else {
+                    setIsSelectMode(true);
+                  }
+                }}
+                className={`w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors ${
+                  isSelectMode
+                    ? 'bg-accent text-white'
+                    : 'text-text-secondary hover:text-text-primary hover:bg-surface-hover'
+                }`}
+                title={t('sidebar.manage')}
+              >
+                <ListChecks className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-4">
         {groupedSessions.length === 0 ? (
@@ -575,18 +578,6 @@ export function Sidebar() {
                         }`}
                       >
                         <div className={`flex items-center gap-2 ${!isSelectMode ? 'pr-6' : ''}`}>
-                          {isSelectMode && (
-                            <div
-                              className={`w-4 h-4 rounded flex items-center justify-center flex-shrink-0 transition-colors ${
-                                isSelected
-                                  ? 'bg-accent text-white'
-                                  : 'border border-border-muted bg-background'
-                              }`}
-                            >
-                              {isSelected && <Check className="w-2.5 h-2.5" />}
-                            </div>
-                          )}
-                          {/* 方案A：状态图标 — 运行中 … / 已完成 √ ；跟随 visualStatus 自动切换 */}
                           {!isSelectMode && isRunning && (
                             <span
                               className="w-5 h-5 rounded-full bg-warning/15 border border-warning/30 flex items-center justify-center flex-shrink-0"
@@ -602,6 +593,17 @@ export function Sidebar() {
                             >
                               <CheckCircle2 className="w-3 h-3 text-success" />
                             </span>
+                          )}
+                          {isSelectMode && (
+                            <div
+                              className={`w-4 h-4 rounded flex items-center justify-center flex-shrink-0 transition-colors ${
+                                isSelected
+                                  ? 'bg-accent text-white'
+                                  : 'border border-border-muted bg-background'
+                              }`}
+                            >
+                              {isSelected && <Check className="w-2.5 h-2.5" />}
+                            </div>
                           )}
                           <div className="min-w-0 flex-1">
                             {renameSessionId === session.id ? (
@@ -646,117 +648,117 @@ export function Sidebar() {
         )}
       </div>
 
-      {isSelectMode ? (
-        <div className="px-3 py-3 border-t border-border-muted">
-          {showDeleteConfirm ? (
-            <div className="border border-error/30 bg-error/10 rounded-lg px-3 py-3">
-              <p className="text-[13px] text-text-primary mb-3">
-                {t('sidebar.batchDeleteConfirm', { count: selectedIds.size })}
-              </p>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setShowDeleteConfirm(false)}
-                  className="flex-1 px-3 py-1.5 rounded-lg text-[13px] font-medium text-text-secondary hover:bg-surface-hover transition-colors"
-                >
-                  {t('sidebar.cancel')}
-                </button>
-                <button
-                  onClick={handleBatchDelete}
-                  className="flex-1 px-3 py-1.5 rounded-lg text-[13px] font-medium bg-error text-white hover:bg-error/90 transition-colors"
-                >
-                  {t('sidebar.confirmDelete')}
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between px-1">
-                <button
-                  onClick={toggleSelectAll}
-                  className="text-[12px] font-medium text-accent hover:text-accent/80 transition-colors"
-                >
-                  {allVisibleSelected ? t('sidebar.deselectAll') : t('sidebar.selectAll')}
-                </button>
-                <span className="text-[12px] text-text-muted">
-                  {t('sidebar.nSelected', { count: selectedIds.size })}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={exitSelectMode}
-                  className="flex-1 px-3 py-2 rounded-xl text-[13px] font-medium text-text-secondary hover:bg-surface-hover transition-colors"
-                >
-                  {t('sidebar.cancel')}
-                </button>
-                <button
-                  onClick={() => setShowDeleteConfirm(true)}
-                  disabled={selectedIds.size === 0}
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-[13px] font-medium bg-error text-white hover:bg-error/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  {t('common.delete')}
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      ) : (
-        <div className="px-3 py-3 border-t border-border-muted">
-          <div className="flex items-center gap-2 rounded-2xl bg-background/50 px-3 py-2.5">
-            <button
-              onClick={() => setShowSettings(true)}
-              className="flex-1 min-w-0 flex items-center gap-2 text-left text-text-secondary hover:text-text-primary transition-colors"
-            >
-              <Settings className="w-4 h-4 flex-shrink-0" />
-              <div className="min-w-0">
-                <div className="text-[13px] font-medium text-text-primary">
-                  {t('sidebar.settings')}
-                </div>
-                <div className="text-[11px] text-text-muted truncate">
-                  {isConfigured ? t('sidebar.apiConfigured') : t('sidebar.apiNotConfigured')}
+        {isSelectMode ? (
+          <div className="px-3 py-3 border-t border-border-muted">
+            {showDeleteConfirm ? (
+              <div className="border border-error/30 bg-error/10 rounded-lg px-3 py-3">
+                <p className="text-[13px] text-text-primary mb-3">
+                  {t('sidebar.batchDeleteConfirm', { count: selectedIds.size })}
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setShowDeleteConfirm(false)}
+                    className="flex-1 px-3 py-1.5 rounded-lg text-[13px] font-medium text-text-secondary hover:bg-surface-hover transition-colors"
+                  >
+                    {t('sidebar.cancel')}
+                  </button>
+                  <button
+                    onClick={handleBatchDelete}
+                    className="flex-1 px-3 py-1.5 rounded-lg text-[13px] font-medium bg-error text-white hover:bg-error/90 transition-colors"
+                  >
+                    {t('sidebar.confirmDelete')}
+                  </button>
                 </div>
               </div>
-            </button>
-
-            <button
-              onClick={toggleTheme}
-              className="w-8 h-8 rounded-xl flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors flex-shrink-0"
-              title={t('sidebar.themeToggle')}
-            >
-              {themeIcon}
-            </button>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between px-1">
+                  <button
+                    onClick={toggleSelectAll}
+                    className="text-[12px] font-medium text-accent hover:text-accent/80 transition-colors"
+                  >
+                    {allVisibleSelected ? t('sidebar.deselectAll') : t('sidebar.selectAll')}
+                  </button>
+                  <span className="text-[12px] text-text-muted">
+                    {t('sidebar.nSelected', { count: selectedIds.size })}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={exitSelectMode}
+                    className="flex-1 px-3 py-2 rounded-xl text-[13px] font-medium text-text-secondary hover:bg-surface-hover transition-colors"
+                  >
+                    {t('sidebar.cancel')}
+                  </button>
+                  <button
+                    onClick={() => setShowDeleteConfirm(true)}
+                    disabled={selectedIds.size === 0}
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-[13px] font-medium bg-error text-white hover:bg-error/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    {t('common.delete')}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
+        ) : (
+          <div className="px-3 py-3 border-t border-border-muted">
+            <div className="flex items-center gap-2 rounded-2xl bg-background/50 px-3 py-2.5">
+              <button
+                onClick={() => setShowSettings(true)}
+                className="flex-1 min-w-0 flex items-center gap-2 text-left text-text-secondary hover:text-text-primary transition-colors"
+              >
+                <Settings className="w-4 h-4 flex-shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-[13px] font-medium text-text-primary">
+                    {t('sidebar.settings')}
+                  </div>
+                  <div className="text-[11px] text-text-muted truncate">
+                    {isConfigured ? t('sidebar.apiConfigured') : t('sidebar.apiNotConfigured')}
+                  </div>
+                </div>
+              </button>
+
+              <button
+                onClick={toggleTheme}
+                className="w-8 h-8 rounded-xl flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors flex-shrink-0"
+                title={t('sidebar.themeToggle')}
+              >
+                {themeIcon}
+              </button>
+            </div>
+          </div>
+        )}
+      </aside>
+
+      {/* Context Menu */}
+      {contextMenu && (
+        <div
+          ref={contextMenuRef}
+          className="fixed z-50 min-w-[120px] bg-surface border border-border rounded-lg shadow-lg py-1"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button
+            onClick={handleRenameClick}
+            className="w-full px-3 py-1.5 text-[13px] text-text-primary hover:bg-surface-hover flex items-center gap-2"
+          >
+            <Pencil className="w-3.5 h-3.5" />
+            {t('sidebar.rename')}
+          </button>
+          <button
+            onClick={() => {
+              deleteSession(contextMenu.sessionId);
+              setContextMenu(null);
+            }}
+            className="w-full px-3 py-1.5 text-[13px] text-error hover:bg-surface-hover flex items-center gap-2"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            {t('common.delete')}
+          </button>
         </div>
       )}
-    </aside>
-
-    {/* Context Menu */}
-    {contextMenu && (
-      <div
-        ref={contextMenuRef}
-        className="fixed z-50 min-w-[120px] bg-surface border border-border rounded-lg shadow-lg py-1"
-        style={{ left: contextMenu.x, top: contextMenu.y }}
-      >
-        <button
-          onClick={handleRenameClick}
-          className="w-full px-3 py-1.5 text-[13px] text-text-primary hover:bg-surface-hover flex items-center gap-2"
-        >
-          <Pencil className="w-3.5 h-3.5" />
-          {t('sidebar.rename')}
-        </button>
-        <button
-          onClick={() => {
-            deleteSession(contextMenu.sessionId);
-            setContextMenu(null);
-          }}
-          className="w-full px-3 py-1.5 text-[13px] text-error hover:bg-surface-hover flex items-center gap-2"
-        >
-          <Trash2 className="w-3.5 h-3.5" />
-          {t('common.delete')}
-        </button>
-      </div>
-    )}
-  </>
+    </>
   );
 }
 

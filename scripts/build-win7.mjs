@@ -145,6 +145,8 @@ async function main() {
   // Vite builds both the renderer and Electron main/preload bundles. On
   // Docker Desktop with a bind-mounted workspace, the main bundle can take
   // longer than five minutes while transforming dependencies.
+  // Remove stale main-process chunks so old bundles never leak into the asar
+  run('npx rimraf dist-electron', { timeout: 60000 });
   run('npx vite build', { timeout: 900000 });
 
   // 4. Pre-build check

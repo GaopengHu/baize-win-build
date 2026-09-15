@@ -144,6 +144,14 @@ export interface MemoryRuntimeConfig {
   useEmbedding: boolean;
   maxNavSteps: number;
   ingestionConcurrency: number;
+  /**
+   * 'background' (default): experience retrieval runs in parallel with the
+   * first LLM request and is injected mid-turn via steering.
+   * 'blocking': await full retrieval before sending the prompt (legacy).
+   */
+  retrievalMode?: 'background' | 'blocking';
+  /** Budget for background retrieval before giving up mid-turn injection. */
+  retrievalTimeoutMs?: number;
   storageRoot?: string;
   evalEnabled?: boolean;
   evalWorkspaces?: string[];
@@ -267,6 +275,8 @@ const defaultConfig: AppConfig = {
     useEmbedding: false,
     maxNavSteps: 2,
     ingestionConcurrency: 4,
+    retrievalMode: 'background',
+    retrievalTimeoutMs: 8000,
     storageRoot: '',
     evalEnabled: false,
     evalWorkspaces: [],
@@ -408,6 +418,14 @@ function normalizeMemoryRuntimeConfig(raw: unknown): MemoryRuntimeConfig {
       typeof value.ingestionConcurrency === 'number' && Number.isFinite(value.ingestionConcurrency)
         ? Math.max(1, Math.min(16, Math.round(value.ingestionConcurrency)))
         : defaultConfig.memoryRuntime.ingestionConcurrency,
+    retrievalMode:
+      value.retrievalMode === 'blocking' || value.retrievalMode === 'background'
+        ? value.retrievalMode
+        : defaultConfig.memoryRuntime.retrievalMode,
+    retrievalTimeoutMs:
+      typeof value.retrievalTimeoutMs === 'number' && Number.isFinite(value.retrievalTimeoutMs)
+        ? Math.max(1000, Math.min(60000, Math.round(value.retrievalTimeoutMs)))
+        : defaultConfig.memoryRuntime.retrievalTimeoutMs,
     storageRoot:
       typeof value.storageRoot === 'string'
         ? value.storageRoot

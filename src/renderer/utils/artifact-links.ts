@@ -127,13 +127,20 @@ export function appendFolderOpenLinks(text: string, workingDir?: string | null):
 
       // Plain string containment checks — avoid building any RegExp from the
       // generated filename. That prevents malformed patterns when filenames
-      // contain CJK characters, hyphens, or other punctuation.
+      // contain CJK characters, hyphens, or other punctuation (upstream used
+      // un-escaped template-literal RegExps and blanked the conversation on
+      // "Range out of order in character class").
       const lowerLine = line.toLowerCase();
       const lowerName = displayName.toLowerCase();
       const lowerResolved = resolvedPath.toLowerCase();
-      const hasFilename = lowerLine.includes(lowerName);
+      // 整行就是文件名 / 行内含完整路径 / 行内是 markdown 文件链接，三种都算命中。
+      // includes() 只用于判定，不用来替换，所以同行提到多个文件时
+      // 只有第一次命中被折叠成链接，其余行按重复提及清理。
+      const hasFilename = line.trim().toLowerCase() === displayName.toLowerCase();
       const hasResolvedPath = lowerLine.includes(lowerResolved);
-      const hasMarkdownLink = hasFilename && line.includes('](');
+      const hasMarkdownLink =
+        line.includes(`[${displayName}](`) ||
+        (lowerLine.includes(lowerName) && line.includes(']('));
 
       if (!hasFilename && !hasResolvedPath && !hasMarkdownLink) {
         continue;
