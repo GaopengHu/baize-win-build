@@ -129,7 +129,6 @@ export function useIPC() {
 
     const cleanup = window.electronAPI.on((event: ServerEvent) => {
       const store = useAppStore.getState();
-      console.log('[useIPC] Received event:', event.type);
 
       try {
         switch (event.type) {
@@ -159,12 +158,6 @@ export function useIPC() {
             break;
 
           case 'stream.message':
-            console.log(
-              '[useIPC] stream.message received:',
-              event.payload.message.role,
-              'content:',
-              JSON.stringify(event.payload.message.content)
-            );
             // Clear pending partial buffer to prevent RAF from appending stale chunks
             delete pendingPartials[event.payload.sessionId];
             // Clear thinking buffer too — final thinking is in the message content blocks
@@ -411,20 +404,16 @@ export function useIPC() {
   // Send event to main process
   const send = useCallback((event: ClientEvent) => {
     if (!isElectron) {
-      console.log('[useIPC] Browser mode - would send:', event.type);
       return;
     }
-    console.log('[useIPC] Sending:', event.type);
     window.electronAPI.send(event);
   }, []);
 
   // Invoke and wait for response
   const invoke = useCallback(async <T>(event: ClientEvent): Promise<T> => {
     if (!isElectron) {
-      console.log('[useIPC] Browser mode - would invoke:', event.type);
       return null as T;
     }
-    console.log('[useIPC] Invoking:', event.type);
     return window.electronAPI.invoke<T>(event);
   }, []);
 
@@ -731,6 +720,25 @@ export function useIPC() {
     [invoke]
   );
 
+  const getSessionMessagesPaginated = useCallback(
+    async (
+      sessionId: string,
+      limit: number,
+      offset: number
+    ): Promise<{ messages: Message[]; total: number; hasMore: boolean }> => {
+      if (!isElectron) {
+        return { messages: [], total: 0, hasMore: false };
+      }
+      // Handler returns JSON string to bypass Electron's structured clone overhead
+      const jsonStr = await invoke<string>({
+        type: 'session.getMessagesPaginated',
+        payload: { sessionId, limit, offset },
+      });
+      return JSON.parse(jsonStr);
+    },
+    [invoke]
+  );
+
   const getSessionTraceSteps = useCallback(
     async (sessionId: string): Promise<TraceStep[]> => {
       if (!isElectron) {
@@ -820,6 +828,7 @@ export function useIPC() {
     batchDeleteSessions,
     listSessions,
     getSessionMessages,
+    getSessionMessagesPaginated,
     getSessionTraceSteps,
     respondToPermission,
     respondToSudoPassword,

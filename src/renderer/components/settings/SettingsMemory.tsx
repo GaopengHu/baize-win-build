@@ -33,6 +33,8 @@ const DEFAULT_MEMORY_RUNTIME: MemoryRuntimeConfig = {
   useEmbedding: false,
   maxNavSteps: 2,
   ingestionConcurrency: 4,
+  retrievalMode: 'background',
+  retrievalTimeoutMs: 8000,
   storageRoot: '',
   evalEnabled: false,
   evalWorkspaces: [],
@@ -50,6 +52,8 @@ function cloneRuntimeConfig(runtime?: MemoryRuntimeConfig): MemoryRuntimeConfig 
     maxNavSteps: source.maxNavSteps ?? DEFAULT_MEMORY_RUNTIME.maxNavSteps,
     ingestionConcurrency:
       source.ingestionConcurrency ?? DEFAULT_MEMORY_RUNTIME.ingestionConcurrency,
+    retrievalMode: source.retrievalMode ?? DEFAULT_MEMORY_RUNTIME.retrievalMode,
+    retrievalTimeoutMs: source.retrievalTimeoutMs ?? DEFAULT_MEMORY_RUNTIME.retrievalTimeoutMs,
     storageRoot: source.storageRoot ?? DEFAULT_MEMORY_RUNTIME.storageRoot,
     evalEnabled: source.evalEnabled ?? DEFAULT_MEMORY_RUNTIME.evalEnabled,
     evalWorkspaces: Array.isArray(source.evalWorkspaces)
@@ -370,8 +374,14 @@ export function SettingsMemory() {
           </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <MetricCard label={t('memory.coreCount')} value={overview?.coreCount ?? 0} />
-            <MetricCard label={t('memory.sessionCount')} value={overview?.experienceSessionCount ?? 0} />
-            <MetricCard label={t('memory.chunkCount')} value={overview?.experienceChunkCount ?? 0} />
+            <MetricCard
+              label={t('memory.sessionCount')}
+              value={overview?.experienceSessionCount ?? 0}
+            />
+            <MetricCard
+              label={t('memory.chunkCount')}
+              value={overview?.experienceChunkCount ?? 0}
+            />
             <MetricCard
               label={t('memory.workspaceCount')}
               value={overview?.sourceWorkspaceCount ?? 0}
@@ -408,7 +418,9 @@ export function SettingsMemory() {
                 overview?.topSourceWorkspaces?.length
                   ? `Top sources: ${overview.topSourceWorkspaces
                       .slice(0, 3)
-                      .map((item) => `${item.workspaceKey} (${item.sessionCount}/${item.chunkCount})`)
+                      .map(
+                        (item) => `${item.workspaceKey} (${item.sessionCount}/${item.chunkCount})`
+                      )
                       .join(' · ')}`
                   : undefined
               }
@@ -466,6 +478,43 @@ export function SettingsMemory() {
                 className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-text-primary outline-none focus:border-accent"
               />
             </LabeledField>
+            <LabeledField label={t('memory.retrievalMode', '记忆检索模式')}>
+              <select
+                value={runtimeDraft.retrievalMode ?? 'background'}
+                onChange={(event) =>
+                  setRuntimeDraft((prev) => ({
+                    ...prev,
+                    retrievalMode: event.target.value as 'background' | 'blocking',
+                  }))
+                }
+                className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-text-primary outline-none focus:border-accent"
+              >
+                <option value="background">
+                  {t('memory.retrievalModeBackground', '快速（后台检索，不阻塞回复）')}
+                </option>
+                <option value="blocking">
+                  {t('memory.retrievalModeBlocking', '深度（等待检索完成后再回复）')}
+                </option>
+              </select>
+            </LabeledField>
+            {(runtimeDraft.retrievalMode ?? 'background') === 'background' && (
+              <LabeledField label={t('memory.retrievalTimeoutMs', '后台检索注入时限（毫秒）')}>
+                <input
+                  type="number"
+                  min={1000}
+                  max={60000}
+                  step={500}
+                  value={runtimeDraft.retrievalTimeoutMs ?? 8000}
+                  onChange={(event) =>
+                    setRuntimeDraft((prev) => ({
+                      ...prev,
+                      retrievalTimeoutMs: Number(event.target.value || 8000),
+                    }))
+                  }
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-text-primary outline-none focus:border-accent"
+                />
+              </LabeledField>
+            )}
             <ToggleField
               label={t('memory.useEmbedding', '启用 embedding 检索')}
               checked={runtimeDraft.useEmbedding}
@@ -740,7 +789,9 @@ export function SettingsMemory() {
                       </p>
                       <p className="mt-1 text-sm font-medium text-text-primary">{selected.title}</p>
                     </div>
-                    <p className="text-sm text-text-secondary whitespace-pre-wrap">{selected.summary}</p>
+                    <p className="text-sm text-text-secondary whitespace-pre-wrap">
+                      {selected.summary}
+                    </p>
                     {selected.sourceFile && (
                       <p className="text-xs text-text-muted">
                         {t('memory.sourceFile', '来源文件')}: {selected.sourceFile}
@@ -749,7 +800,10 @@ export function SettingsMemory() {
                     {selected.sessionId && (
                       <button
                         onClick={() => {
-                          void handleInspectSession(selected.sessionId!, selected.sourceWorkspace || selected.workspaceKey);
+                          void handleInspectSession(
+                            selected.sessionId!,
+                            selected.sourceWorkspace || selected.workspaceKey
+                          );
                         }}
                         className="rounded-lg border border-border bg-background px-3 py-2 text-xs font-medium text-text-primary"
                       >
@@ -825,7 +879,10 @@ export function SettingsMemory() {
                   </div>
                 ) : (
                   <p className="mt-3 text-sm text-text-muted">
-                    {t('memory.inspectSessionHint', '从上方搜索结果中选择一个 session 或 chunk 后查看')}
+                    {t(
+                      'memory.inspectSessionHint',
+                      '从上方搜索结果中选择一个 session 或 chunk 后查看'
+                    )}
                   </p>
                 )}
               </div>
@@ -873,7 +930,9 @@ export function SettingsMemory() {
                   <p className="mt-1 text-xs text-text-muted">{file.filePath}</p>
                   <p className="mt-2 text-[11px] text-text-muted">
                     {file.sizeBytes} bytes
-                    {typeof file.sessionCount === 'number' ? ` · ${file.sessionCount} sessions` : ''}
+                    {typeof file.sessionCount === 'number'
+                      ? ` · ${file.sessionCount} sessions`
+                      : ''}
                     {typeof file.chunkCount === 'number' ? ` · ${file.chunkCount} chunks` : ''}
                   </p>
                 </button>
@@ -1001,13 +1060,7 @@ function InfoCard({
   );
 }
 
-function LabeledField({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function LabeledField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block space-y-1.5">
       <span className="text-xs font-medium text-text-muted">{label}</span>
@@ -1028,7 +1081,11 @@ function ToggleField({
   return (
     <label className="flex items-center justify-between gap-3 rounded-lg border border-border-muted bg-background/70 px-3 py-2.5">
       <span className="text-sm text-text-primary">{label}</span>
-      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
     </label>
   );
 }
@@ -1070,7 +1127,9 @@ function ResultGroup({
                   {[item.sourceWorkspace, item.sourceSessionTitle].filter(Boolean).join(' · ')}
                 </p>
               )}
-              {item.sourceFile && <p className="mt-2 text-[11px] text-text-muted">{item.sourceFile}</p>}
+              {item.sourceFile && (
+                <p className="mt-2 text-[11px] text-text-muted">{item.sourceFile}</p>
+              )}
             </button>
           ))}
         </div>

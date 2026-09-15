@@ -240,6 +240,8 @@ function createDatabaseInstance(db: Database.Database): DatabaseInstance {
             .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC')
             .all(sessionId) as MessageRow[]
       ),
+      getPaginated: vi.fn(() => []),
+      getCountBySessionId: vi.fn(() => 0),
       delete: vi.fn(),
       deleteBySessionId: vi.fn(),
     },

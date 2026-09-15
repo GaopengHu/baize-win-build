@@ -183,8 +183,13 @@ async function waitForDevServer(url: string, maxAttempts = 30, intervalMs = 500)
 // chunks, re-executing all module-level side effects. This flag ensures all
 // side effects (single-instance lock, NavServer, IPC handlers, app lifecycle)
 // only execute ONCE.
-const __bazeAlreadyInitialized = !!(globalThis as any).__BAZE_MAIN_INITIALIZED;
-(globalThis as any).__BAZE_MAIN_INITIALIZED = true;
+type BazeGlobalFlags = typeof globalThis & {
+  __BAZE_MAIN_INITIALIZED?: boolean;
+  __BAZE_APP_READY_INITIALIZED?: boolean;
+};
+const __bazeGlobal = globalThis as BazeGlobalFlags;
+const __bazeAlreadyInitialized = !!__bazeGlobal.__BAZE_MAIN_INITIALIZED;
+__bazeGlobal.__BAZE_MAIN_INITIALIZED = true;
 
 // Single-instance lock: skip in dev mode so vite-plugin-electron can restart freely
 // without the old process blocking the new one during async cleanup.
@@ -803,11 +808,11 @@ app
     // skip all startup logic. The primary fix is inlineDynamicImports in
     // vite.config.ts, but this guard prevents harm even if code splitting
     // somehow creates duplicate chunks.
-    if ((globalThis as any).__BAZE_APP_READY_INITIALIZED) {
+    if (__bazeGlobal.__BAZE_APP_READY_INITIALIZED) {
       log('[App] Already initialized, skipping duplicate app.whenReady handler');
       return;
     }
-    (globalThis as any).__BAZE_APP_READY_INITIALIZED = true;
+    __bazeGlobal.__BAZE_APP_READY_INITIALIZED = true;
 
     // Smoke test mode: verify the app can start, then exit cleanly
     if (process.argv.includes('--smoke-test')) {
@@ -1119,6 +1124,8 @@ async function cleanupSandboxResources(): Promise<void> {
   }
 
   try {
+    // Persist any pending batched trace writes before closing the DB.
+    sessionManager?.flushTraceWrites();
     closeDatabase();
   } catch (error) {
     logError('[App] Error closing database:', error);
@@ -1153,6 +1160,7 @@ app.on('before-quit', async (event) => {
     if (process.env.VITE_DEV_SERVER_URL) {
       stopNavServer();
       try {
+        sessionManager?.flushTraceWrites();
         closeDatabase();
       } catch {
         /* best-effort */
@@ -1179,11 +1187,11 @@ app.on('before-quit', async (event) => {
 // causing duplicate ipcMain.handle() registrations. Wrapping the original
 // method to make it idempotent prevents the "second handler" error.
 const __originalIpcHandle = ipcMain.handle.bind(ipcMain);
-ipcMain.handle = ((channel: string, listener: (...args: any[]) => any) => {
+ipcMain.handle = ((channel: string, listener: (...args: unknown[]) => unknown) => {
   try {
-    __originalIpcHandle(channel, listener);
-  } catch (e: any) {
-    if (e?.message?.includes?.('register a second handler')) {
+    __originalIpcHandle(channel, listener as Parameters<typeof __originalIpcHandle>[1]);
+  } catch (e) {
+    if (e instanceof Error && e.message.includes('register a second handler')) {
       // Already registered — expected with Vite code splitting, safe to ignore
     } else {
       throw e;
@@ -1289,7 +1297,10 @@ function buildUniqueTargetPath(targetPath: string): string {
   return join(dir, `${base}-${Date.now()}${ext}`);
 }
 
-async function saveFileToDownloads(filePath: string, cwd?: string): Promise<{ success: boolean; savedPath?: string; error?: string }> {
+async function saveFileToDownloads(
+  filePath: string,
+  cwd?: string
+): Promise<{ success: boolean; savedPath?: string; error?: string }> {
   try {
     const sourcePath = inferSourcePath(filePath, cwd);
     if (!sourcePath) {
@@ -1485,56 +1496,48 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle(
-  'artifacts.checkPaths',
-  async (_event, paths: string[], cwd?: string) => {
-    if (!Array.isArray(paths) || paths.length === 0) {
-      return [];
-    }
-    const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
-    const existing: string[] = [];
-
-    for (const raw of paths) {
-      if (typeof raw !== 'string' || !raw.trim()) {
-        continue;
-      }
-      let normalized = raw.trim();
-
-      if (
-        !isAbsolute(normalized) &&
-        !isWindowsDrivePath(normalized) &&
-        !isUncPath(normalized)
-      ) {
-        normalized = resolve(baseDir, normalized);
-      }
-
-      if (
-        normalized.startsWith('/workspace/') ||
-        /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalized)
-      ) {
-        const relativePart = normalized.startsWith('/workspace/')
-          ? normalized.slice('/workspace/'.length)
-          : normalized.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
-        normalized = resolve(baseDir, relativePart);
-      }
-
-      if (!isUncPath(normalized)) {
-        normalized = resolve(normalized);
-      }
-
-      try {
-        const stat = fs.statSync(normalized);
-        if (stat.isFile()) {
-          existing.push(normalized);
-        }
-      } catch {
-        // Path does not exist — not a deliverable, skip.
-      }
-    }
-
-    return existing;
+ipcMain.handle('artifacts.checkPaths', async (_event, paths: string[], cwd?: string) => {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return [];
   }
-);
+  const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
+
+  const checks = paths.map(async (raw): Promise<string | null> => {
+    if (typeof raw !== 'string' || !raw.trim()) {
+      return null;
+    }
+    let normalized = raw.trim();
+
+    if (!isAbsolute(normalized) && !isWindowsDrivePath(normalized) && !isUncPath(normalized)) {
+      normalized = resolve(baseDir, normalized);
+    }
+
+    if (normalized.startsWith('/workspace/') || /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalized)) {
+      const relativePart = normalized.startsWith('/workspace/')
+        ? normalized.slice('/workspace/'.length)
+        : normalized.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
+      normalized = resolve(baseDir, relativePart);
+    }
+
+    if (!isUncPath(normalized)) {
+      normalized = resolve(normalized);
+    }
+
+    try {
+      // Async stat: this handler is called on every finalized message and the
+      // synchronous variant blocked the main event loop (shared with token
+      // streaming) once per path.
+      const stat = await fs.promises.stat(normalized);
+      return stat.isFile() ? normalized : null;
+    } catch {
+      // Path does not exist — not a deliverable, skip.
+      return null;
+    }
+  });
+
+  const results = await Promise.all(checks);
+  return results.filter((p): p is string => p !== null);
+});
 
 ipcMain.handle('dialog.selectFiles', async () => {
   const result = await dialog.showOpenDialog({
@@ -2779,7 +2782,7 @@ ipcMain.handle('memory.setEnabled', (_event, enabled: boolean) => {
   return result;
 });
 
-ipcMain.handle('logs.write', (_event, level: 'info' | 'warn' | 'error', args: unknown[]) => {
+ipcMain.handle('logs.write', (_event, level: 'info' | 'warn' | 'error', ...args: unknown[]) => {
   try {
     if (level === 'warn') {
       logWarn(...args);
@@ -2913,6 +2916,21 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
     case 'session.getMessages':
       return sm.getMessages(event.payload.sessionId);
 
+    case 'session.getMessagesPaginated': {
+      const t0 = performance.now();
+      const result = sm.getMessagesPaginated(
+        event.payload.sessionId,
+        event.payload.limit,
+        event.payload.offset
+      );
+      const t1 = performance.now();
+      const jsonStr = JSON.stringify(result);
+      logWarn(
+        `[DIAG] getMessagesPaginated: query=${Math.round(t1 - t0)}ms stringify=${Math.round(performance.now() - t1)}ms jsonLen=${jsonStr.length}`
+      );
+      return jsonStr;
+    }
+
     case 'session.getTraceSteps':
       return sm.getTraceSteps(event.payload.sessionId);
 
@@ -2989,6 +3007,17 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
         setPermissionRules(
           (event.payload as { permissionRules: PermissionRule[] }).permissionRules
         );
+      }
+      return null;
+
+    case 'memory.prefetch':
+      // Fire-and-forget warm-up of experience-memory retrieval while the user
+      // is typing, so the deferred injection at turn start is usually a cache
+      // hit. Errors are handled inside the coordinator/extension path.
+      try {
+        memoryService?.prefetchExperience(event.payload.sessionId, event.payload.draft);
+      } catch (error) {
+        logWarn('[Main] memory.prefetch failed:', error);
       }
       return null;
 

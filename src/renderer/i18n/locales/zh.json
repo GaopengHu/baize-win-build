@@ -122,7 +122,11 @@
     "clearCoreConfirm": "确认清空全局 core memory？此操作不可撤销。",
     "rebuildSuccess": "工作区记忆已重建",
     "clearWorkspaceSuccess": "当前工作区记忆已清空",
-    "clearCoreSuccess": "Core memory 已清空"
+    "clearCoreSuccess": "Core memory 已清空",
+    "retrievalMode": "记忆检索模式",
+    "retrievalModeBackground": "快速（后台检索，不阻塞回复）",
+    "retrievalModeBlocking": "深度（等待检索完成后再回复）",
+    "retrievalTimeoutMs": "后台检索注入时限（毫秒）"
   },
   "language": {
     "english": "English",

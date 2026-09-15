@@ -27,6 +27,8 @@ export interface DatabaseInstance {
     create: (message: MessageRow) => void;
     update: (id: string, updates: Partial<Pick<MessageRow, 'execution_time_ms'>>) => void;
     getBySessionId: (sessionId: string) => MessageRow[];
+    getPaginated: (sessionId: string, limit: number, offset: number) => MessageRow[];
+    getCountBySessionId: (sessionId: string) => number;
     delete: (id: string) => void;
     deleteBySessionId: (sessionId: string) => void;
   };
@@ -426,8 +428,28 @@ export function initDatabase(): DatabaseInstance {
   // Enable foreign keys
   rawDb.pragma('foreign_keys = ON');
 
+  // WAL + synchronous=NORMAL is the recommended combo: commits skip the
+  // per-write fsync while staying crash-safe (WAL frames survive power loss;
+  // only the last transaction(s) since the last checkpoint may be replayed).
+  // better-sqlite3 already compiles SQLITE_DEFAULT_WAL_SYNCHRONOUS=1, but we
+  // set it explicitly so behavior never depends on build-time defaults.
+  rawDb.pragma('synchronous = NORMAL');
+
   // Initialize schema
   initializeSchema(rawDb);
+
+  // Cache for dynamically-built UPDATE statements (sessions/trace_steps/
+  // scheduled_tasks .update()). These run on hot paths (every trace event),
+  // and re-preparing identical SQL each time wastes parse+compile cycles.
+  const dynamicStatementCache = new Map<string, Database.Statement>();
+  const prepareCached = (sql: string): Database.Statement => {
+    let stmt = dynamicStatementCache.get(sql);
+    if (!stmt) {
+      stmt = rawDb.prepare(sql);
+      dynamicStatementCache.set(sql, stmt);
+    }
+    return stmt;
+  };
 
   // Prepare statements for better performance
   const insertSession = rawDb.prepare(`
@@ -460,6 +482,16 @@ export function initDatabase(): DatabaseInstance {
 
   const getMessagesBySessionStmt = rawDb.prepare(`
     SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC
+  `);
+
+  const getMessagesPaginatedStmt = rawDb.prepare(`
+    SELECT * FROM messages WHERE session_id = ?
+    ORDER BY timestamp DESC, rowid DESC
+    LIMIT ? OFFSET ?
+  `);
+
+  const getMessageCountBySessionStmt = rawDb.prepare(`
+    SELECT COUNT(*) as count FROM messages WHERE session_id = ?
   `);
 
   const updateMessageStmt = rawDb.prepare(`
@@ -554,7 +586,7 @@ export function initDatabase(): DatabaseInstance {
         values.push(id);
 
         const sql = `UPDATE sessions SET ${setClauses.join(', ')} WHERE id = ?`;
-        rawDb.prepare(sql).run(...values);
+        prepareCached(sql).run(...values);
       },
 
       get: (id: string): SessionRow | undefined => {
@@ -592,6 +624,16 @@ export function initDatabase(): DatabaseInstance {
 
       getBySessionId: (sessionId: string): MessageRow[] => {
         return getMessagesBySessionStmt.all(sessionId) as MessageRow[];
+      },
+
+      getPaginated: (sessionId: string, limit: number, offset: number): MessageRow[] => {
+        // Returns in DESC order (newest first) — caller reverses if needed
+        return getMessagesPaginatedStmt.all(sessionId, limit, offset) as MessageRow[];
+      },
+
+      getCountBySessionId: (sessionId: string): number => {
+        const row = getMessageCountBySessionStmt.get(sessionId) as { count: number };
+        return row.count;
       },
 
       delete: (id: string) => {
@@ -637,7 +679,7 @@ export function initDatabase(): DatabaseInstance {
 
         values.push(id);
         const sql = `UPDATE trace_steps SET ${setClauses.join(', ')} WHERE id = ?`;
-        rawDb.prepare(sql).run(...values);
+        prepareCached(sql).run(...values);
       },
 
       getBySessionId: (sessionId: string): TraceStepRow[] => {
@@ -689,7 +731,7 @@ export function initDatabase(): DatabaseInstance {
         values.push(id);
 
         const sql = `UPDATE scheduled_tasks SET ${setClauses.join(', ')} WHERE id = ?`;
-        rawDb.prepare(sql).run(...values);
+        prepareCached(sql).run(...values);
       },
 
       get: (id: string): ScheduledTaskRow | undefined => {

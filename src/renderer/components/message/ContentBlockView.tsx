@@ -237,14 +237,30 @@ export const ContentBlockView = memo(function ContentBlockView({
     case 'text': {
       const textBlock = block as { type: 'text'; text: string };
       const text = textBlock.text || '';
-      const normalizedText = normalizeCitationMarkdownLinks(
-        normalizeLocalFileMarkdownLinks(normalizeLatexDelimiters(text))
-      );
-      const augmentedText = appendFolderOpenLinks(normalizedText, currentWorkingDir);
 
       if (!text) {
         return <span className="text-text-muted italic">{t('messageCard.emptyText')}</span>;
       }
+
+      // Streaming fast path: render plain text while tokens are still arriving.
+      // The full markdown pipeline (3 regex normalizers + react-markdown +
+      // remark-math/gfm + rehype-sanitize + KaTeX + highlight.js) re-parses the
+      // ENTIRE accumulated text on every animation frame — O(n²) over a reply.
+      // Plain text keeps each frame O(n) in React only; markdown rendering
+      // happens once when the message finalizes (isStreaming flips false).
+      if (isStreaming) {
+        return (
+          <div className="prose-chat max-w-none text-text-primary whitespace-pre-wrap break-words text-left">
+            {text}
+            <span className="inline-block w-2 h-4 bg-accent ml-1 animate-pulse" />
+          </div>
+        );
+      }
+
+      const normalizedText = normalizeCitationMarkdownLinks(
+        normalizeLocalFileMarkdownLinks(normalizeLatexDelimiters(text))
+      );
+      const augmentedText = appendFolderOpenLinks(normalizedText, currentWorkingDir);
 
       // Simple text display for user messages, Markdown for assistant
       // Non-user text blocks should render as normal assistant output, not as process-only content.
