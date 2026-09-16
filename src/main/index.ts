@@ -12,6 +12,10 @@
  * Dependencies: session-manager, config-store, mcp-manager, sandbox-adapter,
  *               skills-manager, scheduled-task-manager, nav-server, remote-manager
  */
+// Must stay the very first import: normalizes process.env.TZ before Chromium
+// spawns any child process, and before any Date/Intl call in this process.
+// Background (UOS/Deepin tzdata aliases such as Asia/Beijing): see ./timezone.
+import { systemTimeZone } from './timezone';
 import './stream-shim';
 import { app, BrowserWindow, ipcMain, dialog, shell, Menu, nativeTheme, Tray } from 'electron';
 import { join, resolve, dirname, isAbsolute, basename, extname } from 'path';
@@ -837,6 +841,11 @@ app
 
     // Log environment variables for debugging
     log('=== 今点通 Starting ===');
+    log('[Timezone] Detected:', systemTimeZone.detected ?? '(none)');
+    log('[Timezone] process.env.TZ:', systemTimeZone.applied ?? '(unchanged)');
+    if (systemTimeZone.reason) {
+      log('[Timezone]', systemTimeZone.reason);
+    }
     log('Config file:', configStore.getPath());
     log('Is configured:', configStore.isConfigured());
 

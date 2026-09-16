@@ -35,14 +35,6 @@ import {
   Cpu,
 } from 'lucide-react';
 
-type AttachedFile = {
-  name: string;
-  path: string;
-  size: number;
-  type: string;
-  inlineDataBase64?: string;
-};
-
 // Audio/video extensions the asr-transcribe skill accepts. Attaching any of
 // these signals a likely heavy local transcription; low-memory machines are
 // the most common trigger of the blank-window (renderer OOM) issue.
