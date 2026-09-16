@@ -871,7 +871,6 @@ app
 
     // Initialize session manager before creating an interactive window.
     // This avoids session.start racing the startup path and hitting a null manager.
-    sessionManager = new SessionManager(db, sendToRenderer, pluginRuntimeService, extensionManager);
     skillsManager = new SkillsManager(db, {
       getConfiguredGlobalSkillsPath: () => configStore.get('globalSkillsPath') || '',
       setConfiguredGlobalSkillsPath: (nextPath: string) => {
@@ -885,6 +884,13 @@ app
         payload: event,
       });
     });
+    sessionManager = new SessionManager(
+      db,
+      sendToRenderer,
+      pluginRuntimeService,
+      extensionManager,
+      skillsManager
+    );
     // pi-ai handles model routing natively — no proxy warmup needed
 
     // macOS: application menu, dock menu, tray icon

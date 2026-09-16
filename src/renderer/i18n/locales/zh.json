@@ -291,7 +291,6 @@
     "unsavedBadge": "未保存",
     "saveAndContinue": "保存并继续",
     "discardAndContinue": "放弃并继续",
-    "currentSetName": "方案名称",
     "renameInlineHint": "可直接编辑，回车或失焦自动保存",
     "switchSetLabel": "切换到其他方案",
     "switchSetPlaceholder": "选择要切换的方案",
@@ -342,8 +341,15 @@
         "ollama_model_not_listed": "当前模型 {{model}} 不在端点返回的模型列表中，请从列表重新选择或改用手动输入。",
         "ollama_model_loading": "模型 {{model}} 可能仍在加载中，稍后再试深度验证。",
         "model_cold_start": "模型可能仍在加载到 GPU/CPU 内存中。大型模型（7B+）首次使用可能需要 30–120 秒，请稍后重试。"
-      }
-    }
+      },
+      "title": "诊断连接",
+      "hint": "配置完成后先诊断连接，确认 API 配置正确",
+      "connected": "连接成功",
+      "disconnected": "连接失败"
+    },
+    "enableThinking": "启用思考模式",
+    "enableThinkingHint": "开启后模型会在回答前进行思考，适用于支持推理的模型（如 DeepSeek-R1、Claude Thinking）。",
+    "enableThinkingOllamaHint": "Ollama 本地模型开启思考会增加显存/内存占用，请确认模型支持后再开启。"
   },
   "window": {
     "minimize": "最小化",
@@ -626,7 +632,8 @@
     "noConfigSet": "无方案",
     "switchModel": "切换方案",
     "connectorCount_one": "{{count}} 个连接器",
-    "connectorCount_other": "{{count}} 个连接器"
+    "connectorCount_other": "{{count}} 个连接器",
+    "lowMemoryAsrWarning": "检测到设备内存较低（总计 {{totalGB}} GB，可用 {{freeGB}} GB）。本地语音转写非常吃内存，运行中可能出现界面白屏或卡死。建议：1) 先关闭其他大内存程序；2) 长录音先剪短再转写。"
   },
   "context": {
     "progress": "进度",

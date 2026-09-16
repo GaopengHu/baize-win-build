@@ -42,6 +42,10 @@ export interface SessionState {
   executionClock: SessionExecutionClock;
   traceSteps: TraceStep[];
   contextWindow: number;
+  // 本轮最终结局：新一轮开始时置 null，正常结束置 completed，用户停止/
+  // 中止置 stopped。侧边栏绿勾只认 completed，避免"运行中途有中间消息
+  // 就打勾"和"点了停止还打勾"两类误判。
+  lastTurnOutcome: 'completed' | 'stopped' | null;
   hasMoreMessages: boolean;
 }
 
@@ -54,6 +58,7 @@ const DEFAULT_SESSION_STATE: SessionState = {
   executionClock: { startAt: null, endAt: null },
   traceSteps: [],
   contextWindow: 0,
+  lastTurnOutcome: null,
   hasMoreMessages: true,
 };
 
@@ -167,6 +172,7 @@ export interface AppState {
   addTraceStep: (sessionId: string, step: TraceStep) => void;
   updateTraceStep: (sessionId: string, stepId: string, updates: Partial<TraceStep>) => void;
   setTraceSteps: (sessionId: string, steps: TraceStep[]) => void;
+  setLastTurnOutcome: (sessionId: string, outcome: 'completed' | 'stopped' | null) => void;
 
   setLoading: (loading: boolean) => void;
   toggleSidebar: () => void;
@@ -630,6 +636,11 @@ export const useAppStore = create<AppState>((set) => ({
   setTraceSteps: (sessionId, steps) =>
     set((state) => ({
       sessionStates: patchSession(state.sessionStates, sessionId, { traceSteps: steps }),
+    })),
+
+  setLastTurnOutcome: (sessionId, outcome) =>
+    set((state) => ({
+      sessionStates: patchSession(state.sessionStates, sessionId, { lastTurnOutcome: outcome }),
     })),
 
   // UI actions

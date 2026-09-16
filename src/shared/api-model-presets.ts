@@ -175,54 +175,54 @@ export function getModelInputGuidance(
   if (provider === 'openrouter') {
     return {
       placeholder: 'openai/gpt-5.4, anthropic/claude-sonnet-4-6, google/gemini-3-flash-preview',
-      hint: 'Use the exact model ID for the selected protocol or endpoint.',
+      hint: '请填写与当前协议/服务对应的准确模型 ID。',
     };
   }
 
   if (provider === 'custom' && customProtocol === 'openai') {
     return {
       placeholder: 'deepseek-chat, deepseek-reasoner, qwen-max, gpt-5.4-mini',
-      hint: 'Use the exact model ID for the selected protocol or endpoint.',
+      hint: '请填写与当前协议/服务对应的准确模型 ID。',
     };
   }
 
   if (provider === 'custom' && customProtocol === 'gemini') {
     return {
       placeholder: 'gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-2.5-flash',
-      hint: 'Use the exact model ID for the selected protocol or endpoint.',
+      hint: '请填写与当前协议/服务对应的准确模型 ID。',
     };
   }
 
   if (provider === 'custom') {
     return {
       placeholder: 'glm-5, kimi-k2-thinking, claude-sonnet-4-6',
-      hint: 'Use the exact model ID for the selected protocol or endpoint.',
+      hint: '请填写与当前协议/服务对应的准确模型 ID。',
     };
   }
 
   if (provider === 'openai') {
     return {
       placeholder: 'gpt-5.4, gpt-5.4-mini, o3',
-      hint: 'Use the exact model ID for the selected protocol or endpoint.',
+      hint: '请填写与当前协议/服务对应的准确模型 ID。',
     };
   }
 
   if (provider === 'ollama') {
     return {
       placeholder: 'qwen3.5:0.8b, llama3.2:latest, deepseek-r1:latest',
-      hint: 'Use the exact model ID returned by your Ollama server.',
+      hint: '请填写 Ollama 服务返回的准确模型 ID。',
     };
   }
 
   if (provider === 'gemini') {
     return {
       placeholder: 'gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-2.5-flash',
-      hint: 'Use the exact model ID for the selected protocol or endpoint.',
+      hint: '请填写与当前协议/服务对应的准确模型 ID。',
     };
   }
 
   return {
     placeholder: 'claude-sonnet-4-6, claude-opus-4-6',
-    hint: 'Use the exact model ID for the selected protocol or endpoint.',
+    hint: '请填写与当前协议/服务对应的准确模型 ID。',
   };
 }

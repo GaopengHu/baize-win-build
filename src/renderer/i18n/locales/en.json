@@ -197,7 +197,7 @@
     "addCustomModelHint": "Save the current configuration as a new model, then switch to it in chat.",
     "addAndSave": "Add & Save",
     "modelName": "Model Name",
-    "currentSetName": "Scheme Name",
+    "currentSetName": "Set name",
     "selectModel": "Select Model",
     "addModel": "Add Model",
     "configSetDeleteTitle": "Delete config set",
@@ -291,7 +291,6 @@
     "unsavedBadge": "Unsaved",
     "saveAndContinue": "Save & Continue",
     "discardAndContinue": "Discard & Continue",
-    "currentSetName": "Set name",
     "renameInlineHint": "Edit directly. Press Enter or blur to save automatically",
     "switchSetLabel": "Switch to another set",
     "switchSetPlaceholder": "Select a set to switch",
@@ -342,8 +341,15 @@
         "ollama_model_not_listed": "Model {{model}} is not in the endpoint model list. Pick a detected model or switch to manual entry.",
         "ollama_model_loading": "Model {{model}} may still be loading. Try the deep check again in a moment.",
         "model_cold_start": "The model may still be loading into GPU/CPU memory. Large models (7B+) can take 30–120 seconds on first use. Try again shortly."
-      }
-    }
+      },
+      "title": "Diagnose Connection",
+      "hint": "Run a connection diagnosis after configuration to verify the API setup.",
+      "connected": "Connected",
+      "disconnected": "Connection Failed"
+    },
+    "enableThinking": "Enable Thinking",
+    "enableThinkingHint": "When enabled, the model will think before answering. For reasoning-capable models.",
+    "enableThinkingOllamaHint": "Enabling thinking on local Ollama models increases memory usage. Make sure the model supports it."
   },
   "window": {
     "minimize": "Minimize",
@@ -626,7 +632,8 @@
     "noConfigSet": "No scheme",
     "switchModel": "Switch scheme",
     "connectorCount_one": "{{count}} connector",
-    "connectorCount_other": "{{count}} connectors"
+    "connectorCount_other": "{{count}} connectors",
+    "lowMemoryAsrWarning": "Low memory detected ({{totalGB}} GB total, {{freeGB}} GB free). Local ASR transcription is memory-intensive and may cause white screen or freeze. Suggestions: 1) Close other memory-heavy apps; 2) Split long audio beforehand."
   },
   "context": {
     "progress": "Progress",

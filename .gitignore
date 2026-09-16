@@ -69,6 +69,10 @@ dist*
 resources/node
 resources/tools
 resources/python
+# 构建期下载的第三方二进制：ffmpeg（随 win 安装包分发）、Whisper 权重（约 1.5GB，
+# 默认不打进安装包，见 electron-builder.yml 注释）。需要时按 README 预置。
+resources/ffmpeg
+resources/whisper-models
 docs/
 /.mcp.json
 /eng.traineddata

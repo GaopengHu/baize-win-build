@@ -233,7 +233,10 @@ export function ContextPanel() {
     const seenPaths = new Set<string>();
 
     for (const path of artifactPaths) {
-      const resolvedPath = normalizeArtifactPathValue(resolveArtifactPath(path, currentWorkingDir));
+      // Candidate may itself be a file:// URL or carry percent-encoded CJK —
+      // normalize BEFORE resolving so it dedupes against the plain local path.
+      const normalized = normalizeArtifactPathValue(path);
+      const resolvedPath = resolveArtifactPath(normalized, currentWorkingDir);
       if (seenPaths.has(resolvedPath)) continue;
       seenPaths.add(resolvedPath);
       allCandidates.push(resolvedPath);
