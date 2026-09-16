@@ -69,6 +69,30 @@ export interface FileAttachmentContent {
   inlineDataBase64?: string;
 }
 
+// Composer draft persisted in the global store, keyed by context
+// ('welcome' for the welcome screen, sessionId for each chat).
+export interface DraftAttachedFile {
+  name: string;
+  path: string;
+  size: number;
+  type: string;
+  inlineDataBase64?: string;
+}
+
+export interface DraftPastedImage {
+  url: string;
+  base64: string;
+  mediaType: string;
+}
+
+export interface ComposerDraft {
+  prompt: string;
+  pastedImages: DraftPastedImage[];
+  attachedFiles: DraftAttachedFile[];
+  /** Welcome-screen quick-tag selection (only used by the welcome composer). */
+  selectedTag?: string | null;
+}
+
 export interface ToolUseContent {
   type: 'tool_use';
   id: string;

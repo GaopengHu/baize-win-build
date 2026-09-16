@@ -10,6 +10,7 @@ import type {
   SandboxSetupProgress,
   SandboxSyncStatus,
   SkillsStorageChangeEvent,
+  ComposerDraft,
 } from '../types';
 import { applySessionUpdate } from '../utils/session-update';
 
@@ -55,6 +56,15 @@ const DEFAULT_SESSION_STATE: SessionState = {
   contextWindow: 0,
   hasMoreMessages: true,
 };
+
+export const EMPTY_COMPOSER_DRAFT: ComposerDraft = {
+  prompt: '',
+  pastedImages: [],
+  attachedFiles: [],
+};
+
+/** Draft key for the welcome screen composer. Session drafts use their sessionId. */
+export const WELCOME_DRAFT_KEY = 'welcome';
 
 // Helper to immutably update a single session's state within the record
 function patchSession(
@@ -121,6 +131,10 @@ export interface AppState {
 
   // System theme (from OS native theme)
   systemDarkMode: boolean;
+
+  // Composer drafts keyed by context ('welcome' or sessionId),
+  // so each composer keeps its own draft across view/session switches.
+  drafts: Record<string, ComposerDraft>;
 
   // Actions
   setSessions: (sessions: Session[]) => void;
@@ -194,6 +208,10 @@ export interface AppState {
 
   // System theme actions
   setSystemDarkMode: (dark: boolean) => void;
+
+  // Composer draft actions
+  setDraft: (key: string, updates: Partial<ComposerDraft>) => void;
+  clearDraft: (key: string) => void;
 }
 
 const SETTINGS_STORAGE_KEY = 'nowlink.renderer.settings.v1';
@@ -286,6 +304,7 @@ export const useAppStore = create<AppState>((set) => ({
   skillsStorageChangedAt: 0,
   skillsStorageChangeEvent: null,
   systemDarkMode: false,
+  drafts: {},
 
   // Session actions
   setSessions: (sessions) => set({ sessions }),
@@ -307,9 +326,11 @@ export const useAppStore = create<AppState>((set) => ({
   removeSession: (sessionId) =>
     set((state) => {
       const { [sessionId]: _, ...restSessionStates } = state.sessionStates;
+      const { [sessionId]: __, ...restDrafts } = state.drafts;
       return {
         sessions: state.sessions.filter((s) => s.id !== sessionId),
         sessionStates: restSessionStates,
+        drafts: restDrafts,
         activeSessionId: state.activeSessionId === sessionId ? null : state.activeSessionId,
       };
     }),
@@ -321,10 +342,15 @@ export const useAppStore = create<AppState>((set) => ({
       for (const key of Object.keys(state.sessionStates)) {
         if (!idSet.has(key)) newSessionStates[key] = state.sessionStates[key];
       }
+      const newDrafts: Record<string, ComposerDraft> = {};
+      for (const key of Object.keys(state.drafts)) {
+        if (!idSet.has(key)) newDrafts[key] = state.drafts[key];
+      }
 
       return {
         sessions: state.sessions.filter((s) => !idSet.has(s.id)),
         sessionStates: newSessionStates,
+        drafts: newDrafts,
         activeSessionId:
           state.activeSessionId && idSet.has(state.activeSessionId) ? null : state.activeSessionId,
       };
@@ -671,6 +697,21 @@ export const useAppStore = create<AppState>((set) => ({
 
   // System theme actions
   setSystemDarkMode: (dark) => set({ systemDarkMode: dark }),
+
+  // Composer draft actions
+  setDraft: (key, updates) =>
+    set((state) => ({
+      drafts: {
+        ...state.drafts,
+        [key]: { ...EMPTY_COMPOSER_DRAFT, ...state.drafts[key], ...updates },
+      },
+    })),
+  clearDraft: (key) =>
+    set((state) => {
+      if (!(key in state.drafts)) return {};
+      const { [key]: _, ...rest } = state.drafts;
+      return { drafts: rest };
+    }),
 }));
 
 // Expose helpers for nav-server (CLI-driven UI navigation via executeJavaScript)

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useAppStore } from '../store';
+import { useAppStore, WELCOME_DRAFT_KEY } from '../store';
+import { useComposerDraft } from '../hooks/useComposerDraft';
 import { useIPC } from '../hooks/useIPC';
 import type { ContentBlock } from '../types';
 import { getInitialSessionTitle } from '../../shared/session-title';
@@ -16,26 +17,25 @@ import {
   Check,
 } from 'lucide-react';
 
-type AttachedFile = {
-  name: string;
-  path: string;
-  size: number;
-  type: string;
-  inlineDataBase64?: string;
-};
-
 import welcomeLogoSrc from '../assets/logo.png';
 
 export function WelcomeView() {
   const { t } = useTranslation();
-  const [prompt, setPrompt] = useState('');
-  const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const setDraft = useAppStore((state) => state.setDraft);
+  const {
+    prompt,
+    setPrompt,
+    pastedImages,
+    setPastedImages,
+    attachedFiles,
+    setAttachedFiles,
+    clearComposerDraft,
+  } = useComposerDraft(WELCOME_DRAFT_KEY);
+  const [selectedTag, setSelectedTag] = useState<string | null>(
+    () => useAppStore.getState().drafts[WELCOME_DRAFT_KEY]?.selectedTag ?? null
+  );
   const [isSubmitting, setIsSubmitting] = useState(false);
   const isComposingRef = useRef(false);
-  const [pastedImages, setPastedImages] = useState<
-    Array<{ url: string; base64: string; mediaType: string }>
-  >([]);
-  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { startSession, changeWorkingDir, isElectron } = useIPC();
@@ -47,6 +47,12 @@ export function WelcomeView() {
   const isConfigured = useAppStore((state) => state.isConfigured);
   const setShowSettings = useAppStore((state) => state.setShowSettings);
   const setSettingsTab = useAppStore((state) => state.setSettingsTab);
+
+  // Persist the welcome-only quick-tag selection into the same draft entry.
+  useEffect(() => {
+    setDraft(WELCOME_DRAFT_KEY, { selectedTag });
+  }, [selectedTag, setDraft]);
+
   const canSubmit = prompt.trim().length > 0 || pastedImages.length > 0 || attachedFiles.length > 0;
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const quickSwitchModels = useMemo(() => {
@@ -393,13 +399,12 @@ export function WelcomeView() {
       const sessionTitle = getInitialSessionTitle(currentPrompt, attachedFiles[0]?.name);
       const session = await startSession(sessionTitle, contentBlocks, workingDir || undefined);
       if (session) {
-        setPrompt('');
         if (textareaRef.current) {
           textareaRef.current.value = '';
         }
         pastedImages.forEach((img) => URL.revokeObjectURL(img.url));
-        setPastedImages([]);
-        setAttachedFiles([]);
+        setSelectedTag(null);
+        clearComposerDraft();
       }
     } finally {
       setIsSubmitting(false);
