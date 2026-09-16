@@ -5,45 +5,18 @@
 
 import { resolveArtifactPath } from './artifact-path';
 import { extractFilePathCandidatesFromText, normalizeArtifactPathValue } from './tool-output-path';
+import { decodeCjkPercentEncoding, localPathFromFileUrl } from '../../shared/local-file-path';
 
 const DOWNLOADABLE_EXTENSIONS = new Set([
-  'pptx',
-  'ppt',
-  'key',
-  'keynote',
-  'docx',
-  'doc',
-  'pdf',
-  'xlsx',
-  'xls',
-  'csv',
-  'tsv',
-  'txt',
-  'md',
-  'markdown',
-  'rtf',
-  'odt',
-  'ods',
-  'odp',
-  'png',
-  'jpg',
-  'jpeg',
-  'gif',
-  'webp',
-  'svg',
-  'mp3',
-  'wav',
-  'm4a',
-  'ogg',
-  'mp4',
-  'mov',
-  'mkv',
-  'webm',
-  'zip',
-  'rar',
-  '7z',
-  'tar',
-  'gz',
+  'pptx', 'ppt', 'key', 'keynote',
+  'docx', 'doc', 'pdf',
+  'xlsx', 'xls', 'csv', 'tsv',
+  'txt', 'md', 'markdown', 'rtf', 'odt', 'ods', 'odp',
+  'srt', 'vtt',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg',
+  'mp3', 'wav', 'm4a', 'ogg',
+  'mp4', 'mov', 'mkv', 'webm',
+  'zip', 'rar', '7z', 'tar', 'gz',
 ]);
 
 const FILE_GENERATED_PATTERNS = [
@@ -52,12 +25,8 @@ const FILE_GENERATED_PATTERNS = [
   /(?:下载链接|点击下载|下载地址)[：:\s]*([^\n\r]+?\.(?:pptx?|ppt|key|keynote|docx?|doc|pdf|xlsx?|xls|csv|tsv|txt|md|markdown|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i,
 ];
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function getBaseName(path: string): string {
-  const normalized = path.replace(/\\/g, '/');
+  const normalized = decodeCjkPercentEncoding(path).replace(/\\/g, '/');
   return normalized.split('/').pop() || path;
 }
 
@@ -67,9 +36,10 @@ function getBaseName(path: string): string {
  */
 export function extractGeneratedFilePaths(text: string): string[] {
   const candidates = new Set<string>();
+  const decodedText = decodeCjkPercentEncoding(text);
 
   for (const pattern of FILE_GENERATED_PATTERNS) {
-    const match = text.match(pattern);
+    const match = decodedText.match(pattern);
     if (match?.[1]) {
       const cleaned = normalizeArtifactPathValue(match[1]);
       if (cleaned && hasDownloadableExtension(cleaned)) {
@@ -78,9 +48,15 @@ export function extractGeneratedFilePaths(text: string): string[] {
     }
   }
 
-  // Also try the generic path extractor as fallback
+  // Also try the generic path extractor as fallback. Candidates may arrive as
+  // file:// URLs or percent-encoded runs from model output — normalize them to
+  // decoded local paths so the artifact link never displays %E8%A5%BF... mojibake.
   for (const candidate of extractFilePathCandidatesFromText(text)) {
-    const cleaned = normalizeArtifactPathValue(candidate);
+    let cleaned = normalizeArtifactPathValue(candidate);
+    if (cleaned.startsWith('file://')) {
+      cleaned = localPathFromFileUrl(cleaned) ?? cleaned;
+    }
+    cleaned = decodeCjkPercentEncoding(cleaned);
     if (cleaned && hasDownloadableExtension(cleaned)) {
       candidates.add(cleaned);
     }
@@ -104,10 +80,9 @@ function hasDownloadableExtension(path: string): boolean {
  */
 export function createFolderOpenLink(filePath: string, workingDir?: string | null): string {
   const resolved = resolveArtifactPath(filePath, workingDir);
-  const displayName = getBaseName(resolved);
-  // Use file:// URL so the markdown renderer can turn it into a clickable link.
-  // The ContentBlockView will intercept file:// links and call showItemInFolder.
-  const fileUrl = `file:///${encodeURI(resolved).replace(/#/g, '%23').replace(/\?/g, '%3F')}`;
+  const displayName = decodeCjkPercentEncoding(getBaseName(resolved));
+  const normalizedForUrl = resolved.replace(/\\/g, '/');
+  const fileUrl = `file:///${encodeURI(normalizedForUrl).replace(/#/g, '%23').replace(/\?/g, '%3F')}`;
   return `[${displayName}](${fileUrl})`;
 }
 
@@ -130,7 +105,12 @@ export function appendFolderOpenLinks(text: string, workingDir?: string | null):
     }
   }
 
-  const lines = text.split(/\r?\n/);
+  // Decode for display: model output often contains file:// URLs or markdown
+  // links with the Chinese filename percent-encoded. Decode BEFORE splitting
+  // into lines so encoded mentions match resolved paths and no raw
+  // percent-encoded line survives into the rendered reply.
+  const decodedText = decodeCjkPercentEncoding(text);
+  const lines = decodedText.split(/\r?\n/);
   const outputLines: string[] = [...lines];
   const usedResolved = new Set<string>();
 
@@ -139,24 +119,28 @@ export function appendFolderOpenLinks(text: string, workingDir?: string | null):
 
     const folderLink = createFolderOpenLink(originalPath, workingDir);
     const displayName = getBaseName(resolvedPath);
-    const escapedName = escapeRegExp(displayName);
-    const escapedResolved = escapeRegExp(resolvedPath);
-
     let replacedFirst = false;
+
     for (let i = 0; i < outputLines.length; i += 1) {
       const line = outputLines[i] ?? '';
       if (!line.trim()) continue;
 
-      // NOTE: these patterns must escape the backslashes for the RegExp
-      // *source*. Inside a template literal `\[` collapses to `[` and `\b` is
-      // U+0008 (backspace), so the previous version silently compiled
-      // `[microservice-arch\.png]([^)]+)` — a CHARACTER CLASS whose `h-.`
-      // range is invalid. Any generated filename containing `-` threw
-      // "Range out of order in character class" while rendering a message,
-      // which the panel error boundary turned into a blank conversation.
+      // Plain string containment checks — avoid building any RegExp from the
+      // generated filename. That prevents malformed patterns when filenames
+      // contain CJK characters, hyphens, or other punctuation (upstream used
+      // un-escaped template-literal RegExps and blanked the conversation on
+      // "Range out of order in character class").
+      const lowerLine = line.toLowerCase();
+      const lowerName = displayName.toLowerCase();
+      const lowerResolved = resolvedPath.toLowerCase();
+      // 整行就是文件名 / 行内含完整路径 / 行内是 markdown 文件链接，三种都算命中。
+      // includes() 只用于判定，不用来替换，所以同行提到多个文件时
+      // 只有第一次命中被折叠成链接，其余行按重复提及清理。
       const hasFilename = line.trim().toLowerCase() === displayName.toLowerCase();
-      const hasResolvedPath = new RegExp(escapedResolved, 'i').test(line);
-      const hasMarkdownLink = new RegExp(`\\[${escapedName}\\]\\([^)]+\\)`, 'i').test(line);
+      const hasResolvedPath = lowerLine.includes(lowerResolved);
+      const hasMarkdownLink =
+        line.includes(`[${displayName}](`) ||
+        (lowerLine.includes(lowerName) && line.includes(']('));
 
       if (!hasFilename && !hasResolvedPath && !hasMarkdownLink) {
         continue;

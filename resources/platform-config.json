@@ -1,5 +1,5 @@
 {
-  "platform": "linux",
-  "prettyName": "uos",
+  "platform": "darwin",
+  "prettyName": "macos",
   "shell": "/bin/bash"
 }

@@ -87,6 +87,15 @@ win:
       to: platform-config.json
     - from: .claude/skills
       to: skills
+    - from: resources/ffmpeg
+      to: ffmpeg
+    # Whisper 模型（medium ≈1.5GB）故意不打包：安装体积会从 ~230MB 涨到 ~1.5GB。
+    # 运行时若 resourcesPath/whisper-models 不存在，主进程自动回退到
+    # userData/models/whisper，asr-transcribe 技能首次转写时经 hf-mirror 下载。
+    # 需要完全离线（内网/涉密交付）时，把模型放进 resources/whisper-models/
+    # 并临时恢复下面这行即可：
+    # - from: resources/whisper-models
+    #   to: whisper-models
 
 mac:
   icon: resources/icon.icns

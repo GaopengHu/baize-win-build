@@ -9,6 +9,31 @@ export function decodePathSafely(value: string): string {
   }
 }
 
+// Percent-encoded runs that decode to CJK are almost always a URL-encoded
+// Chinese filename leaking into display text (LLMs often echo `file://` URLs
+// or markdown links with the name percent-encoded: %E8%A5%BF...docx).
+// Decoding only CJK-bearing runs keeps legitimate escapes (%20, %23, %E2%80%8B
+// without CJK, and non-CJK URLs) untouched.
+const CJK_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3000-\u303f]/;
+const PERCENT_RUN_PATTERN = /(?:%[0-9A-Fa-f]{2})+/g;
+
+export function decodeCjkPercentEncoding(value: string): string {
+  if (!value || !value.includes('%')) {
+    return value;
+  }
+  return value.replace(PERCENT_RUN_PATTERN, (run) => {
+    try {
+      const decoded = decodeURIComponent(run);
+      if (decoded !== run && CJK_PATTERN.test(decoded)) {
+        return decoded;
+      }
+    } catch {
+      /* malformed escape sequence — leave as-is */
+    }
+    return run;
+  });
+}
+
 export function isWindowsDrivePath(value: string): boolean {
   return windowsDrivePathPattern.test(value);
 }

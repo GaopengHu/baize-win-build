@@ -1,0 +1,13 @@
+{
+  "slug": "generate-chart",
+  "name": "智能数据可视化",
+  "version": "1.0.0",
+  "installedAt": 1788143407732,
+  "source": "skillhub",
+  "iconSource": "https://cloudcache.tencent-cloud.com/qcloud/ui/static/other_external_resource/a4e49550-e527-4406-b761-c4f2e607b757.png",
+  "labels": {
+    "requires_api_key": "false"
+  },
+  "iconLocalPath": "C:\\Users\\lenovo\\.workbuddy\\skills\\generate-chart__skillhub\\_icon.png",
+  "iconDownloadedFrom": "https://cloudcache.tencent-cloud.com/qcloud/ui/static/other_external_resource/a4e49550-e527-4406-b761-c4f2e607b757.png"
+}

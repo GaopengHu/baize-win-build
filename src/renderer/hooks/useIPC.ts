@@ -15,6 +15,18 @@ import i18n from '../i18n/config';
 // Check if running in Electron
 const isElectron = typeof window !== 'undefined' && window.electronAPI !== undefined;
 
+// Unique local id generator. Two messages sent within the same millisecond
+// used to collide on `msg-user-${Date.now()}`, which broke the store's
+// turn-anchor lookup (assistant replies inserted after the wrong message —
+// the observed "response stream confusion" after rapid sends / pause-resume).
+function nextLocalId(prefix: string): string {
+  const cryptoApi = typeof crypto !== 'undefined' ? crypto : undefined;
+  if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+    return `${prefix}-${cryptoApi.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 // Module-level singleton guard so only the FIRST useIPC() caller installs the
 // server-event listener. Other callers (PermissionDialog, Sidebar, ChatView,
 // etc.) still get the callback API but must NOT re-register the listener —
@@ -23,9 +35,94 @@ const isElectron = typeof window !== 'undefined' && window.electronAPI !== undef
 // listener, silently dropping subsequent events from main.
 let ipcListenerInstalled = false;
 
-// --- RAF batching buffers (module-level so useCallback can access) ---
+// RAF batching buffers (module-level so useCallback can access) + per-session
+// turn scopes for sidebar status marking.
 const pendingPartials: Record<string, string[]> = {};
 const pendingThinking: Record<string, string[]> = {};
+// 本轮起点时间戳：session.status=running 时记录，用于把"最终回答"判定
+// 限定在本轮产生的消息内（历史上旧回答不能让停止/超时的任务误打绿勾）。
+const turnStartedAt: Record<string, number> = {};
+
+// Post-stop grace: when a running turn is stopped, the main process persists
+// whatever was partially streamed and re-emits it as a regular message
+// (stream.message) right before the session goes idle. The renderer must NOT
+// wipe the live partial buffer the instant it stops — that is what made the
+// visible reply vanish while only the trace panel survived. Instead, poll
+// briefly: once the persisted message lands, addMessage() clears the partial
+// buffers itself and reuses the same round anchor, and this poll finishes the
+// turn teardown. A hard timeout restores the old (clear-everything) behavior
+// if the persistence message never arrives.
+const postStopGraceTimers = new Map<
+  string,
+  { poll: ReturnType<typeof setInterval>; hardStop: ReturnType<typeof setTimeout> }
+>();
+
+function disarmPostStopGrace(sessionId: string): void {
+  const entry = postStopGraceTimers.get(sessionId);
+  if (entry) {
+    clearInterval(entry.poll);
+    clearTimeout(entry.hardStop);
+    postStopGraceTimers.delete(sessionId);
+  }
+}
+
+// 本轮是否产出了真正的最终回答（作用域限定到本轮，避免历史消息误判）。
+// 排除：抢救的半截回复（含"已停止"）、超时/错误/重试等系统提示、tool_result 中间消息。
+const NON_FINAL_TEXT_RE =
+  /已停止|本轮没有收到|请求超时|重试也失败|自动重试|正在重建会话|正在重试|上一轮/;
+function isGenuineFinalMessage(m: Message, sinceTs: number | null): boolean {
+  if (m.role !== 'assistant' || m.localStatus) return false;
+  if (sinceTs != null && (m.timestamp ?? 0) < sinceTs - 1000) return false;
+  const blocks = m.content ?? [];
+  let hasThinking = false;
+  for (const b of blocks) {
+    if (b.type === 'thinking' && (b.thinking ?? '').trim()) hasThinking = true;
+    if (b.type === 'text') {
+      const t = (b.text ?? '').trim();
+      if (!t) continue;
+      if (NON_FINAL_TEXT_RE.test(t)) continue;
+      if (t.startsWith('**Error**') || t.startsWith('**提示**')) continue;
+      return true;
+    }
+  }
+  return hasThinking;
+}
+
+function hasGenuineFinalSince(sessionId: string, sinceTs: number | null): boolean {
+  if (sinceTs == null) return false;
+  const ss = useAppStore.getState().sessionStates[sessionId];
+  return Boolean((ss?.messages ?? []).some((m) => isGenuineFinalMessage(m, sinceTs)));
+}
+
+function armPostStopGrace(sessionId: string): void {
+  disarmPostStopGrace(sessionId);
+  const poll = setInterval(() => {
+    const state = useAppStore.getState();
+    const session = state.sessions.find((s) => s.id === sessionId);
+    // A new turn already started — its lifecycle owns the buffers now.
+    if (session?.status === 'running') {
+      disarmPostStopGrace(sessionId);
+      return;
+    }
+    const ss = state.sessionStates[sessionId];
+    // The persisted capture message landed (addMessage cleared the buffers) —
+    // finish the teardown now.
+    if (!ss?.partialMessage && !ss?.partialThinking) {
+      state.clearActiveTurn(sessionId);
+      disarmPostStopGrace(sessionId);
+    }
+  }, 250);
+  const hardStop = setTimeout(() => {
+    disarmPostStopGrace(sessionId);
+    const state = useAppStore.getState();
+    const session = state.sessions.find((s) => s.id === sessionId);
+    if (session?.status === 'running') return;
+    state.clearPartialMessage(sessionId);
+    state.clearPartialThinking(sessionId);
+    state.clearActiveTurn(sessionId);
+  }, 5000);
+  postStopGraceTimers.set(sessionId, { poll, hardStop });
+}
 
 export function useIPC() {
   // Handle incoming server events - only setup once across all useIPC() callers.
@@ -140,16 +237,41 @@ export function useIPC() {
             store.updateSession(event.payload.sessionId, {
               status: event.payload.status,
             });
-            if (event.payload.status !== 'running') {
-              store.finishExecutionClock(event.payload.sessionId);
-              store.setLoading(false);
+            if (event.payload.status === 'running') {
+              // 新一轮开始：结局未知，先清掉上一轮的 completed/stopped，
+              // 侧边栏回到运行中（… + 黄），杜绝"还在跑却挂着绿勾"。
+              // 同时记录本轮起点，后续"最终回答"判定只看本轮消息。
+              // 注意：停止会先发 idle（见 stopSession）再发 running，双事件都会
+              // 到；running 最后到即覆盖，保证追问启动时结局恒为 null。
+              turnStartedAt[event.payload.sessionId] = Date.now();
+              store.setLastTurnOutcome(event.payload.sessionId, null);
+              break;
+            }
+            // 走到这里 status 一定不是 running（上面已 break），直接处理收尾。
+            store.finishExecutionClock(event.payload.sessionId);
+            store.setLoading(false);
+            const sinceTs = turnStartedAt[event.payload.sessionId] ?? null;
+            const ss = useAppStore.getState().sessionStates[event.payload.sessionId];
+            const hasLivePartial = Boolean(ss?.partialMessage || ss?.partialThinking);
+            if (hasLivePartial) {
+              // 回复流到一半回合结束（用户停止或网关中断）：不立刻定结局，
+              // 等持久化的 stream.message 落定后再判定（见 stream.message）。
+              store.clearPendingTurns(event.payload.sessionId);
+              store.clearQueuedMessages(event.payload.sessionId);
+              armPostStopGrace(event.payload.sessionId);
+            } else {
+              // 流式缓冲已空：本轮有真正的最终回答 = 正常完成
+              // （completed + 绿勾），否则是停止/中止（stopped，不打勾）。
+              const completed = hasGenuineFinalSince(event.payload.sessionId, sinceTs);
+              store.setLastTurnOutcome(
+                event.payload.sessionId,
+                completed ? 'completed' : 'stopped'
+              );
               store.clearActiveTurn(event.payload.sessionId);
               store.clearPendingTurns(event.payload.sessionId);
               store.clearQueuedMessages(event.payload.sessionId);
               delete pendingPartials[event.payload.sessionId];
               delete pendingThinking[event.payload.sessionId];
-              store.clearPartialMessage(event.payload.sessionId);
-              store.clearPartialThinking(event.payload.sessionId);
             }
             break;
 
@@ -163,6 +285,30 @@ export function useIPC() {
             // Clear thinking buffer too — final thinking is in the message content blocks
             delete pendingThinking[event.payload.sessionId];
             store.addMessage(event.payload.sessionId, event.payload.message);
+            // 停止后宽限期内到达的持久化半截回复：确认是"已停止"性质的
+            // 消息则把结局定为 stopped（不打勾）；正常流式结束到达的最终
+            // 回答则在此处立即定 completed——它往往先于 session.status(idle)
+            // 到达，提前落定可以让侧边栏绿勾更跟手。
+            {
+              const msg = event.payload.message;
+              if (msg.role === 'assistant' && !msg.localStatus) {
+                const sessionId = event.payload.sessionId;
+                const session = useAppStore
+                  .getState()
+                  .sessions.find((s) => s.id === sessionId);
+                if (session?.status !== 'running') {
+                  const text = (msg.content ?? [])
+                    .filter((b) => b.type === 'text')
+                    .map((b) => (b as { text?: string }).text ?? '')
+                    .join('\n');
+                  if (/已停止|本轮未输出正文/.test(text)) {
+                    store.setLastTurnOutcome(sessionId, 'stopped');
+                  } else if (isGenuineFinalMessage(msg, turnStartedAt[sessionId] ?? null)) {
+                    store.setLastTurnOutcome(sessionId, 'completed');
+                  }
+                }
+              }
+            }
             break;
 
           case 'stream.partial':
@@ -461,7 +607,7 @@ export function useIPC() {
         useAppStore.getState().setActiveSession(sessionId);
 
         const userMessage: Message = {
-          id: `msg-user-${Date.now()}`,
+          id: nextLocalId('msg-user'),
           sessionId,
           role: 'user',
           content,
@@ -507,7 +653,7 @@ export function useIPC() {
 
           // Immediately add user message to UI
           const userMessage: Message = {
-            id: `msg-user-${Date.now()}`,
+            id: nextLocalId('msg-user'),
             sessionId: session.id,
             role: 'user',
             content,
@@ -570,7 +716,7 @@ export function useIPC() {
       const hasPending = (ss?.pendingTurns?.length ?? 0) > 0;
       const shouldQueue = isSessionRunning || hasActiveTurn || hasPending;
       const userMessage: Message = {
-        id: `msg-user-${Date.now()}`,
+        id: nextLocalId('msg-user'),
         sessionId,
         role: 'user',
         content,
@@ -604,7 +750,9 @@ export function useIPC() {
         return;
       }
 
-      // Clear stale streaming buffers from previous aborted turns
+      // Clear stale streaming buffers from previous aborted turns, and cancel
+      // any pending post-stop grace from a previous stop.
+      disarmPostStopGrace(sessionId);
       delete pendingPartials[sessionId];
       delete pendingThinking[sessionId];
       useAppStore.getState().clearPartialMessage(sessionId);
@@ -653,13 +801,19 @@ export function useIPC() {
     (sessionId: string) => {
       cancelQueuedMessages(sessionId);
       clearPendingTurns(sessionId);
-      clearActiveTurn(sessionId);
       finishExecutionClock(sessionId);
-      delete pendingPartials[sessionId];
-      delete pendingThinking[sessionId];
-      useAppStore.getState().clearPartialMessage(sessionId);
-      useAppStore.getState().clearPartialThinking(sessionId);
+      // Keep the active turn and the live partial buffers visible. The main
+      // process persists the partially-streamed reply and re-emits it as
+      // stream.message; wiping here would blank the visible reply instantly
+      // (the reported "disappears on pause" bug). The grace poll armed via
+      // the session.status(idle) event finishes the teardown once the
+      // persisted message lands.
       if (!isElectron) {
+        clearActiveTurn(sessionId);
+        delete pendingPartials[sessionId];
+        delete pendingThinking[sessionId];
+        useAppStore.getState().clearPartialMessage(sessionId);
+        useAppStore.getState().clearPartialThinking(sessionId);
         updateSession(sessionId, { status: 'idle' });
         setLoading(false);
         return;

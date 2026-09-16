@@ -52,7 +52,7 @@ type TabId =
 
 // Tabs kept functional but hidden from the settings sidebar.
 // They remain reachable programmatically (e.g. via nav-server __navigate).
-const HIDDEN_TABS = new Set<TabId>(['schedule', 'remote']);
+const HIDDEN_TABS = new Set<TabId>(['remote']);
 
 const VALID_TABS = new Set<TabId>([
   'api',

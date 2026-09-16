@@ -221,26 +221,21 @@ export function SettingsAPI() {
                       }}
                       className="w-full text-left min-w-0"
                     >
-                      <div className="flex items-start gap-3">
-                        <div className="mt-0.5 flex-shrink-0">
-                          <HealthIcon state={health} />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <p className="text-sm font-medium text-text-primary truncate">
-                              {set.name}
-                            </p>
-                            {isActive && <Check className="w-3.5 h-3.5 text-accent shrink-0" />}
-                          </div>
-                          <p className="text-[11px] text-text-muted truncate mt-0.5">
-                            {set.provider === 'custom'
-                              ? `${t('api.moreModels', '自定义')} · ${set.customProtocol.toUpperCase()}`
-                              : presets?.[set.provider]?.name || set.provider}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <p className="text-sm font-medium text-text-primary truncate">
+                            {set.name}
                           </p>
-                          <p className="text-[11px] text-text-secondary truncate mt-0.5">
-                            {modelName}
-                          </p>
+                          {isActive && <Check className="w-3.5 h-3.5 text-accent shrink-0" />}
                         </div>
+                        <p className="text-[11px] text-text-muted truncate mt-0.5">
+                          {set.provider === 'custom'
+                            ? `${t('api.moreModels', '自定义')} · ${set.customProtocol.toUpperCase()}`
+                            : presets?.[set.provider]?.name || set.provider}
+                        </p>
+                        <p className="text-[11px] text-text-secondary truncate mt-0.5">
+                          {modelName}
+                        </p>
                       </div>
                     </button>
 
@@ -319,19 +314,14 @@ export function SettingsAPI() {
                 </div>
                 <p className="mt-1 text-xs text-text-muted">{activeSetSummary}</p>
               </div>
-              <div className="flex items-center gap-2">
-                <div className="rounded-full border border-border-muted bg-background px-3 py-1.5 text-[11px] text-text-muted">
-                  {currentConfigSet.id}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setEditorOpen(false)}
-                  className="w-8 h-8 rounded-lg border border-border-muted bg-background hover:bg-surface-hover text-text-secondary transition-colors flex items-center justify-center"
-                  title={t('common.close')}
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => setEditorOpen(false)}
+                className="w-8 h-8 rounded-lg border border-border-muted bg-background hover:bg-surface-hover text-text-secondary transition-colors flex items-center justify-center"
+                title={t('common.close')}
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
             </div>
 
             <div className="p-5 space-y-5 max-h-[calc(100vh-230px)] overflow-y-auto">

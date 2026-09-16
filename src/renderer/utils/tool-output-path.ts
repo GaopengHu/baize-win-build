@@ -1,3 +1,5 @@
+import { decodeCjkPercentEncoding, localPathFromFileUrl } from '../../shared/local-file-path';
+
 type ParsedOutput = {
   path?: string;
   filePath?: string;
@@ -15,8 +17,13 @@ type ParsedInput = {
 };
 
 export function normalizeArtifactPathValue(value: string): string {
-  return value
-    .trim()
+  // file:// URLs from model output are decoded to plain local paths so the
+  // artifacts panel and file buttons show the real Chinese filename.
+  let decoded = value.trim();
+  if (/^file:\/\//i.test(decoded)) {
+    decoded = localPathFromFileUrl(decoded) ?? decoded;
+  }
+  return decodeCjkPercentEncoding(decoded)
     .replace(/^[\s>*\-•`"']+/, '')
     .replace(/^[\[](.+)[\]]$/, '$1')
     .replace(/^\((.+)\)$/, '$1')
@@ -31,6 +38,11 @@ export function normalizeArtifactPathValue(value: string): string {
  */
 function isInsideUrlToken(text: string, matchIndex: number, matchLength: number): boolean {
   const before = text.slice(0, matchIndex);
+  // The regex can start a match mid-URL (e.g. at the second slash of `://`),
+  // in which case the scheme separator is cut in half right before the match.
+  if (text.slice(Math.max(0, matchIndex - 2), matchIndex) === ':/') {
+    return true;
+  }
   const schemeIdx = before.lastIndexOf('://');
   if (schemeIdx === -1) {
     return false;
@@ -102,23 +114,34 @@ export function extractFilePathCandidatesFromText(text: string): string[] {
 
   const markdownLinkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
   let match: RegExpExecArray | null;
-  while ((match = markdownLinkRegex.exec(trimmed)) !== null) {
+  const trimmedForLinks = decodeCjkPercentEncoding(trimmed);
+  while ((match = markdownLinkRegex.exec(trimmedForLinks)) !== null) {
     const href = match[2]?.trim();
     if (href) {
       candidates.add(normalizeArtifactPathValue(href));
     }
   }
 
-  // Match file paths with Chinese filenames support.
-  // Captures: optional drive letter + path separators + filename with known extension.
+  // Match local file paths with Chinese filenames support.
+  // file:// URLs are decoded to plain paths FIRST so downstream consumers
+  // always see real filenames (never `…%E8%A5%BF…`). URLs on remote schemes
+  // (https://host/README.md) are skipped by isInsideUrlToken.
+  const decodedForScan = /file:\/\//i.test(trimmed)
+    ? decodeCjkPercentEncoding(trimmed)
+    : trimmed;
+  // Captures: optional root (drive letter or POSIX leading slash) + chained path
+  // segments + filename with known extension. Each segment consumes its OWN
+  // trailing separator so multi-segment paths match in full — the previous
+  // pattern `[\\/][\w...]+[\\/]` swallowed the next segment's leading separator
+  // and only ever captured path tails (broke the artifacts panel on Windows).
   // NOTE: filename charset intentionally excludes CJK punctuation (U+3000-303F) so
   // things like "总结。docx" or "要点、png" are never treated as files.
-  const pathLikeRegex = /(?:[A-Za-z]:[\\/]|[\\/][\w\u4e00-\u9fff.\-_]+[\\/])*([\w\u4e00-\u9fff.\-_]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/giu;
-  for (const found of trimmed.matchAll(pathLikeRegex)) {
+  const pathLikeRegex = /(?:[A-Za-z]:[\\/]|\/)?(?:[\w\u4e00-\u9fff.\-_]+[\\/])*[\w\u4e00-\u9fff.\-_]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz)/giu;
+  for (const found of decodedForScan.matchAll(pathLikeRegex)) {
     const index = typeof found.index === 'number' ? found.index : -1;
     // Skip matches that live inside a URL token (e.g. https://host/README.md),
     // otherwise URLs would produce phantom artifacts.
-    if (index >= 0 && isInsideUrlToken(trimmed, index, found[0].length)) {
+    if (index >= 0 && isInsideUrlToken(decodedForScan, index, found[0].length)) {
       continue;
     }
     const value = found[0].trim();
@@ -155,8 +178,8 @@ function extractFilePathFromText(text: string): string | null {
     || text.match(/The file (.+?) has been updated(?: successfully)?(?:\.|$)/i)
     || text.match(/Saved screenshot to ([^\r\n]+)/i)
     // Chinese patterns: 文件已生成/已创建/已保存/已写入/路径
-    || text.match(/(?:已生成|已创建|已保存|已写入|已导出|路径|保存到|生成到|输出到|写入到|创建到)[:：\s]*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i)
-    || text.match(/(?:文件|报告|文档|演示文稿|表格|幻灯片)[:：\s]*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i);
+    || text.match(/(?:已生成|已创建|已保存|已写入|已导出|路径|保存到|生成到|输出到|写入到|创建到)[:：\s]*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i)
+    || text.match(/(?:文件|报告|文档|演示文稿|表格|幻灯片)[:：\s]*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i);
   if (!match || !match[1]) {
     return null;
   }
