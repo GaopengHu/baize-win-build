@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import {
+  extractBetween,
+  extractBlockAfter,
+  extractNearestBefore,
+  nonTrivialLines,
+  preambleBefore,
+  stripLineComments,
+  windowAfter,
+} from './helpers/agent-runner-extract';
 
 const agentRunnerPath = path.resolve(process.cwd(), 'src/main/claude/agent-runner.ts');
 const agentRunnerContent = readFileSync(agentRunnerPath, 'utf8');
@@ -11,6 +20,10 @@ const agentRunnerContent = readFileSync(agentRunnerPath, 'utf8');
  * controller.abort(), the AbortError ended up in the generic "Aborted by
  * user" branch which overwrote the loop-guard's 'error' trace step with
  * status:'completed', title:'Cancelled'.
+ *
+ * 断言已按 AGENT-RUNNER-REFACTOR-PLAN.md §5.0.1 L4 迁移为结构化匹配
+ * （tests/helpers/agent-runner-extract.ts），不再依赖固定字符偏移窗口，
+ * 以便 Phase 1-6 物理移动代码时只需换文件路径、不需重调偏移量。
  */
 describe('agent-runner loop-guard abort preserves error trace status', () => {
   it('declares an abortedByLoopGuard flag in the prompt() scope', () => {
@@ -20,29 +33,20 @@ describe('agent-runner loop-guard abort preserves error trace status', () => {
   it('sets the flag immediately before controller.abort() in handleLoopGuardDecision', () => {
     // The assignment must appear in the loop-guard block AND must precede the
     // controller.abort() call so the AbortError handler sees the flag.
-    const setIdx = agentRunnerContent.indexOf('abortedByLoopGuard = true;');
-    expect(setIdx).toBeGreaterThan(-1);
-
-    const abortIdx = agentRunnerContent.indexOf('controller.abort();', setIdx);
-    expect(abortIdx).toBeGreaterThan(setIdx);
-
+    const between = extractBetween(
+      agentRunnerContent,
+      'abortedByLoopGuard = true;',
+      'controller.abort();'
+    );
     // No other lines should sneak between the flag set and the abort call —
     // keep them adjacent so the intent is obvious.
-    const between = agentRunnerContent.slice(setIdx, abortIdx);
-    const nonTrivialLines = between
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith('//'));
-    expect(nonTrivialLines.length).toBeLessThanOrEqual(2);
+    const nonTrivial = nonTrivialLines(between);
+    expect(nonTrivial.length).toBeLessThanOrEqual(2);
   });
 
   it('the AbortError catch branch checks abortedByLoopGuard before falling into the user-cancel branch', () => {
-    // Pull out the AbortError handler block for inspection.
-    const start = agentRunnerContent.indexOf("error.name === 'AbortError'");
-    expect(start).toBeGreaterThan(-1);
-    const end = agentRunnerContent.indexOf('} else {', start);
-    expect(end).toBeGreaterThan(start);
-    const block = agentRunnerContent.slice(start, end + 800);
+    // Pull out the AbortError handler block for inspection (brace-balanced).
+    const block = extractBlockAfter(agentRunnerContent, "error.name === 'AbortError'");
 
     // The branch for loop-guard must exist and must be reached BEFORE the
     // generic "Aborted by user" path that emits 'Cancelled'.
@@ -56,20 +60,14 @@ describe('agent-runner loop-guard abort preserves error trace status', () => {
     // Capture the loop-guard branch body and assert the executable code
     // contains neither sendTraceUpdate nor a 'Cancelled' literal — the guard
     // already published the error trace.
-    const branchStart = agentRunnerContent.indexOf(
+    const branch = extractBlockAfter(
+      agentRunnerContent,
       "} else if (abortDisposition === 'loop_guard') {"
     );
-    expect(branchStart).toBeGreaterThan(-1);
-    const branchEnd = agentRunnerContent.indexOf('} else {', branchStart);
-    expect(branchEnd).toBeGreaterThan(branchStart);
-    const branch = agentRunnerContent.slice(branchStart, branchEnd);
 
     // Strip single-line comments so the explanatory prose can mention
     // "Cancelled" without tripping the assertion.
-    const codeOnly = branch
-      .split('\n')
-      .map((line) => line.replace(/\/\/.*$/, ''))
-      .join('\n');
+    const codeOnly = stripLineComments(branch);
 
     expect(codeOnly).not.toContain('Cancelled');
     expect(codeOnly).not.toContain('sendTraceUpdate');
@@ -89,9 +87,11 @@ describe('agent-runner loop-guard abort preserves error trace status', () => {
     // The trace update with status:'error' and the loop-detected title must
     // stay in place so the catch branch has something to preserve.
     expect(agentRunnerContent).toContain("title: 'Stopped: tool-call loop detected'");
-    const titleIdx = agentRunnerContent.indexOf("title: 'Stopped: tool-call loop detected'");
-    const localStart = agentRunnerContent.lastIndexOf('sendTraceUpdate', titleIdx);
-    const localBlock = agentRunnerContent.slice(localStart, titleIdx);
+    const localBlock = extractNearestBefore(
+      agentRunnerContent,
+      'sendTraceUpdate',
+      "title: 'Stopped: tool-call loop detected'"
+    );
     expect(localBlock).toContain("status: 'error'");
   });
 
@@ -106,17 +106,17 @@ describe('agent-runner loop-guard abort preserves error trace status', () => {
     // an `if (!hasEmittedError)` gate, and the assignment to hasEmittedError
     // should follow the sendMessage so the suppression intent is preserved for
     // later generic-error paths.
-    const sendIdx = agentRunnerContent.indexOf('text: buildAbortUserMessage(decision)');
-    expect(sendIdx).toBeGreaterThan(-1);
+    const anchor = 'text: buildAbortUserMessage(decision)';
+    expect(agentRunnerContent).toContain(anchor);
 
-    // The 200 chars immediately before the sendMessage must not contain a
+    // The chars immediately before the sendMessage must not contain a
     // bare `if (!hasEmittedError) {` gate (i.e., the old suppression check).
-    const preamble = agentRunnerContent.slice(Math.max(0, sendIdx - 400), sendIdx);
+    const preamble = preambleBefore(agentRunnerContent, anchor, 400);
     expect(preamble).not.toMatch(/if\s*\(\s*!hasEmittedError\s*\)\s*\{/);
 
     // hasEmittedError should be assigned AFTER the sendMessage to suppress
     // duplicate generic errors later in this turn, not before.
-    const trailing = agentRunnerContent.slice(sendIdx, sendIdx + 400);
+    const trailing = windowAfter(agentRunnerContent, anchor, 400);
     expect(trailing).toContain('hasEmittedError = true');
   });
 });

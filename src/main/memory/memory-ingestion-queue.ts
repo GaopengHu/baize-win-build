@@ -1,17 +1,13 @@
+import { AsyncChain } from '../utils/async-chain';
+
+/**
+ * 记忆摄入队列：按 sessionId 串行执行 ingest 任务。
+ * 薄包装 AsyncChain<string>（AGENT-RUNNER-REFACTOR-PLAN.md §5.0.2）。
+ */
 export class MemoryIngestionQueue {
-  private readonly chains = new Map<string, Promise<void>>();
+  private readonly chain = new AsyncChain<string>();
 
   enqueue(key: string, task: () => Promise<void>): Promise<void> {
-    const previous = this.chains.get(key) || Promise.resolve();
-    const next = previous.catch(() => undefined).then(task);
-    this.chains.set(
-      key,
-      next.finally(() => {
-        if (this.chains.get(key) === next) {
-          this.chains.delete(key);
-        }
-      })
-    );
-    return next;
+    return this.chain.enqueue(key, task);
   }
 }
