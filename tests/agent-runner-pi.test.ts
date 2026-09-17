@@ -5,6 +5,12 @@ import path from 'node:path';
 const agentRunnerPath = path.resolve(process.cwd(), 'src/main/claude/agent-runner.ts');
 const agentRunnerContent = readFileSync(agentRunnerPath, 'utf8');
 
+// Phase 1 迁移：以下模块从 agent-runner.ts 拆出，源码文本断言随之指向新文件。
+const pipelineUtilsPath = path.resolve(process.cwd(), 'src/main/claude/pipeline/utils.ts');
+const pipelineUtilsContent = readFileSync(pipelineUtilsPath, 'utf8');
+const mcpToolBridgePath = path.resolve(process.cwd(), 'src/main/claude/tools/mcp-tool-bridge.ts');
+const mcpToolBridgeContent = readFileSync(mcpToolBridgePath, 'utf8');
+
 describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   it('avoids dynamic re-import shadowing for config store singletons', () => {
     expect(agentRunnerContent).toContain(
@@ -16,10 +22,17 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
     expect(agentRunnerContent).not.toContain(
       "const { mcpConfigStore } = await import('../mcp/mcp-config-store')"
     );
+    // mcp-tool-bridge（Phase 1 拆出）同样必须走静态 import，不得动态 re-import 单例
+    expect(mcpToolBridgeContent).toContain(
+      "import type { MCPManager } from '../../mcp/mcp-manager'"
+    );
+    expect(mcpToolBridgeContent).not.toContain('await import(');
   });
 
   it('keeps MCP config build resilient', () => {
-    expect(agentRunnerContent).toContain('function safeStringify');
+    // safeStringify 已迁至 pipeline/utils.ts（Phase 1）
+    expect(pipelineUtilsContent).toContain('export function safeStringify');
+    expect(agentRunnerContent).toContain("from './pipeline/utils'");
     expect(agentRunnerContent).toContain('Failed to prepare MCP server config, skipping server');
   });
 
@@ -98,17 +111,23 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   });
 
   it('routes MCP image results through structured helpers instead of stringifying base64 into text', () => {
-    expect(agentRunnerContent).toContain(
-      "import {\n  normalizeMcpToolResultForModel,\n  normalizeToolExecutionResultForUi,\n} from './tool-result-utils'"
+    // Phase 1 迁移：buildMcpCustomTools（含 normalizeMcpToolResultForModel 调用）
+    // 移入 tools/mcp-tool-bridge.ts；UI 侧 normalizeToolExecutionResultForUi 留在 agent-runner。
+    expect(mcpToolBridgeContent).toContain(
+      "import { normalizeMcpToolResultForModel } from '../tool-result-utils'"
+    );
+    expect(mcpToolBridgeContent).toContain(
+      'const normalizedResult = normalizeMcpToolResultForModel(result);'
     );
     expect(agentRunnerContent).toContain(
-      'const normalizedResult = normalizeMcpToolResultForModel(result);'
+      "import { normalizeToolExecutionResultForUi } from './tool-result-utils'"
     );
     expect(agentRunnerContent).toContain(
       'const normalizedToolResult = normalizeToolExecutionResultForUi(event.result);'
     );
     expect(agentRunnerContent).not.toContain('else textParts.push(JSON.stringify(part));');
     expect(agentRunnerContent).not.toContain(": JSON.stringify(event.result || '');");
+    expect(mcpToolBridgeContent).not.toContain('JSON.stringify(result');
   });
 
   it('persists assistant model metadata for pi-ai thinking replay', () => {

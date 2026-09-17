@@ -21,7 +21,6 @@ import {
   type AgentSession as PiAgentSession,
   type ToolDefinition,
 } from '@mariozechner/pi-coding-agent';
-import { Type, type TSchema } from '@sinclair/typebox';
 import { getSharedAuthStorage, ModelRegistry } from './shared-auth';
 import type { Session, Message, TraceStep, ServerEvent, ContentBlock } from '../../renderer/types';
 import { v4 as uuidv4 } from 'uuid';
@@ -41,8 +40,7 @@ import {
 } from '../utils/logger';
 import * as path from 'path';
 import * as fs from 'fs';
-import * as os from 'os';
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync } from 'child_process';
 import { app } from 'electron';
 import { setMaxListeners } from 'node:events';
 import { getSandboxAdapter } from '../sandbox/sandbox-adapter';
@@ -90,509 +88,31 @@ import {
   type LoopGuardDecision,
   type ToolCallDescriptor,
 } from './agent-runner-loop-guard';
-import {
-  normalizeMcpToolResultForModel,
-  normalizeToolExecutionResultForUi,
-} from './tool-result-utils';
+import { normalizeToolExecutionResultForUi } from './tool-result-utils';
 import { fetchOllamaModelInfo } from '../config/ollama-api';
 import { createWindowsBashOperations } from './windows-bash-operations';
+import { estimateCharsPerToken } from './pipeline/context-types';
+import {
+  enrichProcessPathForBuild,
+  getBundledNodePaths,
+  resolveBundledPythonBinDir,
+} from './pipeline/path-utils';
+import {
+  normalizeTokenUsage,
+  safeStringify,
+  summarizeMessageForLog,
+  toErrorText,
+} from './pipeline/utils';
+import { serializeMessageContentForHistory } from './pipeline/cold-start-history';
+import { buildMcpCustomTools } from './tools/mcp-tool-bridge';
+import { wrapBashToolForSudo, wrapBashToolWithDefaultTimeout } from './tools/bash-tool-wrappers';
+
+// 冷启动历史序列化器已迁至 pipeline/cold-start-history.ts（Phase 1）；
+// 此处 re-export 保持外部导入方（如 src/tests/claude/agent-runner-history-rebuild.test.ts）兼容。
+export { serializeMessageContentForHistory };
 
 // Virtual workspace path shown to the model (hides real sandbox path)
 const VIRTUAL_WORKSPACE_PATH = '/workspace';
-
-/**
- * Estimate chars-per-token ratio based on content language.
- * CJK characters tokenize at ~1.5 chars/token vs ~4 for English.
- */
-function estimateCharsPerToken(sampleText: string): number {
-  if (!sampleText || sampleText.length === 0) return 4;
-  const sample = sampleText.substring(0, 500);
-  const cjkCount = (sample.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || [])
-    .length;
-  const cjkRatio = cjkCount / sample.length;
-  return 4 - cjkRatio * 2.5; // Range: 1.5 (pure CJK) ~ 4 (pure English)
-}
-
-// Escape characters that would break the cold-start `<conversation_history>`
-// envelope when interpolated into XML tag bodies or attribute values. Raw user
-// text blocks are intentionally not escaped (preserves legacy compatibility);
-// only the new wrapper tags (`<thinking>`, `<tool_use>`, `<tool_result>`) and
-// their attributes pass through these.
-//
-// Attribute values additionally need `"` escaped because attributes are
-// double-quoted. Tag bodies do not (keeping `"` keeps JSON input legible to
-// the model).
-function escapeXmlAttr(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function escapeXmlText(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-/**
- * Serialize a message's content blocks into the XML representation used inside the
- * cold-start `<conversation_history>` preamble.
- *
- * Why this exists: when the cached pi-coding-agent SDK session is disposed (cwd
- * change or runtime-signature change), agent-runner rebuilds history from
- * DB-persisted messages. The previous implementation only kept `text` blocks,
- * which silently dropped `thinking`, `tool_use`, and `tool_result` blocks.
- * Providers that require previous reasoning/tool-call replay (e.g. DeepSeek V4
- * Flash) then fail with 400 on the next turn, and every other thinking-capable
- * model loses its reasoning trace across cwd switches (issue #162 \u2014 Bug B).
- *
- * Blocks handled:
- *   - text          \u2192 raw text (matches the legacy serializer's output)
- *   - thinking      \u2192 `<thinking>\u2026</thinking>`
- *   - tool_use      \u2192 `<tool_use name="\u2026" id="\u2026">{json input}</tool_use>`
- *   - tool_result   \u2192 `<tool_result tool_use_id="\u2026"[ is_error="true"]>\u2026</tool_result>`
- *   - image         \u2192 skipped (binary, cannot live inside an XML text preamble)
- *   - file_attachment \u2192 skipped (large, would bloat the prompt)
- */
-export function serializeMessageContentForHistory(content: ContentBlock[]): string {
-  const parts: string[] = [];
-  for (const block of content) {
-    switch (block.type) {
-      case 'text': {
-        const text = block.text ?? '';
-        if (text.length > 0) parts.push(text);
-        break;
-      }
-      case 'thinking': {
-        const thinking = block.thinking ?? '';
-        if (thinking.length > 0) parts.push(`<thinking>${escapeXmlText(thinking)}</thinking>`);
-        break;
-      }
-      case 'tool_use': {
-        const name = block.name ?? 'unknown';
-        const id = block.id ?? '';
-        let inputStr: string;
-        try {
-          inputStr = JSON.stringify(block.input ?? {});
-        } catch {
-          inputStr = '{}';
-        }
-        parts.push(
-          `<tool_use name="${escapeXmlAttr(name)}" id="${escapeXmlAttr(id)}">${escapeXmlText(inputStr)}</tool_use>`
-        );
-        break;
-      }
-      case 'tool_result': {
-        const id = block.toolUseId ?? '';
-        const errAttr = block.isError ? ' is_error="true"' : '';
-        // Local type says `content: string`, but Anthropic-style payloads
-        // from older message rows or third-party providers may store an
-        // array of content blocks. Flatten defensively so we never serialize
-        // "[object Object]".
-        const rawContent = (block as { content: unknown }).content;
-        let text: string;
-        if (typeof rawContent === 'string') {
-          text = rawContent;
-        } else if (Array.isArray(rawContent)) {
-          text = rawContent
-            .map((c) =>
-              c && typeof c === 'object' && 'text' in c
-                ? String((c as { text: unknown }).text ?? '')
-                : ''
-            )
-            .join('\n');
-        } else {
-          text = '';
-        }
-        parts.push(
-          `<tool_result tool_use_id="${escapeXmlAttr(id)}"${errAttr}>${escapeXmlText(text)}</tool_result>`
-        );
-        break;
-      }
-      case 'image':
-      case 'file_attachment':
-        // Skip \u2014 not representable as XML text in a history preamble.
-        break;
-    }
-  }
-  return parts.join('\n');
-}
-
-// Bundled node/npx paths never change at runtime — resolve once.
-let cachedBundledNodePaths: { node: string; npx: string } | null | undefined = undefined;
-
-function getBundledNodePaths(): { node: string; npx: string } | null {
-  if (cachedBundledNodePaths !== undefined) {
-    return cachedBundledNodePaths;
-  }
-  const platform = process.platform;
-  const arch = process.arch;
-  let resourcesPath: string;
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    resourcesPath = path.join(projectRoot, 'resources', 'node', `${platform}-${arch}`);
-  } else {
-    resourcesPath = path.join(process.resourcesPath, 'node');
-  }
-  const binDir = platform === 'win32' ? resourcesPath : path.join(resourcesPath, 'bin');
-  const nodePath = path.join(binDir, platform === 'win32' ? 'node.exe' : 'node');
-  const npxPath = path.join(binDir, platform === 'win32' ? 'npx.cmd' : 'npx');
-  cachedBundledNodePaths =
-    fs.existsSync(nodePath) && fs.existsSync(npxPath) ? { node: nodePath, npx: npxPath } : null;
-  return cachedBundledNodePaths;
-}
-
-/**
- * Resolve bundled Python bin directory path (if available).
- * Checks packaged and dev layouts, returns the bin dir containing python3.
- */
-function resolveBundledPythonBinDir(): string | null {
-  const platform = process.platform;
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    if (platform === 'darwin') {
-      candidates.push(path.join(projectRoot, 'resources', 'python', `darwin-${arch}`, 'bin'));
-    }
-    candidates.push(path.join(projectRoot, 'resources', 'python', 'bin'));
-  } else {
-    // Packaged layout: Resources/python/bin/python3
-    candidates.push(path.join(process.resourcesPath, 'python', 'bin'));
-  }
-
-  const pythonExe = platform === 'win32' ? 'python.exe' : 'python3';
-  for (const binDir of candidates) {
-    if (fs.existsSync(path.join(binDir, pythonExe))) return binDir;
-  }
-  return null;
-}
-
-/**
- * Resolve bundled tools directory (cliclick etc., macOS only).
- */
-function resolveBundledToolsBinDir(): string | null {
-  if (process.platform !== 'darwin') return null;
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    candidates.push(path.join(projectRoot, 'resources', 'tools', `darwin-${arch}`, 'bin'));
-    candidates.push(path.join(projectRoot, 'resources', 'tools', 'bin'));
-  } else {
-    candidates.push(path.join(process.resourcesPath, 'tools', `darwin-${arch}`, 'bin'));
-    candidates.push(path.join(process.resourcesPath, 'tools', 'bin'));
-  }
-
-  for (const binDir of candidates) {
-    if (fs.existsSync(binDir)) return binDir;
-  }
-  return null;
-}
-
-/**
- * Resolve bundled ffmpeg executable (used by the ASR skill for audio decode).
- * Dev: <projectRoot>/resources/ffmpeg/<platform>/ffmpeg[.exe]
- * Packaged: <process.resourcesPath>/ffmpeg/<platform>/ffmpeg[.exe]
- */
-function resolveBundledFfmpegPath(): string | null {
-  const isWin = process.platform === 'win32';
-  const exeName = isWin ? 'ffmpeg.exe' : 'ffmpeg';
-
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'windows', 'ffmpeg.exe'));
-    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'macos', 'ffmpeg'));
-    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'linux', 'ffmpeg'));
-  } else {
-    const platformDir = process.platform === 'win32' ? 'windows' : process.platform;
-    candidates.push(path.join(process.resourcesPath, 'ffmpeg', platformDir, exeName));
-    candidates.push(path.join(process.resourcesPath, 'ffmpeg', 'windows', 'ffmpeg.exe'));
-  }
-
-  for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-/**
- * One-time enrichment of process.env.PATH for build (production) mode.
- *
- * In dev mode, Electron inherits the user's full shell PATH, so Skill commands
- * like `python3` and `node` just work. In build mode, `process.env.PATH` is
- * minimal (often just `/usr/bin:/bin`).
- *
- * This function:
- * 1. Restores the user's login-shell PATH (safe: uses execFileSync, not execSync)
- * 2. Prepends bundled Node, Python, and tools bin dirs (highest priority)
- * 3. Deduplicates all entries
- * 4. Writes the result back to `process.env.PATH`
- *
- * Called once before the first `createCodingTools()` — subsequent calls are no-ops.
- */
-let pathEnriched = false;
-
-/**
- * Resolve the directory that holds bundled whisper models (read-only, shipped with the app).
- * Dev: <projectRoot>/resources/whisper-models  Packaged: <process.resourcesPath>/whisper-models
- */
-function resolveBundledWhisperModelsDir(): string | null {
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    candidates.push(path.join(projectRoot, 'resources', 'whisper-models'));
-  } else {
-    candidates.push(path.join(process.resourcesPath, 'whisper-models'));
-  }
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-async function enrichProcessPathForBuild(): Promise<void> {
-  if (pathEnriched) return;
-  pathEnriched = true;
-
-  // ASR model dir resolution order:
-  // 1. Bundled models shipped inside the app (resources/whisper-models) — read-only, no download needed.
-  // 2. Per-user writable cache in userData/models/whisper — used when the app ships no bundled model.
-  const bundledWhisperModels = resolveBundledWhisperModelsDir();
-  const asrModelDir = bundledWhisperModels ?? path.join(app.getPath('userData'), 'models', 'whisper');
-  if (!process.env.ASR_WHISPER_MODEL_DIR) {
-    process.env.ASR_WHISPER_MODEL_DIR = asrModelDir;
-    log(
-      `[ClaudeAgentRunner] ASR_WHISPER_MODEL_DIR=${asrModelDir}${bundledWhisperModels ? ' (bundled, read-only)' : ' (userData cache)'}`
-    );
-  }
-
-  if (!app.isPackaged) {
-    log('[ClaudeAgentRunner] Dev mode — skipping PATH enrichment');
-    return;
-  }
-
-  const platform = process.platform;
-  const delimiter = platform === 'win32' ? ';' : ':';
-  const currentPaths = (process.env.PATH || '').split(delimiter).filter((p: string) => p.trim());
-
-  // 1. Restore user's login-shell PATH
-  let shellPaths: string[] = [];
-  if (platform === 'darwin' || platform === 'linux') {
-    try {
-      const shell = getDefaultShell();
-      const output = (
-        execFileSync(shell, ['-l', '-c', 'echo $PATH'], {
-          encoding: 'utf-8',
-          timeout: 5000,
-          env: { ...process.env, HOME: os.homedir() },
-        }) as string
-      ).trim();
-      if (output) {
-        shellPaths = output.split(':').filter((p: string) => p.trim());
-        log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from login shell`);
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logWarn(`[ClaudeAgentRunner] Could not restore shell PATH: ${message}`);
-    }
-  } else if (platform === 'win32') {
-    try {
-      const output = (
-        execFileSync(
-          'powershell.exe',
-          [
-            '-NoProfile',
-            '-Command',
-            "[Environment]::GetEnvironmentVariable('Path', 'User') + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine')",
-          ],
-          { encoding: 'utf-8', timeout: 5000 }
-        ) as string
-      ).trim();
-      if (output) {
-        shellPaths = output.split(';').filter((p: string) => p.trim());
-        log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from Windows registry`);
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logWarn(`[ClaudeAgentRunner] Could not restore Windows PATH: ${message}`);
-    }
-  }
-
-  // 2. Collect bundled bin directories (highest priority)
-  const bundledDirs: string[] = [];
-
-  const nodePaths = getBundledNodePaths();
-  if (nodePaths) {
-    bundledDirs.push(path.dirname(nodePaths.node));
-  }
-
-  const pythonBinDir = resolveBundledPythonBinDir();
-  if (pythonBinDir) {
-    bundledDirs.push(pythonBinDir);
-  }
-
-  const toolsBinDir = resolveBundledToolsBinDir();
-  if (toolsBinDir) {
-    bundledDirs.push(toolsBinDir);
-  }
-
-  const ffmpegPath = resolveBundledFfmpegPath();
-  if (ffmpegPath) {
-    process.env.ASR_FFMPEG_PATH = ffmpegPath;
-    const ffmpegDir = path.dirname(ffmpegPath);
-    bundledDirs.push(ffmpegDir);
-    log(`[ClaudeAgentRunner] Using bundled ffmpeg: ${ffmpegPath}`);
-  }
-
-  // 3. Merge: bundled (highest) → shell → current process, deduplicate
-  const seen = new Set<string>();
-  const merged: string[] = [];
-
-  for (const p of [...bundledDirs, ...shellPaths, ...currentPaths]) {
-    const normalized = platform === 'win32' ? p.toLowerCase() : p;
-    if (!seen.has(normalized)) {
-      seen.add(normalized);
-      merged.push(p);
-    }
-  }
-
-  process.env.PATH = merged.join(delimiter);
-  log(
-    `[ClaudeAgentRunner] Enriched process.env.PATH for build mode: ${bundledDirs.length} bundled + ${shellPaths.length} shell + ${currentPaths.length} process → ${merged.length} total`
-  );
-}
-
-// Shared pi-ai auth storage — created once, reused across sessions.
-
-/**
- * Bridge MCP tools from MCPManager into ToolDefinition[] format for the agent SDK.
- * Each MCP tool becomes a customTool whose execute() delegates to mcpManager.callTool().
- */
-function buildMcpCustomTools(mcpManager: MCPManager): ToolDefinition[] {
-  const mcpTools = mcpManager.getTools();
-  return mcpTools.map((mcpTool) => {
-    // Wrap the raw JSON Schema inputSchema as a TypeBox TSchema
-    const parameters = Type.Unsafe<Record<string, unknown>>(
-      mcpTool.inputSchema as Record<string, unknown>
-    );
-
-    const toolDef: ToolDefinition<TSchema, unknown> = {
-      name: mcpTool.name,
-      label: `${mcpTool.serverName} → ${mcpTool.originalName || mcpTool.name}`,
-      description: mcpTool.description || `MCP tool from ${mcpTool.serverName}`,
-      parameters,
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        try {
-          const result = await mcpManager.callTool(mcpTool.name, params as Record<string, unknown>);
-          const normalizedResult = normalizeMcpToolResultForModel(result);
-          return {
-            content: [{ type: 'text' as const, text: normalizedResult.text }],
-            details:
-              normalizedResult.images.length > 0
-                ? { openCoworkImages: normalizedResult.images }
-                : undefined,
-          };
-        } catch (err: unknown) {
-          logError(`[ClaudeAgentRunner] MCP tool ${mcpTool.name} failed:`, err);
-          throw err instanceof Error ? err : new Error(String(err));
-        }
-      },
-    };
-    return toolDef;
-  });
-}
-
-/**
- * Get shell environment with proper PATH (including node, npm, etc.)
- * GUI apps on macOS don't inherit shell PATH, so we need to extract it
- */
-
-function safeStringify(value: unknown, space = 0): string {
-  try {
-    return JSON.stringify(value, null, space);
-  } catch (error) {
-    const details = error instanceof Error ? error.message : String(error);
-    return `[Unserializable: ${details}]`;
-  }
-}
-
-function summarizeMessageForLog(message: unknown): Record<string, unknown> {
-  if (!message || typeof message !== 'object') {
-    return { present: false };
-  }
-
-  const typedMessage = message as {
-    role?: unknown;
-    stopReason?: unknown;
-    content?: unknown[];
-    usage?: unknown;
-  };
-  const content = Array.isArray(typedMessage.content) ? typedMessage.content : [];
-
-  return {
-    present: true,
-    role: typeof typedMessage.role === 'string' ? typedMessage.role : undefined,
-    stopReason: typedMessage.stopReason ?? undefined,
-    contentBlocks: content.length,
-    contentTypes: content.slice(0, 8).map((block) => {
-      if (!block || typeof block !== 'object') {
-        return typeof block;
-      }
-      const type = (block as { type?: unknown }).type;
-      return typeof type === 'string' ? type : 'unknown';
-    }),
-    usage: normalizeTokenUsage(typedMessage.usage),
-  };
-}
-
-function toErrorText(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (typeof error === 'string') {
-    return error;
-  }
-  if (error && typeof error === 'object') {
-    const maybeMessage = (error as { message?: unknown }).message;
-    if (typeof maybeMessage === 'string' && maybeMessage.trim()) {
-      return maybeMessage;
-    }
-  }
-  const serialized = safeStringify(error);
-  if (serialized.startsWith('[Unserializable:')) {
-    return String(error);
-  }
-  return serialized;
-}
-
-function normalizeTokenUsage(usage: unknown): Message['tokenUsage'] | undefined {
-  if (!usage || typeof usage !== 'object') {
-    return undefined;
-  }
-
-  const raw = usage as {
-    input?: unknown;
-    output?: unknown;
-    input_tokens?: unknown;
-    output_tokens?: unknown;
-    inputTokens?: unknown;
-    outputTokens?: unknown;
-  };
-
-  const input = raw.input ?? raw.input_tokens ?? raw.inputTokens;
-  const output = raw.output ?? raw.output_tokens ?? raw.outputTokens;
-
-  if (typeof input !== 'number' || typeof output !== 'number') {
-    return undefined;
-  }
-
-  return { input, output };
-}
 
 interface AgentRunnerOptions {
   sendToRenderer: (event: ServerEvent) => void;
@@ -1101,13 +621,6 @@ ${hints.join('\n')}
     );
   }
 
-  /**
-   * Check if a command contains sudo
-   */
-  private static isSudoCommand(command: string): boolean {
-    return /\bsudo\b/.test(command);
-  }
-
   private getToolDisplayName(toolName: string): string {
     const cached = this.toolDisplayNameCache.get(toolName);
     if (cached) {
@@ -1130,137 +643,6 @@ ${hints.join('\n')}
 
     this.toolDisplayNameCache.set(toolName, displayName);
     return displayName;
-  }
-
-  /**
-   * Wrap the bash tool in the coding tools array to intercept sudo commands.
-   * When a sudo command is detected, prompts the user for a password,
-   * then rewrites the command to pipe the password into sudo -S.
-   */
-  private wrapBashToolForSudo(
-    tools: ToolDefinition[],
-    sessionId: string,
-    effectiveCwd: string
-  ): ToolDefinition[] {
-    if (!this.requestSudoPassword) return tools;
-
-    const requestSudoPassword = this.requestSudoPassword;
-
-    return tools.map((tool) => {
-      if (tool.name !== 'bash') return tool;
-
-      const originalExecute = tool.execute;
-      return {
-        ...tool,
-        execute: async (
-          toolCallId: string,
-          params: { command: string; timeout?: number },
-          signal: AbortSignal | undefined,
-          onUpdate: ((update: unknown) => void) | undefined,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          ctx: any
-        ) => {
-          const command = params.command;
-
-          if (ClaudeAgentRunner.isSudoCommand(command)) {
-            log('[ClaudeAgentRunner] Sudo command detected, requesting password');
-            const password = await requestSudoPassword(sessionId, toolCallId, command);
-
-            if (!password) {
-              log('[ClaudeAgentRunner] Sudo password cancelled by user');
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Command cancelled: user denied sudo password.' },
-                ],
-                details: undefined as unknown,
-              };
-            }
-
-            // Add -S flag to sudo invocations that don't already have it
-            const rewrittenCommand = command.replace(/\bsudo\b(?!\s+-S)/g, 'sudo -S');
-
-            // Pass password via stdin pipe so it never appears in process args
-            // or environment variables. Uses async spawn with stdio: 'pipe'.
-            log(
-              '[ClaudeAgentRunner] Executing sudo command with password injection (via stdin pipe)'
-            );
-            try {
-              const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
-              const shellArgs =
-                process.platform === 'win32' ? ['/c', rewrittenCommand] : ['-c', rewrittenCommand];
-              const timeoutMs = (params.timeout ?? 120) * 1000;
-              const output = await new Promise<string>((resolve, reject) => {
-                const child = spawn(shell, shellArgs, {
-                  stdio: ['pipe', 'pipe', 'pipe'],
-                  cwd: effectiveCwd,
-                });
-                let stdout = '';
-                let stderr = '';
-                const timer = setTimeout(() => {
-                  child.kill('SIGKILL');
-                  reject(new Error(`Sudo command timed out after ${timeoutMs}ms`));
-                }, timeoutMs);
-                child.stdout.on('data', (chunk: Buffer) => {
-                  stdout += chunk.toString();
-                });
-                child.stderr.on('data', (chunk: Buffer) => {
-                  stderr += chunk.toString();
-                });
-                child.on('error', (err) => {
-                  clearTimeout(timer);
-                  reject(err);
-                });
-                child.on('close', () => {
-                  clearTimeout(timer);
-                  resolve(stdout + stderr);
-                });
-                child.stdin.write(password + '\n');
-                child.stdin.end();
-              });
-              return {
-                content: [{ type: 'text' as const, text: output || '(no output)' }],
-                details: undefined as unknown,
-              };
-            } catch (sudoErr) {
-              logError('[ClaudeAgentRunner] Sudo command failed:', sudoErr);
-              throw sudoErr instanceof Error ? sudoErr : new Error(String(sudoErr));
-            }
-          }
-
-          return originalExecute(toolCallId, params, signal, onUpdate, ctx);
-        },
-      } as ToolDefinition;
-    });
-  }
-
-  /**
-   * Wrap the bash tool to inject a default timeout when the model omits one.
-   * The agent SDK's bash tool has no default timeout, which means
-   * commands can run indefinitely if the model doesn't specify a timeout.
-   */
-  private static wrapBashToolWithDefaultTimeout(tools: ToolDefinition[]): ToolDefinition[] {
-    const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
-
-    return tools.map((tool) => {
-      if (tool.name !== 'bash') return tool;
-
-      const originalExecute = tool.execute;
-      return {
-        ...tool,
-        execute: async (
-          toolCallId: string,
-          params: { command: string; timeout?: number },
-          signal: AbortSignal | undefined,
-          onUpdate: ((update: unknown) => void) | undefined,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          ctx: any
-        ) => {
-          const effectiveParams =
-            params.timeout != null ? params : { ...params, timeout: DEFAULT_BASH_TIMEOUT_SECONDS };
-          return originalExecute(toolCallId, effectiveParams, signal, onUpdate, ctx);
-        },
-      } as ToolDefinition;
-    });
   }
 
   /**
@@ -2301,15 +1683,18 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
       );
 
       // Inject a default 120s timeout for bash commands when the model omits one
-      const withTimeout = ClaudeAgentRunner.wrapBashToolWithDefaultTimeout(
-        codingTools as ToolDefinition[]
-      );
+      const withTimeout = wrapBashToolWithDefaultTimeout(codingTools as ToolDefinition[]);
 
       // Wrap the bash tool to intercept sudo commands and request passwords
       // Note: wrapBashToolForSudo returns ToolDefinition[] (5-param execute) but
       // createAgentSession.tools expects Tool[] (4-param execute). The extra ctx
       // parameter is simply not passed by the session runner — safe to cast.
-      const wrappedTools = this.wrapBashToolForSudo(withTimeout, session.id, effectiveCwd);
+      const wrappedTools = wrapBashToolForSudo(
+        withTimeout,
+        session.id,
+        effectiveCwd,
+        this.requestSudoPassword
+      );
 
       // Diagnostic: log tools being passed to SDK (helps debug Ollama tool use)
       logCtx(`[ClaudeAgentRunner] Session reuse check: cached=${!!cachedSession}`);
