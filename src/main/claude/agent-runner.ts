@@ -24,8 +24,7 @@ import {
 import { getSharedAuthStorage, ModelRegistry } from './shared-auth';
 import type { Session, Message, TraceStep, ServerEvent, ContentBlock } from '../../renderer/types';
 import { v4 as uuidv4 } from 'uuid';
-import { decidePermission, rememberAlwaysAllow } from '../config/permission-rules-store';
-import { classifyPermission, resolvePermissionGate } from '../utils/permission-classifier';
+import { installPermissionHook } from './tools/permission-hook';
 import { PathResolver } from '../sandbox/path-resolver';
 import { MCPManager } from '../mcp/mcp-manager';
 import { mcpConfigStore } from '../mcp/mcp-config-store';
@@ -282,120 +281,9 @@ ${hints.join('\n')}
   }
 
   /**
-   * Install a permission-gating hook on the pi-coding-agent session via
-   * `agent.setBeforeToolCall`. This is the only interception point that
-   * fires for built-in tools (read, bash, edit, write) — the SDK ignores
-   * wrapped `execute` functions on built-in tools passed via `options.tools`.
-   *
-   * The hook consults `decidePermission` from the main-process rules cache:
-   *  - 'allow' → delegate to SDK's original hook (proceeds normally)
-   *  - 'deny'  → return { block: true, reason } (SDK treats as tool error)
-   *  - 'ask'   → await requestPermission() IPC round-trip to PermissionDialog
-   *
-   * Known limitation: the async requestPermission wait (user dialog) causes
-   * the renderer to miss UI update events. The tool executes correctly on
-   * the backend, but the renderer's loading spinner may not clear. This is
-   * a renderer-side issue tracked as a follow-up.
+   * 工具显示名解析（MCP sanitized 名 → 原始名）。
+   * 权限钩子已迁至 tools/permission-hook.ts（Phase 3），通过 deps 注入本方法复用缓存。
    */
-  private installPermissionHook(
-    piSession: PiAgentSession,
-    sessionId: string,
-    sessionCwd: string | null
-  ): void {
-    if (!this.requestPermission) {
-      log('[ClaudeAgentRunner] No requestPermission callback — skipping permission hook');
-      return;
-    }
-
-    // Access the Agent instance (public readonly property on AgentSession)
-    // and wrap its beforeToolCall hook with our permission gate.
-    //
-    // We must chain to the SDK's original beforeToolCall hook because it
-    // fires extension tool_call events and manages the _agentEventQueue.
-    // Without chaining, the renderer misses completion events.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const agent = (piSession as any).agent;
-    if (!agent || typeof agent.setBeforeToolCall !== 'function') {
-      logWarn(
-        '[ClaudeAgentRunner] Cannot access agent.setBeforeToolCall — skipping permission hook'
-      );
-      return;
-    }
-
-    // Capture the SDK's hook before we overwrite it
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sdkBeforeToolCall: ((ctx: any, signal?: AbortSignal) => Promise<any>) | undefined =
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (agent as any)._beforeToolCall;
-
-    const requestPermission = this.requestPermission;
-    const getDisplayName = (name: string): string => this.getToolDisplayName(name);
-
-    agent.setBeforeToolCall(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      async (ctx: any, signal?: AbortSignal): Promise<any> => {
-        const toolName: string = ctx.toolCall?.name ?? '';
-        const input: Record<string, unknown> = ctx.args ?? {};
-        // Human-readable name for prompts/messages (e.g. MCP sanitized
-        // 'mcp__chrome__chrome_screenshot__ab12' → 'chrome_screenshot').
-        // Rule matching and rememberAlwaysAllow still use the canonical
-        // `toolName` so allow-once decisions stay stable across calls.
-        const displayName = getDisplayName(toolName);
-
-        const sessionAllowAll = this.optionsAllowAll?.call(this, sessionId) ?? false;
-        const { kind, reason } = classifyPermission(sessionCwd, toolName, input);
-        const decision = decidePermission(sessionId, toolName, input);
-        const gate = resolvePermissionGate(kind, decision, sessionAllowAll);
-
-        if (gate === 'deny') {
-          log(`[ClaudeAgentRunner] Tool '${toolName}' denied by rule`);
-          return {
-            block: true,
-            reason: `Tool '${displayName}' is denied by your permission rules.`,
-          };
-        }
-
-        if (gate === 'ask') {
-          const toolUseId = `${ctx.toolCall?.id ?? 'unknown'}-perm-${uuidv4().slice(0, 8)}`;
-          let result: 'allow' | 'deny' | 'allow_always';
-          try {
-            result = await requestPermission(sessionId, toolUseId, displayName, input, kind);
-          } catch (permErr) {
-            logError(
-              `[ClaudeAgentRunner] Permission request failed for '${toolName}' — failing closed`,
-              permErr
-            );
-            return {
-              block: true,
-              reason: `Permission request failed for '${displayName}'; tool not executed.`,
-            };
-          }
-
-          if (result === 'deny') {
-            log(`[ClaudeAgentRunner] Tool '${toolName}' denied by user`);
-            return { block: true, reason: `User denied permission for '${displayName}'.` };
-          }
-
-          if (result === 'allow_always') {
-            rememberAlwaysAllow(sessionId, toolName);
-          }
-        }
-
-        log(
-          `[ClaudeAgentRunner] Permission gate allowed '${toolName}' (${kind}${
-            reason ? `: ${reason}` : ''
-          })`
-        );
-        // Allowed — delegate to SDK's original hook for event pipeline
-        return sdkBeforeToolCall ? sdkBeforeToolCall(ctx, signal) : undefined;
-      }
-    );
-
-    log(
-      `[ClaudeAgentRunner] Permission hook installed on session ${sessionId} via agent.setBeforeToolCall`
-    );
-  }
-
   private getToolDisplayName(toolName: string): string {
     const cached = this.toolDisplayNameCache.get(toolName);
     if (cached) {
@@ -1516,7 +1404,12 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
 
         // Install permission-gating hook via the SDK's tool_call extension event.
         // This must happen once per new session — the hook persists across reuses.
-        this.installPermissionHook(piSession, session.id, session.cwd ?? null);
+        // （Phase 3 迁移至 tools/permission-hook.ts；deps 注入 runner 侧回调与显示名缓存）
+        installPermissionHook(piSession, session.id, session.cwd ?? null, {
+          requestPermission: this.requestPermission,
+          sessionAllowAll: this.optionsAllowAll,
+          getToolDisplayName: (name) => this.getToolDisplayName(name),
+        });
 
         // Store session for reuse — evict oldest if cache is full
         if (this.piSessions.size >= ClaudeAgentRunner.MAX_CACHED_SESSIONS) {
