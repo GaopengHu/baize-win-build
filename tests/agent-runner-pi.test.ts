@@ -10,6 +10,13 @@ const pipelineUtilsPath = path.resolve(process.cwd(), 'src/main/claude/pipeline/
 const pipelineUtilsContent = readFileSync(pipelineUtilsPath, 'utf8');
 const mcpToolBridgePath = path.resolve(process.cwd(), 'src/main/claude/tools/mcp-tool-bridge.ts');
 const mcpToolBridgeContent = readFileSync(mcpToolBridgePath, 'utf8');
+// Phase 4 迁移：coworkAppendPrompt 内联数组移入 pipeline/prompt-strategy.ts，
+// prompt 文本断言随之指向新文件（行为断言见 tests/claude/pipeline/prompt-strategy.test.ts）。
+const promptStrategyPath = path.resolve(
+  process.cwd(),
+  'src/main/claude/pipeline/prompt-strategy.ts'
+);
+const promptStrategyContent = readFileSync(promptStrategyPath, 'utf8');
 
 describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   it('avoids dynamic re-import shadowing for config store singletons', () => {
@@ -37,7 +44,8 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   });
 
   it('uses standard markdown link guidance for sources citations', () => {
-    expect(agentRunnerContent).toContain(
+    // Phase 4 迁移：citation_requirements 段移入 prompt-strategy.ts
+    expect(promptStrategyContent).toContain(
       'otherwise use standard Markdown links: [Title](https://claude.ai/chat/URL)'
     );
   });
@@ -105,9 +113,10 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   });
 
   it('nudges the model to proceed with reasonable assumptions', () => {
-    expect(agentRunnerContent).toContain('proceed immediately with reasonable assumptions');
-    expect(agentRunnerContent).toContain('within two days');
-    expect(agentRunnerContent).toContain('most recent two relevant publication days');
+    // Phase 4 迁移：base rules 移入 prompt-strategy.ts
+    expect(promptStrategyContent).toContain('proceed immediately with reasonable assumptions');
+    expect(promptStrategyContent).toContain('within two days');
+    expect(promptStrategyContent).toContain('most recent two relevant publication days');
   });
 
   it('routes MCP image results through structured helpers instead of stringifying base64 into text', () => {
@@ -140,13 +149,18 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
     expect(agentRunnerContent).not.toContain('AskUserQuestion');
     expect(agentRunnerContent).not.toContain('TodoWrite');
     expect(agentRunnerContent).not.toContain('pendingQuestions');
+    // Phase 4：prompt 文本现居 prompt-strategy.ts，反向断言同步指向新文件
+    expect(promptStrategyContent).not.toContain('AskUserQuestion');
+    expect(promptStrategyContent).not.toContain('TodoWrite');
+    expect(promptStrategyContent).not.toContain('pendingQuestions');
   });
 
   it('chat-first behavioral rules are present', () => {
-    expect(agentRunnerContent).toContain('CHAT FIRST');
-    expect(agentRunnerContent).toContain(
+    // Phase 4 迁移：CHAT FIRST / START DOING IT 规则移入 prompt-strategy.ts
+    expect(promptStrategyContent).toContain('CHAT FIRST');
+    expect(promptStrategyContent).toContain(
       'Do NOT create, write, or edit files unless the user explicitly asks'
     );
-    expect(agentRunnerContent).toContain('START DOING IT');
+    expect(promptStrategyContent).toContain('START DOING IT');
   });
 });

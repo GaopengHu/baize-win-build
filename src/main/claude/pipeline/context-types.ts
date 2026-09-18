@@ -38,6 +38,8 @@ export interface TaskContext {
   platform: NodeJS.Platform;
   hasMCPTools: boolean;
   sandboxPath?: string;
+  /** 用户会话工作目录（session.cwd）；PromptStrategy 的 workspace_info 使用。 */
+  workingDir?: string;
   effectiveCwd: string;
 }
 
