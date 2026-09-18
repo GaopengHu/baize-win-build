@@ -14,6 +14,7 @@ import {
   useLoadingSessionId,
 } from '../store/selectors';
 import { useAppStore } from '../store';
+import { useComposerDraft } from '../hooks/useComposerDraft';
 import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
 import { ProcessPanel } from './message/ProcessPanel';
@@ -33,14 +34,6 @@ import {
   Check,
   Cpu,
 } from 'lucide-react';
-
-type AttachedFile = {
-  name: string;
-  path: string;
-  size: number;
-  type: string;
-  inlineDataBase64?: string;
-};
 
 // Audio/video extensions the asr-transcribe skill accepts. Attaching any of
 // these signals a likely heavy local transcription; low-memory machines are
@@ -110,7 +103,17 @@ export function ChatView() {
   }, [appConfig?.configSets, t]);
 
   const activeConfigSetId = appConfig?.activeConfigSetId;
-  const [prompt, setPrompt] = useState('');
+  // Per-session composer draft: keyed by the active session id, so each chat
+  // keeps its own draft when switching sessions or toggling Settings.
+  const {
+    prompt,
+    setPrompt,
+    pastedImages,
+    setPastedImages,
+    attachedFiles,
+    setAttachedFiles,
+    clearComposerDraft,
+  } = useComposerDraft(activeSessionId ?? 'chat');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [inputHeight, setInputHeight] = useState(56);
   const [activeConnectors, setActiveConnectors] = useState<
@@ -120,10 +123,6 @@ export function ChatView() {
   const headerRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
   const connectorMeasureRef = useRef<HTMLDivElement>(null);
-  const [pastedImages, setPastedImages] = useState<
-    Array<{ url: string; base64: string; mediaType: string }>
-  >([]);
-  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const inputBoxMaxWidth = 1320;
@@ -480,22 +479,6 @@ export function ChatView() {
 
   useEffect(() => {
     textareaRef.current?.focus();
-  }, [activeSessionId]);
-
-  useEffect(() => {
-    setPrompt('');
-    setPastedImages((prev) => {
-      for (const image of prev) {
-        URL.revokeObjectURL(image.url);
-      }
-      return [];
-    });
-    setAttachedFiles([]);
-    setInputHeight(56);
-    if (textareaRef.current) {
-      textareaRef.current.value = '';
-      textareaRef.current.style.height = 'auto';
-    }
   }, [activeSessionId]);
 
   useLayoutEffect(() => {
@@ -986,15 +969,13 @@ export function ChatView() {
       await continueSession(activeSessionId, contentBlocks);
 
       // Clean up
-      setPrompt('');
       if (textareaRef.current) {
         textareaRef.current.value = '';
         textareaRef.current.style.height = 'auto';
       }
       setInputHeight(56);
       pastedImages.forEach((img) => URL.revokeObjectURL(img.url));
-      setPastedImages([]);
-      setAttachedFiles([]);
+      clearComposerDraft();
     } finally {
       setIsSubmitting(false);
     }
