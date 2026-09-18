@@ -1,0 +1,319 @@
+/**
+ * @module main/skills/company-marketplace-service
+ *
+ * Client for the company AI platform ("今点通" 应用市场) public app API.
+ *
+ * Endpoints (verified against 172.26.110.88:3000):
+ * - GET  {base}/api/apps/public?category=Skill → app list **with packages[]**
+ *   (this is the endpoint that returns installable packages; `/api/apps` returns
+ *   the same apps but omits packages, so it is only used as a fallback)
+ * - GET  {base}/api/apps/icon/{appId}          → icon binary
+ * - GET  {base}/api/apps/download/{appId}?package_id={pkgId} → package binary (zip)
+ *
+ * Downloads are anonymous on this server. An optional bearer token can still
+ * be provided for environments that require one.
+ */
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+const DEFAULT_BASE_URL = 'http://172.26.110.88:3000';
+const REQUEST_TIMEOUT_MS = 15_000;
+const DOWNLOAD_TIMEOUT_MS = 120_000;
+const MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
+
+export interface MarketplacePackage {
+  id: number;
+  app_id: number;
+  name: string;
+  arch: string;
+  file_size: number;
+  sort: number;
+  created: number;
+}
+
+export interface MarketplaceApp {
+  id: number;
+  name: string;
+  description: string;
+  icon: string;
+  version: string;
+  screenshots: string[];
+  category: string;
+  tags: string[];
+  download_count: number;
+  updated_time: number;
+  packages: MarketplacePackage[];
+}
+
+interface MarketplaceEnvelope {
+  success: boolean;
+  message: string;
+  data?: unknown;
+}
+
+export class MarketplaceHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'MarketplaceHttpError';
+    this.status = status;
+  }
+}
+
+export class CompanyMarketplaceService {
+  private baseUrl: string;
+  private accessToken: string;
+
+  constructor(baseUrl = DEFAULT_BASE_URL, accessToken = '') {
+    this.baseUrl = CompanyMarketplaceService.normalizeBaseUrl(baseUrl);
+    this.accessToken = accessToken.trim();
+  }
+
+  static normalizeBaseUrl(value: string): string {
+    const trimmed = (value || DEFAULT_BASE_URL).trim().replace(/\/+$/, '');
+    if (!trimmed) {
+      return DEFAULT_BASE_URL;
+    }
+    if (!/^https?:\/\//i.test(trimmed)) {
+      return `http://${trimmed}`;
+    }
+    return trimmed;
+  }
+
+  getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
+  async listSkillApps(category = 'Skill'): Promise<MarketplaceApp[]> {
+    const query = `category=${encodeURIComponent(category)}`;
+    // `/api/apps/public` is the catalog endpoint that includes packages[].
+    // `/api/apps` returns the same apps without packages, so it can only serve
+    // as a fallback (its results are then not installable).
+    const candidates = [`${this.baseUrl}/api/apps/public?${query}`, `${this.baseUrl}/api/apps?${query}`];
+    let firstError: unknown = null;
+
+    for (const url of candidates) {
+      try {
+        const payload = await this.requestJson<MarketplaceEnvelope>(url);
+        if (!payload?.success) {
+          throw new MarketplaceHttpError(200, payload?.message || 'Marketplace request failed');
+        }
+        if (!Array.isArray(payload.data)) {
+          throw new Error('Marketplace returned unexpected data shape');
+        }
+        const apps = payload.data
+          .map((raw) => this.parseApp(raw))
+          .filter((app): app is MarketplaceApp => app !== null)
+          // The catalog endpoint filters by category server-side, but keep a
+          // client-side guard so non-skill apps never leak into the UI.
+          .filter((app) => !category || app.category.toLowerCase() === category.toLowerCase());
+        if (apps.length > 0 || url === candidates[candidates.length - 1]) {
+          return apps;
+        }
+      } catch (error) {
+        if (firstError === null) {
+          firstError = error;
+        }
+      }
+    }
+
+    throw firstError instanceof Error
+      ? firstError
+      : new Error('Marketplace request failed for all catalog endpoints');
+  }
+
+  /**
+   * Download a package to a temp file and return its path.
+   * Caller is responsible for deleting the file afterwards.
+   */
+  async downloadPackage(appId: number, packageId: number): Promise<string> {
+    const url = `${this.baseUrl}/api/apps/download/${encodeURIComponent(appId)}?package_id=${encodeURIComponent(packageId)}`;
+    const response = await this.requestRaw(url, DOWNLOAD_TIMEOUT_MS);
+    if (!response.ok) {
+      const message = await this.extractErrorMessage(response);
+      throw new MarketplaceHttpError(
+        response.status,
+        `Package download failed (${response.status})${message ? `: ${message}` : ''}`
+      );
+    }
+
+    const declaredSize = Number(response.headers.get('content-length') || 0);
+    if (declaredSize > MAX_PACKAGE_BYTES) {
+      throw new Error(`Package too large: ${declaredSize} bytes (limit ${MAX_PACKAGE_BYTES})`);
+    }
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nowlink-skill-'));
+    const tempFile = path.join(tempDir, `package-${appId}-${packageId}.zip`);
+    try {
+      // NOTE: the fetch available in the bundled Electron runtime returns a
+      // non-standard Response whose body is neither a WHATWG ReadableStream
+      // (no getReader) nor a Node stream helper (no Readable.fromWeb support).
+      // arrayBuffer() is the one API proven to work there — fetchIconBytes
+      // already relies on it and icons render fine — so avoid all streaming
+      // APIs and buffer the whole package before writing it to disk.
+      const data = Buffer.from(await response.arrayBuffer());
+      if (data.length === 0) {
+        throw new Error('Package download is empty');
+      }
+      if (data.length > MAX_PACKAGE_BYTES) {
+        throw new Error(`Package too large after download: ${data.length} bytes`);
+      }
+      fs.writeFileSync(tempFile, data);
+    } catch (error) {
+      this.cleanupTempDir(tempDir);
+      throw error;
+    }
+
+    return tempFile;
+  }
+
+  async fetchIconBytes(appId: number): Promise<{ bytes: Buffer; contentType: string } | null> {
+    const url = `${this.baseUrl}/api/apps/icon/${encodeURIComponent(appId)}`;
+    try {
+      const response = await this.requestRaw(url, REQUEST_TIMEOUT_MS);
+      if (!response.ok) {
+        return null;
+      }
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      if (!contentType.startsWith('image/')) {
+        return null;
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length === 0) {
+        return null;
+      }
+      return { bytes: buffer, contentType };
+    } catch {
+      return null;
+    }
+  }
+
+  private parseApp(raw: unknown): MarketplaceApp | null {
+    if (typeof raw !== 'object' || raw === null) {
+      return null;
+    }
+    const record = raw as Record<string, unknown>;
+    const id = Number(record.id);
+    if (!Number.isFinite(id)) {
+      return null;
+    }
+    const packages = Array.isArray(record.packages)
+      ? record.packages
+          .map((pkg) => this.parsePackage(pkg))
+          .filter((pkg): pkg is MarketplacePackage => pkg !== null)
+      : [];
+
+    return {
+      id,
+      name: typeof record.name === 'string' ? record.name : `App ${id}`,
+      description: typeof record.description === 'string' ? record.description : '',
+      icon: typeof record.icon === 'string' ? record.icon : '',
+      version: typeof record.version === 'string' ? record.version : '',
+      screenshots: Array.isArray(record.screenshots)
+        ? record.screenshots.filter((item): item is string => typeof item === 'string')
+        : [],
+      category: typeof record.category === 'string' ? record.category : 'Skill',
+      tags: Array.isArray(record.tags)
+        ? record.tags.filter((item): item is string => typeof item === 'string')
+        : [],
+      download_count: Number(record.download_count) || 0,
+      updated_time: Number(record.updated_time) || 0,
+      packages,
+    };
+  }
+
+  private parsePackage(raw: unknown): MarketplacePackage | null {
+    if (typeof raw !== 'object' || raw === null) {
+      return null;
+    }
+    const record = raw as Record<string, unknown>;
+    const id = Number(record.id);
+    const appId = Number(record.app_id);
+    if (!Number.isFinite(id)) {
+      return null;
+    }
+    return {
+      id,
+      app_id: Number.isFinite(appId) ? appId : 0,
+      name: typeof record.name === 'string' ? record.name : `package-${id}`,
+      arch: typeof record.arch === 'string' ? record.arch : '',
+      file_size: Number(record.file_size) || 0,
+      sort: Number(record.sort) || 0,
+      created: Number(record.created) || 0,
+    };
+  }
+
+  private async requestJson<T>(url: string): Promise<T> {
+    const response = await this.requestRaw(url, REQUEST_TIMEOUT_MS);
+    if (!response.ok) {
+      const message = await this.extractErrorMessage(response);
+      throw new MarketplaceHttpError(
+        response.status,
+        `Request failed (${response.status}) for ${url}${message ? `: ${message}` : ''}`
+      );
+    }
+    try {
+      return (await response.json()) as T;
+    } catch (error) {
+      throw new Error(`Marketplace returned invalid JSON: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  private async requestRaw(url: string, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        signal: controller.signal,
+        headers: this.buildHeaders(),
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new MarketplaceHttpError(0, `Request timed out after ${timeoutMs}ms: ${url}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private buildHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      Accept: 'application/json, */*',
+      'User-Agent': 'nowlink-skill-marketplace/1.0',
+    };
+    if (this.accessToken) {
+      headers.Authorization = `Bearer ${this.accessToken}`;
+    }
+    return headers;
+  }
+
+  private async extractErrorMessage(response: Response): Promise<string> {
+    try {
+      const text = await response.text();
+      if (!text) {
+        return '';
+      }
+      try {
+        const parsed = JSON.parse(text) as { message?: string; error?: { message?: string } };
+        if (parsed.message) return parsed.message;
+        if (parsed.error?.message) return parsed.error.message;
+      } catch {
+        // plain text body
+      }
+      return text.slice(0, 200);
+    } catch {
+      return '';
+    }
+  }
+
+  private cleanupTempDir(tempDir: string): void {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+}

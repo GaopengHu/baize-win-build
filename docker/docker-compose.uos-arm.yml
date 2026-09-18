@@ -11,6 +11,9 @@
 #   # 构建（重复构建跳过镜像层，速度更快）
 #   docker-compose -f docker/docker-compose.uos-arm.yml run --rm build
 #
+#   # 只重打 .deb（lockfile 未变时跳过 npm install）
+#   docker-compose -f docker/docker-compose.uos-arm.yml run --rm build bash -c "node scripts/build-linux-arm64.mjs"
+#
 
 services:
   build:
@@ -39,6 +42,8 @@ services:
       - ~/.cache/electron:/home/builder/.cache/electron
       # electron-builder 缓存 (linux 工具链)
       - ~/.cache/electron-builder:/home/builder/.cache/electron-builder
+      # vite 构建缓存（renderer/main bundle 增量）
+      - zhinengti-uos-arm-vite-cache:/app/node_modules/.vite-build
     # 使用宿主网络，解决容器内 DNS 解析慢的问题（同 mac 方案）
     network_mode: host
     environment:
@@ -50,11 +55,15 @@ services:
     command: >
       bash -c "
         echo '=== 今点通 UOS/Kylin ARM64 .deb Build Container ===' &&
-        echo 'Step 1: npm install' &&
-        npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
-        echo 'Step 2: Apply patches' &&
-        npx patch-package &&
-        echo 'Step 3: Download Node.js binaries (incl. linux-arm64)' &&
+        if [ -f node_modules/.install-stamp ] && cmp -s package-lock.json node_modules/.install-stamp; then
+          echo 'Step 1: npm install SKIPPED (package-lock.json unchanged)';
+        else
+          echo 'Step 1: npm install' &&
+          npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
+          npx patch-package &&
+          cp package-lock.json node_modules/.install-stamp;
+        fi &&
+        echo 'Step 2: Download Node.js binaries (incl. linux-arm64)' &&
         OPEN_COWORK_DOWNLOAD_ALL_NODE_BINARIES=1 node scripts/download-node.js &&
         echo 'Step 4: Cross-compile better-sqlite3 for ARM64' &&
         node scripts/cross-compile-better-sqlite3.mjs &&
@@ -65,3 +74,4 @@ services:
 volumes:
   zhinengti-uos-arm-node-modules:
   zhinengti-uos-arm-node-resources:
+  zhinengti-uos-arm-vite-cache:

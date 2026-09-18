@@ -231,6 +231,13 @@ export function useActiveHasMoreMessages(): boolean {
   );
 }
 
+/** Returns the last-turn outcome (completed/stopped) for the active session. */
+export function useActiveLastTurnOutcome(): 'completed' | 'stopped' | null {
+  return useAppStore((s) =>
+    s.activeSessionId ? (s.sessionStates[s.activeSessionId]?.lastTurnOutcome ?? null) : null
+  );
+}
+
 // ---------------------------------------------------------------------------
 // UI layout domain
 // ---------------------------------------------------------------------------

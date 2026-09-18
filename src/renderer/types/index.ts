@@ -222,6 +222,30 @@ export interface PluginCatalogItemV2 {
   catalogSource?: 'claude-marketplace';
 }
 
+/** One installable package of a company-marketplace app (server "packages[]"). */
+export interface MarketplacePackageInfo {
+  packageId: number;
+  appId: number;
+  name: string;
+  arch: string;
+  fileSize: number;
+  updatedTime: number;
+}
+
+/** Company AI platform marketplace app (server GET /api/apps?category=Skill). */
+export interface MarketplaceSkillApp {
+  appId: number;
+  name: string;
+  description: string;
+  version: string;
+  tags: string[];
+  downloadCount: number;
+  updatedTime: number;
+  /** Icon is fetched separately via marketplace.icon; false hides the img. */
+  hasIcon: boolean;
+  packages: MarketplacePackageInfo[];
+}
+
 export interface PluginCatalogItem extends PluginCatalogItemV2 {
   skillCount: number;
   hasSkills: boolean;
@@ -246,6 +270,14 @@ export interface PluginInstallResultV2 {
   plugin: InstalledPlugin;
   installedSkills: string[];
   warnings: string[];
+}
+
+/** Result of installing a skill from the company marketplace. */
+export interface MarketplaceSkillInstallResult {
+  success: boolean;
+  skillName: string;
+  appId: number;
+  packageId: number;
 }
 
 export interface PluginToggleResult {
@@ -467,6 +499,7 @@ export type ClientEvent =
       type: 'session.continue';
       payload: { sessionId: string; prompt: string; content?: ContentBlock[] };
     }
+  | { type: 'session.resume'; payload: { sessionId: string } }
   | { type: 'session.stop'; payload: { sessionId: string } }
   | { type: 'session.delete'; payload: { sessionId: string } }
   | { type: 'session.batchDelete'; payload: { sessionIds: string[] } }
@@ -697,6 +730,7 @@ export interface AppConfig {
   claudeCodePath?: string;
   defaultWorkdir?: string;
   globalSkillsPath?: string;
+  marketplaceBaseUrl?: string;
   theme?: AppTheme;
   sandboxEnabled?: boolean;
   memoryEnabled?: boolean;

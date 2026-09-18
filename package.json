@@ -79,6 +79,7 @@
     "@slack/bolt": "4.7.0",
     "@slack/web-api": "7.15.1",
     "@ungap/structured-clone": "^1.2.0",
+    "adm-zip": "0.6.1",
     "app-builder-lib": "26.8.1",
     "archiver": "^7.0.1",
     "better-sqlite3": "9.6.0",

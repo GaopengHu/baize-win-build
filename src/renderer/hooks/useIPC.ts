@@ -67,9 +67,11 @@ function disarmPostStopGrace(sessionId: string): void {
 }
 
 // 本轮是否产出了真正的最终回答（作用域限定到本轮，避免历史消息误判）。
-// 排除：抢救的半截回复（含"已停止"）、超时/错误/重试等系统提示、tool_result 中间消息。
+// 排除：超时/错误/重试等系统提示、tool_result 中间消息。
+// 注意：暂停抢救的半截回复（"（已暂停"开头）是有效的正文内容，必须算作
+// genuine，否则暂停后结局会误判为 stopped 且流式缓冲可能被清空。
 const NON_FINAL_TEXT_RE =
-  /已停止|本轮没有收到|请求超时|重试也失败|自动重试|正在重建会话|正在重试|上一轮/;
+  /本轮没有收到|请求超时|重试也失败|自动重试|正在重建会话|正在重试|上一轮/;
 function isGenuineFinalMessage(m: Message, sinceTs: number | null): boolean {
   if (m.role !== 'assistant' || m.localStatus) return false;
   if (sinceTs != null && (m.timestamp ?? 0) < sinceTs - 1000) return false;
@@ -285,10 +287,11 @@ export function useIPC() {
             // Clear thinking buffer too — final thinking is in the message content blocks
             delete pendingThinking[event.payload.sessionId];
             store.addMessage(event.payload.sessionId, event.payload.message);
-            // 停止后宽限期内到达的持久化半截回复：确认是"已停止"性质的
-            // 消息则把结局定为 stopped（不打勾）；正常流式结束到达的最终
-            // 回答则在此处立即定 completed——它往往先于 session.status(idle)
-            // 到达，提前落定可以让侧边栏绿勾更跟手。
+            // 停止后到达的持久化消息：只有"本轮未输出正文"占位符才定为
+            // stopped（不打勾）；抢救下来的半截正文是有效内容，走正常的
+            // genuine 判定（半截正文应显示且可继续）。正常流式结束到达的
+            // 最终回答则在此处立即定 completed——它往往先于
+            // session.status(idle) 到达，提前落定可以让侧边栏绿勾更跟手。
             {
               const msg = event.payload.message;
               if (msg.role === 'assistant' && !msg.localStatus) {
@@ -301,7 +304,7 @@ export function useIPC() {
                     .filter((b) => b.type === 'text')
                     .map((b) => (b as { text?: string }).text ?? '')
                     .join('\n');
-                  if (/已停止|本轮未输出正文/.test(text)) {
+                  if (/本轮未输出正文/.test(text)) {
                     store.setLastTurnOutcome(sessionId, 'stopped');
                   } else if (isGenuineFinalMessage(msg, turnStartedAt[sessionId] ?? null)) {
                     store.setLastTurnOutcome(sessionId, 'completed');
@@ -693,7 +696,11 @@ export function useIPC() {
 
   // Continue an existing session
   const continueSession = useCallback(
-    async (sessionId: string, promptOrContent: string | ContentBlock[]) => {
+    async (
+      sessionId: string,
+      promptOrContent: string | ContentBlock[],
+      options?: { silentUserMessage?: boolean }
+    ) => {
       setLoading(true);
       console.log('[useIPC] Continuing session:', sessionId);
 
@@ -707,7 +714,9 @@ export function useIPC() {
       const textContent = content.find((block) => block.type === 'text');
       const prompt = textContent && 'text' in textContent ? textContent.text : '';
 
-      // Immediately add user message to UI (for both modes)
+      // Immediately add user message to UI (for both modes), unless the
+      // caller asked for a silent resume (e.g. pause-continue): no user
+      // bubble, the model just keeps generating.
       const store = useAppStore.getState();
       const isSessionRunning =
         store.sessions.find((session) => session.id === sessionId)?.status === 'running';
@@ -715,16 +724,21 @@ export function useIPC() {
       const hasActiveTurn = Boolean(ss?.activeTurn);
       const hasPending = (ss?.pendingTurns?.length ?? 0) > 0;
       const shouldQueue = isSessionRunning || hasActiveTurn || hasPending;
-      const userMessage: Message = {
-        id: nextLocalId('msg-user'),
-        sessionId,
-        role: 'user',
-        content,
-        timestamp: Date.now(),
-        localStatus: shouldQueue ? 'queued' : undefined,
-      };
-      addMessage(sessionId, userMessage);
-      startExecutionClock(sessionId, userMessage.timestamp);
+      const silent = options?.silentUserMessage === true && !shouldQueue;
+      if (!silent) {
+        const userMessage: Message = {
+          id: nextLocalId('msg-user'),
+          sessionId,
+          role: 'user',
+          content,
+          timestamp: Date.now(),
+          localStatus: shouldQueue ? 'queued' : undefined,
+        };
+        addMessage(sessionId, userMessage);
+        startExecutionClock(sessionId, userMessage.timestamp);
+      } else {
+        startExecutionClock(sessionId, Date.now());
+      }
 
       // Browser mode mock
       if (!isElectron) {
@@ -766,14 +780,18 @@ export function useIPC() {
       }
 
       try {
-        send({
-          type: 'session.continue',
-          payload: {
-            sessionId,
-            prompt,
-            content, // Send full content blocks including images
-          },
-        });
+        send(
+          silent
+            ? { type: 'session.resume', payload: { sessionId } }
+            : {
+                type: 'session.continue',
+                payload: {
+                  sessionId,
+                  prompt,
+                  content, // Send full content blocks including images
+                },
+              }
+        );
         // Loading will be reset when we receive session.status event
       } catch (e) {
         setLoading(false);

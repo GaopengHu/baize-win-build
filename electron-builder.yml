@@ -35,6 +35,7 @@ files:
   - node_modules/whatwg-url/**/*
   - node_modules/tr46/**/*
   - node_modules/webidl-conversions/**/*
+  - node_modules/adm-zip/**/*
   # Exclude non-essential files from node_modules to reduce bundle size
   - '!**/*.js.map'
   - '!**/*.mjs.map'

@@ -9,6 +9,7 @@ import {
   useActiveTurn,
   usePendingTurns,
   useActiveExecutionClock,
+  useActiveLastTurnOutcome,
   useAppConfig,
   useActiveHasMoreMessages,
   useLoadingSessionId,
@@ -26,6 +27,7 @@ import {
   Plus,
   Loader2,
   Plug,
+  Play,
   X,
   Clock,
   ChevronDown,
@@ -166,6 +168,14 @@ export function ChatView() {
   const pendingCount = pendingTurns.length;
   const isSessionRunning = activeSession?.status === 'running';
   const canStop = isSessionRunning || hasActiveTurn || pendingCount > 0;
+  const lastTurnOutcome = useActiveLastTurnOutcome();
+  // 暂停后且有本轮内容可续写时，显示"继续"按钮。paused 状态在用户点击
+  // 继续或发起新提问时自然结束（新一轮 running 会清掉 outcome）。
+  const canResume =
+    !canStop &&
+    lastTurnOutcome !== null &&
+    messages.length > 0 &&
+    messages[messages.length - 1]?.role === 'assistant';
 
   const loadMoreMessages = useCallback(async () => {
     if (!activeSessionId || loadingMoreRef.current || !hasMoreMessages || !isElectron) return;
@@ -1006,6 +1016,18 @@ export function ChatView() {
     }
   };
 
+  const handleResume = useCallback(async () => {
+    if (!activeSessionId || canStop || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      // 无痕续写：不产生用户气泡，主进程直接用上一轮上下文继续生成，
+      // 历史里已落库的半截回复会被自动带上，模型从断点往下写。
+      await continueSession(activeSessionId, ' ', { silentUserMessage: true });
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [activeSessionId, canStop, isSubmitting, continueSession]);
+
   if (!activeSession) {
     return (
       <div className="flex-1 flex items-center justify-center bg-background px-5">
@@ -1583,6 +1605,16 @@ export function ChatView() {
                     title={t('chat.stop')}
                   >
                     <Square className="w-4 h-4" />
+                  </button>
+                )}
+                {canResume && (
+                  <button
+                    type="button"
+                    onClick={handleResume}
+                    className="w-9 h-9 rounded-2xl flex items-center justify-center bg-success/10 text-success hover:bg-success/20 transition-colors"
+                    title={t('chat.resume')}
+                  >
+                    <Play className="w-4 h-4" />
                   </button>
                 )}
                 <button
