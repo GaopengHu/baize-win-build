@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -12,12 +13,18 @@ import type {
   PluginInstallResultV2,
   PluginToggleResult,
 } from '../../renderer/types';
-import { log, logError } from '../utils/logger';
+import { log, logError, logWarn } from '../utils/logger';
 import { isPathWithinRoot } from '../tools/path-containment';
 import { getDefaultShell } from '../utils/shell-resolver';
 import { withRetry } from '../utils/retry';
+import type { SkillsAdapter } from './skills-adapter';
 import { pluginRegistryStore } from './plugin-registry-store';
 import { PluginCatalogService } from './plugin-catalog-service';
+import {
+  CompanyMarketplaceService,
+  MarketplaceHttpError,
+} from './company-marketplace-service';
+import type { MarketplaceSkillInstallResult } from '../../renderer/types';
 
 const execFileAsync = promisify(execFile);
 
@@ -88,6 +95,9 @@ function cloneComponentState(state: PluginComponentEnabledState): PluginComponen
 export class PluginRuntimeService {
   private readonly catalogService: PluginCatalogService;
   private readonly commandRunner: CommandRunner;
+  private skillsManager?: SkillsAdapter & {
+    installSkill: (skillPath: string, options?: { enabled?: boolean }) => Promise<{ name: string }>;
+  };
 
   constructor(
     catalogService: PluginCatalogService = new PluginCatalogService(),
@@ -95,6 +105,11 @@ export class PluginRuntimeService {
   ) {
     this.catalogService = catalogService;
     this.commandRunner = commandRunner;
+  }
+
+  /** Late-binding of the skills manager (avoids a circular import at module load). */
+  setSkillsManager(manager: NonNullable<PluginRuntimeService['skillsManager']>): void {
+    this.skillsManager = manager;
   }
 
   async listCatalog(options?: { installableOnly?: boolean }): Promise<PluginCatalogItemV2[]> {
@@ -291,6 +306,202 @@ export class PluginRuntimeService {
       }
     }
     return ready;
+  }
+
+  async installFromMarketplace(input: {
+    appId: number;
+    packageId: number;
+    skillName?: string;
+    baseUrl?: string;
+    accessToken?: string;
+  }): Promise<MarketplaceSkillInstallResult> {
+    const marketplace = new CompanyMarketplaceService(
+      input.baseUrl || CompanyMarketplaceService.normalizeBaseUrl(''),
+      input.accessToken || ''
+    );
+    const { appId, packageId } = input;
+    log(`[PluginRuntime] Marketplace install requested: appId=${appId} packageId=${packageId}`);
+
+    let packageFile: string | null = null;
+    try {
+      packageFile = await marketplace.downloadPackage(appId, packageId);
+      this.assertZipMagic(packageFile);
+      const extractDir = await this.extractZipSafely(packageFile);
+      try {
+        const skillDirs = this.locateSkillDirectories(extractDir);
+        if (skillDirs.length === 0) {
+          throw new Error('压缩包内未找到 SKILL.md（既没有 skills/<name>/SKILL.md，也没有顶层 SKILL.md）');
+        }
+
+        const installedNames: string[] = [];
+        for (const skillDir of skillDirs) {
+          const manager = this.skillsManager;
+          if (!manager) {
+            throw new Error('Skills manager not initialized');
+          }
+          // Marketplace installs start DISABLED — the user explicitly opts in
+          // via the toggle in settings before the skill takes effect.
+          const skill = await manager.installSkill(skillDir, { enabled: false });
+          installedNames.push(skill.name);
+        }
+        log(
+          `[PluginRuntime] Marketplace install completed: appId=${appId} pkg=${packageId} skills=${JSON.stringify(installedNames)}`
+        );
+        return {
+          success: true,
+          skillName: installedNames[0] || input.skillName || String(appId),
+          appId,
+          packageId,
+        };
+      } finally {
+        this.removeTempDirQuietly(extractDir);
+      }
+    } catch (error) {
+      if (error instanceof MarketplaceHttpError && error.status === 401) {
+        throw new Error(
+          '下载安装包需要访问令牌（401 Unauthorized）。请在设置中配置公司应用市场的访问令牌。'
+        );
+      }
+      throw error;
+    } finally {
+      if (packageFile) {
+        this.removeTempDirQuietly(path.dirname(packageFile));
+      }
+    }
+  }
+
+  private assertZipMagic(packageFile: string): void {
+    const stat = fs.statSync(packageFile);
+    if (stat.size < 4) {
+      throw new Error('安装包文件过小，不是有效的 zip 文件');
+    }
+    const fd = fs.openSync(packageFile, 'r');
+    try {
+      const header = Buffer.alloc(4);
+      fs.readSync(fd, header, 0, 4, 0);
+      const isZip = header[0] === 0x50 && header[1] === 0x4b;
+      if (!isZip) {
+        const preview = fs.readFileSync(packageFile, 'utf8').slice(0, 120).replace(/\r?\n/g, ' ');
+        throw new Error(
+          `安装包不是有效的 zip 文件（文件头 ${header[0].toString(16)} ${header[1].toString(16)}，预期 50 4b）。` +
+            `服务端可能返回了错误内容，预览：${preview || '(空)'}`
+        );
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  /**
+   * Extract a zip archive into a fresh temp directory, refusing any entry that
+   * escapes the extraction root (zip-slip) and dropping absolute/unsafe names.
+   */
+  private async extractZipSafely(packageFile: string): Promise<string> {
+    const AdmZipModule = await import('adm-zip');
+    const AdmZip = (AdmZipModule.default ?? AdmZipModule) as unknown as new (
+      file: string
+    ) => {
+      getEntries: () => Array<{
+        entryName: string;
+        isDirectory: boolean;
+        getData: () => Buffer;
+      }>;
+    };
+    const zip = new AdmZip(packageFile);
+
+    const extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nowlink-skill-x-'));
+    const entries = zip.getEntries();
+    if (entries.length === 0) {
+      this.removeTempDirQuietly(extractDir);
+      throw new Error('压缩包是空的');
+    }
+
+    try {
+      for (const entry of entries) {
+        const normalized = entry.entryName.replace(/\\/g, '/');
+        if (!normalized || normalized.startsWith('/') || normalized.includes('..')) {
+          logWarn(`[PluginRuntime] Skipping unsafe zip entry: ${entry.entryName}`);
+          continue;
+        }
+        if (/^[a-zA-Z]:/.test(normalized)) {
+          logWarn(`[PluginRuntime] Skipping absolute zip entry: ${entry.entryName}`);
+          continue;
+        }
+        const targetPath = path.resolve(extractDir, normalized);
+        if (!isPathWithinRoot(targetPath, extractDir)) {
+          logWarn(`[PluginRuntime] Skipping zip entry escaping root: ${entry.entryName}`);
+          continue;
+        }
+
+        if (entry.isDirectory) {
+          fs.mkdirSync(targetPath, { recursive: true });
+          continue;
+        }
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+        fs.writeFileSync(targetPath, entry.getData());
+      }
+    } catch (error) {
+      this.removeTempDirQuietly(extractDir);
+      throw error;
+    }
+    return extractDir;
+  }
+
+  /**
+   * Find skill directories inside an extracted package. Supports:
+   * A) the package root itself is a skill (SKILL.md at top level)
+   * B) a single top-level folder containing SKILL.md
+   * C) a plugin layout with skills/<name>/SKILL.md
+   */
+  private locateSkillDirectories(extractDir: string): string[] {
+    const skillMarker = (dir: string): boolean =>
+      fs.existsSync(path.join(dir, 'SKILL.md'));
+
+    if (skillMarker(extractDir)) {
+      return [extractDir];
+    }
+
+    const pluginSkillsRoot = path.join(extractDir, 'skills');
+    if (fs.existsSync(pluginSkillsRoot) && fs.statSync(pluginSkillsRoot).isDirectory()) {
+      const found = fs
+        .readdirSync(pluginSkillsRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(pluginSkillsRoot, entry.name))
+        .filter(skillMarker);
+      if (found.length > 0) {
+        return found;
+      }
+    }
+
+    const topDirs = fs
+      .readdirSync(extractDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(extractDir, entry.name));
+    const nestedFound = topDirs.filter(skillMarker);
+    if (nestedFound.length > 0) {
+      return nestedFound;
+    }
+
+    // One folder wrapping another single folder (e.g. <name>-main/<name>/SKILL.md)
+    for (const topDir of topDirs) {
+      const inner = fs
+        .readdirSync(topDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(topDir, entry.name))
+        .filter(skillMarker);
+      if (inner.length > 0) {
+        return inner;
+      }
+    }
+    return [];
+  }
+
+  private removeTempDirQuietly(targetDir: string): void {
+    try {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    } catch (error) {
+      logWarn(`[PluginRuntime] Failed to remove temp dir ${targetDir}:`, error);
+    }
   }
 
   private static async defaultCommandRunner(

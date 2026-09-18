@@ -1,5 +1,5 @@
 {
-  "platform": "darwin",
-  "prettyName": "macos",
-  "shell": "/bin/bash"
+  "platform": "win32",
+  "prettyName": "windows",
+  "shell": "powershell.exe"
 }

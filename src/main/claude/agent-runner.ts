@@ -652,6 +652,12 @@ export class ClaudeAgentRunner {
   private extensionManager?: AgentRuntimeExtensionManager;
   private activeControllers: Map<string, AbortController> = new Map();
   private piSessions: Map<string, CachedPiSession> = new Map();
+  /**
+   * Set when cancel() is invoked by a user stop. Consumed once by the turn
+   * that was in flight, so a later natural completion can't mistake an old
+   * flag for a fresh stop.
+   */
+  private userStopFlags: Set<string> = new Set();
   private toolDisplayNameCache: Map<string, string> = new Map();
   private static readonly MAX_CACHED_SESSIONS = 50;
 
@@ -1317,6 +1323,16 @@ ${hints.join('\n')}
     // The catch block consults this flag to avoid overwriting the published
     // 'Request failed' trace state with a generic 'Cancelled' update.
     let abortedByStreamError = false;
+    // Pause-rescue buffer: the raw text streamed so far this turn, regardless
+    // of which inner scope owns the event handler. The AbortError handler
+    // below uses it to persist the half-written reply on user stop, so the
+    // visible output is kept and "continue" can resume from it. The inner
+    // event handler appends to it via the shared ref object.
+    const pauseRescue: { text: string; persistedTextCount: number; apiCallCount: number } = {
+      text: '',
+      persistedTextCount: 0,
+      apiCallCount: 0,
+    };
 
     try {
       this.pathResolver.registerSession(session.id, session.mountedPaths);
@@ -2490,6 +2506,16 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
 
       // Accumulate streamed text deltas in case message_end.content is empty (pi SDK streaming behaviour)
       let streamedText = '';
+      // Turn-scoped pause-rescue state (lives at run() scope so BOTH the
+      // event-handler closure AND the AbortError catch below can reach it):
+      // raw text streamed so far + how many text messages this turn has
+      // persisted. The user-abort branch uses them to emit the rescue message
+      // (keeping the visible reply) and to decide on the placeholder.
+      const pauseRescue: { text: string; persistedTextCount: number; apiCallCount: number } = {
+        text: '',
+        persistedTextCount: 0,
+        apiCallCount: 0,
+      };
       let compactionStepId: string | undefined;
       let hasEmittedError = false;
       let terminalErrorText: string | undefined;
@@ -2656,6 +2682,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         }
         if (emission.textDelta) {
           this.sendPartial(session.id, emission.textDelta);
+          pauseRescue.text += emission.textDelta;
         }
 
         const partialText = emission.partialText ? sanitizeOutputPaths(emission.partialText) : '';
@@ -2710,6 +2737,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
           } else if (event.type === 'message_start') {
             messageStartTime = Date.now();
             apiCallCount++;
+            pauseRescue.apiCallCount = apiCallCount;
             log(
               `[ClaudeAgentRunner] Event: message_start [api_call #${apiCallCount}]`,
               safeStringify(summarizeMessageForLog(event.message), 2)
@@ -2748,6 +2776,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
                 }
                 if (parsed.text) {
                   streamedText += parsed.text;
+                  pauseRescue.text += parsed.text;
                   this.sendPartial(session.id, parsed.text);
                 }
               } else if (ame.type === 'thinking_delta') {
@@ -2807,6 +2836,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
               }
               if (flushed.text) {
                 streamedText += flushed.text;
+                pauseRescue.text += flushed.text;
                 this.sendPartial(session.id, flushed.text);
               }
 
@@ -2928,6 +2958,12 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
                 }
 
                 if (contentBlocks.length > 0) {
+                  const hasTextBlock = contentBlocks.some(
+                    (b) => b.type === 'text' && (b.text ?? '').trim()
+                  );
+                  if (hasTextBlock) {
+                    pauseRescue.persistedTextCount += 1;
+                  }
                   const msgWithUsage = msg as { usage?: unknown };
                   const tokenUsage = normalizeTokenUsage(msgWithUsage.usage);
                   if (msgWithUsage.usage) {
@@ -3178,6 +3214,53 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         );
         return;
       }
+      // prompt() returned WITHOUT throwing but the turn was aborted (either
+      // our own controller during shutdown paths, or the SDK's internal abort
+      // after piSession.abort() on user stop): run the same user-abort rescue
+      // as the AbortError branch so the half-written reply is persisted.
+      // NOTE: a user stop aborts BOTH the SDK session and our inner
+      // controller, so plain `controller.signal.aborted` cannot tell them
+      // apart. abortedByUserStop is set by cancel() and marks a user stop.
+      if (this.consumeUserStopFlag(session.id)) {
+        logCtx('[ClaudeAgentRunner] Stopped by user (prompt returned without error)');
+        const userFlushed = thinkParser.flush();
+        if (userFlushed.thinking) {
+          this.sendToRenderer({
+            type: 'stream.thinking',
+            payload: { sessionId: session.id, delta: userFlushed.thinking },
+          });
+        }
+        if (userFlushed.text) {
+          pauseRescue.text += userFlushed.text;
+          this.sendPartial(session.id, userFlushed.text);
+        }
+        const cleanPartial = sanitizeOutputPaths(pauseRescue.text).trim();
+        pauseRescue.text = '';
+        if (cleanPartial) {
+          pauseRescue.persistedTextCount += 1;
+          this.sendMessage(session.id, {
+            id: uuidv4(),
+            sessionId: session.id,
+            role: 'assistant',
+            content: [{ type: 'text', text: cleanPartial }],
+            timestamp: Date.now(),
+          });
+        } else if (pauseRescue.apiCallCount === 0 && pauseRescue.persistedTextCount === 0) {
+          pauseRescue.persistedTextCount += 1;
+          this.sendMessage(session.id, {
+            id: uuidv4(),
+            sessionId: session.id,
+            role: 'assistant',
+            content: [{ type: 'text', text: '（已暂停，本轮未输出正文）' }],
+            timestamp: Date.now(),
+          });
+        }
+        this.sendTraceUpdate(session.id, thinkingStepId, {
+          status: 'completed',
+          title: 'Cancelled',
+        });
+        return;
+      }
       // Complete - update the initial thinking step
       this.sendTraceUpdate(session.id, thinkingStepId, {
         status: terminalErrorText ? 'error' : 'completed',
@@ -3215,6 +3298,36 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
           logCtx('[ClaudeAgentRunner] Aborted by stream error');
         } else {
           logCtx('[ClaudeAgentRunner] Aborted by user');
+          // Persist the partially-streamed reply BEFORE the renderer tears
+          // down the live buffers: use pauseRescue (the turn-scoped rescue
+          // buffer fed by every text path incl. think-tag flushes and error
+          // emissions). sendMessage() persists to DB and pushes
+          // stream.message, whose addMessage handler atomically swaps
+          // partial → persisted, so the visible reply never blanks on pause.
+          const cleanPartial = sanitizeOutputPaths(pauseRescue.text).trim();
+          pauseRescue.text = '';
+          if (cleanPartial) {
+            pauseRescue.persistedTextCount += 1;
+            this.sendMessage(session.id, {
+              id: uuidv4(),
+              sessionId: session.id,
+              role: 'assistant',
+              content: [{ type: 'text', text: cleanPartial }],
+              timestamp: Date.now(),
+            });
+          } else if (pauseRescue.apiCallCount === 0 && pauseRescue.persistedTextCount === 0) {
+            // Nothing streamed yet in this turn and no prior text this turn:
+            // keep the turn visible with a placeholder so the user sees the
+            // run existed and the continue affordance has an anchor.
+            pauseRescue.persistedTextCount += 1;
+            this.sendMessage(session.id, {
+              id: uuidv4(),
+              sessionId: session.id,
+              role: 'assistant',
+              content: [{ type: 'text', text: '（已暂停，本轮未输出正文）' }],
+              timestamp: Date.now(),
+            });
+          }
           this.sendTraceUpdate(session.id, thinkingStepId, {
             status: 'completed',
             title: 'Cancelled',
@@ -3293,8 +3406,34 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
   }
 
   cancel(sessionId: string): void {
+    // User stop: abort the SDK session FIRST so the in-flight LLM request
+    // actually stops and piSession.prompt() rejects/returns. Only then abort
+    // the inner event-stream controller so our subscribe listener stops
+    // consuming late events. Previously only the inner controller was
+    // aborted, so prompt() kept running in the background while our UI
+    // tore down the buffers — the reported "pause wipes the output" bug.
+    // Mark the user-stop flag so the prompt-returned-without-error path can
+    // run the same partial-rescue as the AbortError path.
+    this.userStopFlags.add(sessionId);
+    const cached = this.piSessions.get(sessionId);
+    if (cached) {
+      try {
+        void cached.session.abort();
+      } catch (error) {
+        logWarn('[ClaudeAgentRunner] pi session abort error:', error);
+      }
+    }
     const controller = this.activeControllers.get(sessionId);
     if (controller) controller.abort();
+  }
+
+  /** Consume (read + clear) the user-stop flag for a session. */
+  private consumeUserStopFlag(sessionId: string): boolean {
+    if (!this.userStopFlags.has(sessionId)) {
+      return false;
+    }
+    this.userStopFlags.delete(sessionId);
+    return true;
   }
 
   private sendTraceStep(sessionId: string, step: TraceStep): void {

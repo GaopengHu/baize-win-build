@@ -69,6 +69,11 @@ interface AgentRunner {
 
 const WORKSPACE_MOUNT_VIRTUAL_PATH = '/mnt/workspace';
 const TITLE_GENERATION_TIMEOUT_MS = 20000;
+// Internal continuation prompt for silent resume (never persisted as a user
+// message, never displayed). Carries the intent to keep generating from the
+// existing context, which already holds the rescued partial reply.
+const RESUME_PROMPT =
+  '请从上次中断的地方继续输出，不要重复已经输出过的内容，不要解释，直接继续。';
 
 export class SessionManager {
   private db: DatabaseInstance;
@@ -81,7 +86,7 @@ export class SessionManager {
   private extensionManager?: AgentRuntimeExtensionManager;
   private skillsAdapter?: SkillsAdapter;
   private activeSessions: Map<string, AbortController> = new Map();
-  private promptQueues: Map<string, Array<{ prompt: string; content?: ContentBlock[] }>> =
+  private promptQueues: Map<string, Array<{ prompt: string; content?: ContentBlock[]; silent?: boolean }>> =
     new Map();
   private pendingPermissions: Map<
     string,
@@ -452,6 +457,23 @@ export class SessionManager {
     this.enqueuePrompt(session, prompt, content);
   }
 
+  /**
+   * Resume generation after a user pause WITHOUT creating a user message.
+   * No user bubble is persisted or displayed — the model simply continues
+   * from the existing context (which already contains the rescued partial
+   * reply saved at stop time).
+   */
+  async resumeSession(sessionId: string): Promise<void> {
+    log('[SessionManager] Resuming session (no user message):', sessionId);
+
+    const session = this.loadSession(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    this.enqueuePrompt(session, RESUME_PROMPT, undefined, { silent: true });
+  }
+
   async generateSessionTitleFromPrompt(prompt: string): Promise<string> {
     const normalizedPrompt = prompt.trim();
     if (!normalizedPrompt) {
@@ -648,11 +670,15 @@ export class SessionManager {
   private async processPrompt(
     session: Session,
     prompt: string,
-    content?: ContentBlock[]
+    content?: ContentBlock[],
+    options?: { silent?: boolean }
   ): Promise<void> {
     const traceId = generateTraceId();
     return runWithLogContext({ sessionId: session.id, traceId }, async () => {
       logCtx('[SessionManager] Processing prompt for session:', session.id, 'traceId:', traceId);
+      if (options?.silent) {
+        logCtx('[SessionManager] Silent resume — skipping user message persistence');
+      }
       logCtx(
         '[SessionManager] Received content:',
         content
@@ -696,24 +722,30 @@ export class SessionManager {
           logCtx('[SessionManager] Enhanced prompt with file info:', enhancedPrompt);
         }
 
-        // Save user message to database for persistence
+        // Save user message to database for persistence — skipped for
+        // silent resume (no user bubble, no DB row).
         const existingMessages = this.getMessages(session.id);
-        const userMessage: Message = {
-          id: uuidv4(),
-          sessionId: session.id,
-          role: 'user',
-          content: messageContent, // Save full content including images and files
-          timestamp: Date.now(),
-        };
-        this.saveMessage(userMessage);
-        logCtx(
-          '[SessionManager] User message saved:',
-          userMessage.id,
-          'with',
-          messageContent.length,
-          'content blocks'
-        );
-        const messagesForContext = [...existingMessages, userMessage];
+        let messagesForContext: Message[];
+        if (options?.silent) {
+          messagesForContext = existingMessages;
+        } else {
+          const userMessage: Message = {
+            id: uuidv4(),
+            sessionId: session.id,
+            role: 'user',
+            content: messageContent, // Save full content including images and files
+            timestamp: Date.now(),
+          };
+          this.saveMessage(userMessage);
+          logCtx(
+            '[SessionManager] User message saved:',
+            userMessage.id,
+            'with',
+            messageContent.length,
+            'content blocks'
+          );
+          messagesForContext = [...existingMessages, userMessage];
+        }
 
         // Update session model to match current config (may have changed since session creation)
         const currentModel = configStore.get('model');
@@ -743,9 +775,12 @@ export class SessionManager {
         }
 
         // 标题生成不再与首轮对话并发，避免与主请求竞争同一上游配额/通道导致体感变慢。
-        this.runSessionTitleGeneration(session, prompt, existingMessages).catch((err) =>
-          logCtxError('[SessionManager] Title generation failed:', err)
-        );
+        // 静默续写不触发标题生成（内部指令不适合做标题）。
+        if (!options?.silent) {
+          this.runSessionTitleGeneration(session, prompt, existingMessages).catch((err) =>
+            logCtxError('[SessionManager] Title generation failed:', err)
+          );
+        }
       } catch (error) {
         logCtxError('[SessionManager] Error processing prompt:', error);
         const errorText = error instanceof Error ? error.message : 'Unknown error';
@@ -866,9 +901,14 @@ export class SessionManager {
     );
   }
 
-  private enqueuePrompt(session: Session, prompt: string, content?: ContentBlock[]): void {
+  private enqueuePrompt(
+    session: Session,
+    prompt: string,
+    content?: ContentBlock[],
+    options?: { silent?: boolean }
+  ): void {
     const queue = this.promptQueues.get(session.id) || [];
-    queue.push({ prompt, content });
+    queue.push({ prompt, content, silent: options?.silent });
     this.promptQueues.set(session.id, queue);
 
     if (!this.activeSessions.has(session.id)) {
@@ -914,7 +954,9 @@ export class SessionManager {
             return; // finally handles cleanup
           }
 
-          await this.processPrompt(latestSession, item.prompt, item.content);
+          await this.processPrompt(latestSession, item.prompt, item.content, {
+            silent: item.silent,
+          });
 
           if (controller.signal.aborted) return; // finally handles cleanup
         }

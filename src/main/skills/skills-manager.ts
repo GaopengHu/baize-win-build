@@ -1093,7 +1093,7 @@ export class SkillsManager implements SkillsAdapter {
   /**
    * Install a skill from a directory
    */
-  async installSkill(skillPath: string): Promise<Skill> {
+  async installSkill(skillPath: string, options?: { enabled?: boolean }): Promise<Skill> {
     // Validate skill folder
     const validation = await this.validateSkillFolder(skillPath);
     if (!validation.valid) {
@@ -1153,7 +1153,13 @@ export class SkillsManager implements SkillsAdapter {
       throw new Error(`Installed skill not found after reload: ${metadata.name}`);
     }
 
-    // Save canonical skill entry (stable id: global-<folderName>)
+    // Save canonical skill entry (stable id: global-<folderName>).
+    // Callers (e.g. company marketplace installs) can request the skill to
+    // start disabled so the user explicitly opts in before it takes effect.
+    if (options?.enabled === false) {
+      installedSkill.enabled = false;
+      this.loadedSkills.set(installedSkill.id, installedSkill);
+    }
     this.saveSkill(installedSkill);
 
     log(`Installed skill: ${installedSkill.name} (${installedSkill.id})`);

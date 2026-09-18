@@ -72,6 +72,7 @@ import {
   buildScheduledTaskFallbackTitle,
   buildScheduledTaskTitle,
 } from '../shared/schedule/task-title';
+import { CompanyMarketplaceService } from './skills/company-marketplace-service';
 import {
   isUncPath,
   isWindowsDrivePath,
@@ -893,6 +894,7 @@ app
         payload: event,
       });
     });
+    pluginRuntimeService.setSkillsManager(skillsManager);
     sessionManager = new SessionManager(
       db,
       sendToRenderer,
@@ -2046,6 +2048,96 @@ ipcMain.handle('plugins.uninstall', async (_event, pluginId: string) => {
   }
 });
 
+// ─── Company marketplace (今点通应用市场) IPC ───
+// Base URL is configurable via AppConfig.marketplaceBaseUrl so the bundled
+// default can be overridden without rebuilding.
+
+function getMarketplaceService(): CompanyMarketplaceService {
+  try {
+    const baseUrl = configStore.get('marketplaceBaseUrl') || '';
+    if (baseUrl.trim()) {
+      return new CompanyMarketplaceService(baseUrl);
+    }
+  } catch (error) {
+    logWarn('[Marketplace] Failed to read marketplaceBaseUrl, using default:', error);
+  }
+  return new CompanyMarketplaceService();
+}
+
+ipcMain.handle('marketplace.getBaseUrl', () => {
+  try {
+    return getMarketplaceService().getBaseUrl();
+  } catch (error) {
+    logError('[Marketplace] Error getting base URL:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.listSkillApps', async () => {
+  try {
+    const marketplace = getMarketplaceService();
+    const apps = await marketplace.listSkillApps('Skill');
+    return apps.map((app) => ({
+      appId: app.id,
+      name: app.name,
+      description: app.description,
+      version: app.version,
+      tags: app.tags,
+      downloadCount: app.download_count,
+      updatedTime: app.updated_time,
+      hasIcon: Boolean(app.icon),
+      packages: app.packages.map((pkg) => ({
+        packageId: pkg.id,
+        appId: pkg.app_id || app.id,
+        name: pkg.name,
+        arch: pkg.arch,
+        fileSize: pkg.file_size,
+        updatedTime: pkg.created,
+      })),
+    }));
+  } catch (error) {
+    logError('[Marketplace] Error listing skill apps:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.getIcon', async (_event, appId: number) => {
+  try {
+    const marketplace = getMarketplaceService();
+    const icon = await marketplace.fetchIconBytes(Number(appId));
+    if (!icon) {
+      return null;
+    }
+    return `data:${icon.contentType};base64,${icon.bytes.toString('base64')}`;
+  } catch (error) {
+    logWarn('[Marketplace] Icon fetch failed:', error);
+    return null;
+  }
+});
+
+ipcMain.handle(
+  'marketplace.installSkill',
+  async (
+    _event,
+    input: { appId: number; packageId: number; skillName?: string }
+  ) => {
+    try {
+      if (!pluginRuntimeService) {
+        throw new Error('PluginRuntimeService not initialized');
+      }
+      const result = await pluginRuntimeService.installFromMarketplace({
+        ...input,
+        baseUrl: getMarketplaceService().getBaseUrl(),
+      });
+      sessionManager?.invalidateSkillsSetup();
+      return result;
+    } catch (error) {
+      logError('[Marketplace] Error installing skill:', error);
+      throw error;
+    }
+  }
+);
+
 // Window control IPC handlers
 ipcMain.on('window.minimize', () => {
   try {
@@ -2912,6 +3004,9 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
         event.payload.prompt,
         event.payload.content
       );
+
+    case 'session.resume':
+      return sm.resumeSession(event.payload.sessionId);
 
     case 'session.stop':
       return sm.stopSession(event.payload.sessionId);

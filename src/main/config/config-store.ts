@@ -106,6 +106,9 @@ export interface AppConfig {
   // Optional: Global skills storage directory
   globalSkillsPath?: string;
 
+  // Company skill marketplace (今点通应用市场) base URL, e.g. http://172.26.110.88:3000
+  marketplaceBaseUrl?: string;
+
   // Developer logs
   enableDevLogs: boolean;
 
@@ -173,6 +176,7 @@ const DIRECT_READ_KEYS = new Set<keyof AppConfig>([
   'claudeCodePath',
   'defaultWorkdir',
   'globalSkillsPath',
+  'marketplaceBaseUrl',
   'enableDevLogs',
   'theme',
   'sandboxEnabled',
@@ -249,6 +253,7 @@ const defaultConfig: AppConfig = {
   claudeCodePath: '',
   defaultWorkdir: '',
   globalSkillsPath: '',
+  marketplaceBaseUrl: 'http://172.26.110.88:3000',
   enableDevLogs: false,
   theme: 'light',
   sandboxEnabled: true,
@@ -999,6 +1004,10 @@ export class ConfigStore {
         typeof raw.globalSkillsPath === 'string'
           ? raw.globalSkillsPath
           : defaultConfig.globalSkillsPath,
+      marketplaceBaseUrl:
+        typeof raw.marketplaceBaseUrl === 'string' && raw.marketplaceBaseUrl.trim()
+          ? raw.marketplaceBaseUrl.trim()
+          : defaultConfig.marketplaceBaseUrl,
       enableDevLogs: toBoolean(raw.enableDevLogs, defaultConfig.enableDevLogs),
       theme: isAppTheme(raw.theme) ? raw.theme : defaultConfig.theme,
       sandboxEnabled: toBoolean(raw.sandboxEnabled, defaultConfig.sandboxEnabled),
@@ -1406,6 +1415,10 @@ export class ConfigStore {
         updates.globalSkillsPath !== undefined
           ? updates.globalSkillsPath
           : current.globalSkillsPath,
+      marketplaceBaseUrl:
+        updates.marketplaceBaseUrl !== undefined
+          ? updates.marketplaceBaseUrl
+          : current.marketplaceBaseUrl,
       enableDevLogs:
         updates.enableDevLogs !== undefined ? updates.enableDevLogs : current.enableDevLogs,
       theme: updates.theme !== undefined ? updates.theme : current.theme,
