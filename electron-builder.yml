@@ -161,6 +161,12 @@ linux:
     - from: .claude/skills
       to: skills
 
+deb:
+  #electron‑builder 默认 postinst 脚本在 root 下执行`unshare --user`做沙箱判断，该判断在 root 环境永远成功，导致`chrome‑sandbox`权限设置错误。
+  #UOS20 默认关闭`unprivileged_userns_clone`，普通用户启动 Electron 直接崩溃。自定义脚本改用 nobody 普通用户实测沙箱能力，按需设置`chrome‑sandbox`权限，并持久化调整内核参数。
+  afterInstall: ./scripts/deb-after-install.sh
+  afterRemove: ./scripts/deb-after-remove.sh
+
 nsis:
   oneClick: false
   perMachine: false
