@@ -1204,16 +1204,9 @@ export class ClaudeAgentRunner {
 
       // Accumulate streamed text deltas in case message_end.content is empty (pi SDK streaming behaviour)
       let streamedText = '';
-      // Turn-scoped pause-rescue state (lives at run() scope so BOTH the
-      // event-handler closure AND the AbortError catch below can reach it):
-      // raw text streamed so far + how many text messages this turn has
-      // persisted. The user-abort branch uses them to emit the rescue message
-      // (keeping the visible reply) and to decide on the placeholder.
-      const pauseRescue: { text: string; persistedTextCount: number; apiCallCount: number } = {
-        text: '',
-        persistedTextCount: 0,
-        apiCallCount: 0,
-      };
+      // 注意：此处不再声明内层 pauseRescue——它会遮蔽外层（run() 顶部 line ~503），
+      // 导致事件处理器写 inner 而 AbortError catch 读 outer，两个对象不同，
+      // 用户停止时 rescue 永远落空。统一通过作用域链引用 run() 顶部声明的同一个对象。
       let compactionStepId: string | undefined;
       let hasEmittedError = false;
       let terminalErrorText: string | undefined;
