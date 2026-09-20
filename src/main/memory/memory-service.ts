@@ -388,6 +388,16 @@ export class MemoryService {
    * Asynchronous deep path: experience-memory retrieval (lexical + navigator
    * LLM decisions). Must NOT be awaited on the first-token critical path;
    * use prefetchExperience/acquireExperience for background injection.
+   *
+   * Memory 注入位置：追加到 user message 前缀（messages 流），不修改 system prompt。
+   * 因此与 prompt-strategy 的 reload() 切换无顺序耦合——reload() 只动 system prompt，
+   * memory 注入只动 messages，二者作用于不同字段。
+   *
+   * 时序保证：
+   * 1. session-factory.applyRuntimeStrategies() 先 reload()，system prompt 切换
+   * 2. prompt() 发出请求，stream 开始
+   * 3. memory-injector 在流中途异步追加到 messages
+   * 步骤 3 不影响步骤 1 已生效的 system prompt。
    */
   async buildExperiencePromptBlock(session: { cwd?: string }, prompt: string): Promise<string> {
     if (!this.isEnabled()) {

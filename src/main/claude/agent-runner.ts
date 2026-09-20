@@ -1,7 +1,23 @@
 /**
  * @module main/claude/agent-runner
  *
- * AI query execution engine (1514 lines).
+ * AI 查询执行编排器（Phase 0-6 重构后；AGENT-RUNNER-REFACTOR-PLAN.md §2.1-§2.2）。
+ *
+ * 架构地图（原 3322 行 God Class 拆分后各阶段落点）：
+ * - Stage 0 沙箱准备/回同步           → 本文件 run()（合法留在编排器）
+ * - Stage 1 模型解析                  → pi-model-resolution.ts
+ * - Stage 2 任务分类 + 三策略         → pipeline/task-classifier + prompt/tool/thinking-strategy
+ * - Stage 3 会话装配                  → pipeline/session-factory（PiSessionFactory）
+ *   + 冷启动历史                      → pipeline/cold-start-history
+ *   + MCP servers 配置                → 本文件 buildMcpServersConfig()（Phase 6 提取）
+ *   + MCP customTools 桥接            → tools/mcp-tool-bridge
+ *   + 权限钩子                        → tools/permission-hook
+ *   + skills 目录/路径管理            → skills-runtime.ts
+ * - Stage 4 执行（事件流桥接/loop guard/prompt）→ 本文件 run()（合法留在编排器）
+ * - Stage 5 收尾（abort 判定/trace/沙箱回同步） → 本文件 run()
+ *
+ * 行为不变量：工具集恒定全量、从不按任务裁剪（§3.3）；从不调用
+ * setActiveToolsByName；session 缓存签名机制维持（含 apiKeyFingerprint，R1）。
  *
  * Responsibilities:
  * - Runs AI conversations via the 今点通 agent SDK (createAgentSession)
@@ -271,6 +287,169 @@ export class ClaudeAgentRunner {
     return model;
   }
 
+  /**
+   * Stage 3a：构建 SDK mcpServers 配置（Phase 6 从 run() 内联块提取，行为不变）。
+   *
+   * - 指纹命中 `_mcpServersCache` 时直接复用（bundled node 路径进程内稳定，不入指纹）；
+   * - stdio 服务器：npx/node 命令替换为内置路径 + PATH 注入；
+   *   `{SOFTWARE_DEV_SERVER_PATH}` / `{GUI_OPERATE_SERVER_PATH}` 占位符经
+   *   mcpConfigStore.createFromPreset 解析；
+   * - 单服务器构建失败仅跳过该服务器（'Failed to prepare MCP server config'）；
+   * - 结果写回缓存并输出 summary 日志（COWORK_LOG_SDK_MESSAGES_FULL=1 时输出全量）。
+   *
+   * 注意：返回值当前仅供日志/缓存——MCP 工具本体经 buildMcpCustomTools
+   * 以 customTools 桥接进 SDK（tools/mcp-tool-bridge.ts），不走 mcpServers 字段。
+   */
+  private buildMcpServersConfig(input: {
+    mcpFingerprint: string;
+    allConfigs: ReturnType<typeof mcpConfigStore.getEnabledServers>;
+    imageCapable: boolean;
+  }): Record<string, unknown> {
+    const { mcpFingerprint, allConfigs, imageCapable } = input;
+
+    // Build MCP servers configuration for SDK
+    // IMPORTANT: SDK uses tool names in format: mcp__<ServerKey>__<toolName>
+    const mcpServers: Record<string, unknown> = {};
+    if (!this.mcpManager) {
+      return mcpServers;
+    }
+
+    const serverStatuses = this.mcpManager.getServerStatus();
+    const connectedServers = serverStatuses.filter((s) => s.connected);
+    log('[ClaudeAgentRunner] MCP server statuses:', safeStringify(serverStatuses));
+    log('[ClaudeAgentRunner] Connected MCP servers:', connectedServers.length);
+
+    if (this._mcpServersCache?.fingerprint === mcpFingerprint) {
+      Object.assign(mcpServers, this._mcpServersCache.servers);
+      log('[ClaudeAgentRunner] MCP servers config reused from cache');
+    } else {
+      // Use the module-level memoized helper — no more per-query fs.existsSync calls.
+      const bundledNodePaths = getBundledNodePaths();
+      const bundledNpx = bundledNodePaths?.npx ?? null;
+
+      for (const config of allConfigs) {
+        try {
+          // Use a simpler key without spaces to avoid issues
+          const serverKey = config.name;
+
+          if (config.type === 'stdio') {
+            // 当命令是 npx 或 node 时优先使用内置路径
+            const command =
+              config.command === 'npx' && bundledNpx
+                ? bundledNpx
+                : config.command === 'node' && bundledNodePaths
+                  ? bundledNodePaths.node
+                  : config.command;
+
+            // 使用内置 npx/node 时，将内置 node bin 注入 PATH
+            const serverEnv = { ...config.env };
+            if (bundledNodePaths && (config.command === 'npx' || config.command === 'node')) {
+              const nodeBinDir = path.dirname(bundledNodePaths.node);
+              const currentPath = process.env.PATH || '';
+              // Prepend bundled node bin to PATH so npx can find node
+              serverEnv.PATH = `${nodeBinDir}${path.delimiter}${currentPath}`;
+              log(`[ClaudeAgentRunner]   Added bundled node bin to PATH: ${nodeBinDir}`);
+            }
+
+            if (!imageCapable) {
+              serverEnv.OPEN_COWORK_DISABLE_IMAGE_TOOL_OUTPUT = '1';
+            }
+
+            // Resolve path placeholders for presets
+            let resolvedArgs = config.args || [];
+
+            // Check if any args contain placeholders that need resolving
+            const hasPlaceholders = resolvedArgs.some(
+              (arg) =>
+                arg.includes('{SOFTWARE_DEV_SERVER_PATH}') ||
+                arg.includes('{GUI_OPERATE_SERVER_PATH}')
+            );
+
+            if (hasPlaceholders) {
+              // Get the appropriate preset based on config name
+              let presetKey: string | null = null;
+              if (
+                config.name === 'Software_Development' ||
+                config.name === 'Software Development'
+              ) {
+                presetKey = 'software-development';
+              } else if (config.name === 'GUI_Operate' || config.name === 'GUI Operate') {
+                presetKey = 'gui-operate';
+              }
+
+              if (presetKey) {
+                const preset = mcpConfigStore.createFromPreset(presetKey, true);
+                if (preset && preset.args) {
+                  resolvedArgs = preset.args;
+                }
+              }
+            }
+
+            mcpServers[serverKey] = {
+              type: 'stdio',
+              command,
+              args: resolvedArgs,
+              env: serverEnv,
+            };
+            log(`[ClaudeAgentRunner] Added STDIO MCP server: ${serverKey}`);
+            log(`[ClaudeAgentRunner]   Command: ${command} ${resolvedArgs.join(' ')}`);
+            log(`[ClaudeAgentRunner]   Tools will be named: mcp__${serverKey}__<toolName>`);
+          } else if (config.type === 'sse') {
+            mcpServers[serverKey] = {
+              type: 'sse',
+              url: config.url,
+              headers: config.headers || {},
+            };
+            log(`[ClaudeAgentRunner] Added SSE MCP server: ${serverKey}`);
+          }
+        } catch (error) {
+          logError('[ClaudeAgentRunner] Failed to prepare MCP server config, skipping server', {
+            serverId: config.id,
+            serverName: config.name,
+            error: toErrorText(error),
+          });
+        }
+      }
+
+      // Store in cache for subsequent queries
+      this._mcpServersCache = { fingerprint: mcpFingerprint, servers: { ...mcpServers } };
+    }
+
+    const mcpServersSummary = Object.entries(mcpServers).map(([name, serverConfig]) => {
+      const typedServerConfig = serverConfig as {
+        type?: string;
+        command?: string;
+        args?: unknown[];
+        env?: Record<string, unknown>;
+      };
+      return {
+        name,
+        type: typedServerConfig.type ?? 'unknown',
+        command: typedServerConfig.command ?? '',
+        argsCount: Array.isArray(typedServerConfig.args) ? typedServerConfig.args.length : 0,
+        envKeys: typedServerConfig.env ? Object.keys(typedServerConfig.env).length : 0,
+      };
+    });
+    log('[ClaudeAgentRunner] Final mcpServers summary:', safeStringify(mcpServersSummary, 2));
+    if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
+      log('[ClaudeAgentRunner] Final mcpServers config:', safeStringify(mcpServers, 2));
+    }
+
+    return mcpServers;
+  }
+
+  /**
+   * 执行一次 AI 查询（编排器主入口）。
+   *
+   * Pipeline 分阶段（AGENT-RUNNER-REFACTOR-PLAN.md §2.1）：
+   * - Stage 0：沙箱准备（WSL/Lima 同步、pathResolver 注册）
+   * - Stage 1：模型解析（pi-model-resolution：路由协议/注册表/合成回退）
+   * - Stage 2：任务分类 + 三策略（classifyTask → Prompt/Tool/ThinkingStrategy）
+   * - Stage 3：会话装配（签名原料 → PiSessionFactory.invalidateIfStale →
+   *   冷启动历史 → MCP servers 配置 → customTools → resolveOrCreate）
+   * - Stage 4：执行（事件流桥接 + loop guard + prompt，留在本文件）
+   * - Stage 5：收尾（abort 判定、trace 完成、沙箱回同步）
+   */
   async run(session: Session, prompt: string, existingMessages: Message[]): Promise<void> {
     const runStartTime = Date.now();
     logCtx('[ClaudeAgentRunner] run() started');
@@ -921,134 +1100,11 @@ export class ClaudeAgentRunner {
         contextualPrompt = `${extensionResult.promptPrefix.trim()}\n\n${contextualPrompt}`;
       }
 
+      // Stage 3a（Phase 6）：MCP servers 配置构建提取为私有方法（行为不变），
+      // 日志/缓存指纹语义与内联实现完全一致。返回值仅用于日志与缓存——
+      // MCP 工具本体经 buildMcpCustomTools 以 customTools 桥接进 SDK。
       logTiming('before building MCP servers config', runStartTime);
-
-      // Build MCP servers configuration for SDK
-      // IMPORTANT: SDK uses tool names in format: mcp__<ServerKey>__<toolName>
-      // （enabled configs 已在上方会话签名处读取；此处共享 allConfigs/mcpFingerprint）
-      const mcpServers: Record<string, unknown> = {};
-      if (this.mcpManager) {
-        const serverStatuses = this.mcpManager.getServerStatus();
-        const connectedServers = serverStatuses.filter((s) => s.connected);
-        log('[ClaudeAgentRunner] MCP server statuses:', safeStringify(serverStatuses));
-        log('[ClaudeAgentRunner] Connected MCP servers:', connectedServers.length);
-
-        if (this._mcpServersCache?.fingerprint === mcpFingerprint) {
-          Object.assign(mcpServers, this._mcpServersCache.servers);
-          log('[ClaudeAgentRunner] MCP servers config reused from cache');
-        } else {
-          // Use the module-level memoized helper — no more per-query fs.existsSync calls.
-          const bundledNodePaths = getBundledNodePaths();
-          const bundledNpx = bundledNodePaths?.npx ?? null;
-
-          for (const config of allConfigs) {
-            try {
-              // Use a simpler key without spaces to avoid issues
-              const serverKey = config.name;
-
-              if (config.type === 'stdio') {
-                // 当命令是 npx 或 node 时优先使用内置路径
-                const command =
-                  config.command === 'npx' && bundledNpx
-                    ? bundledNpx
-                    : config.command === 'node' && bundledNodePaths
-                      ? bundledNodePaths.node
-                      : config.command;
-
-                // 使用内置 npx/node 时，将内置 node bin 注入 PATH
-                const serverEnv = { ...config.env };
-                if (bundledNodePaths && (config.command === 'npx' || config.command === 'node')) {
-                  const nodeBinDir = path.dirname(bundledNodePaths.node);
-                  const currentPath = process.env.PATH || '';
-                  // Prepend bundled node bin to PATH so npx can find node
-                  serverEnv.PATH = `${nodeBinDir}${path.delimiter}${currentPath}`;
-                  log(`[ClaudeAgentRunner]   Added bundled node bin to PATH: ${nodeBinDir}`);
-                }
-
-                if (!imageCapable) {
-                  serverEnv.OPEN_COWORK_DISABLE_IMAGE_TOOL_OUTPUT = '1';
-                }
-
-                // Resolve path placeholders for presets
-                let resolvedArgs = config.args || [];
-
-                // Check if any args contain placeholders that need resolving
-                const hasPlaceholders = resolvedArgs.some(
-                  (arg) =>
-                    arg.includes('{SOFTWARE_DEV_SERVER_PATH}') ||
-                    arg.includes('{GUI_OPERATE_SERVER_PATH}')
-                );
-
-                if (hasPlaceholders) {
-                  // Get the appropriate preset based on config name
-                  let presetKey: string | null = null;
-                  if (
-                    config.name === 'Software_Development' ||
-                    config.name === 'Software Development'
-                  ) {
-                    presetKey = 'software-development';
-                  } else if (config.name === 'GUI_Operate' || config.name === 'GUI Operate') {
-                    presetKey = 'gui-operate';
-                  }
-
-                  if (presetKey) {
-                    const preset = mcpConfigStore.createFromPreset(presetKey, true);
-                    if (preset && preset.args) {
-                      resolvedArgs = preset.args;
-                    }
-                  }
-                }
-
-                mcpServers[serverKey] = {
-                  type: 'stdio',
-                  command,
-                  args: resolvedArgs,
-                  env: serverEnv,
-                };
-                log(`[ClaudeAgentRunner] Added STDIO MCP server: ${serverKey}`);
-                log(`[ClaudeAgentRunner]   Command: ${command} ${resolvedArgs.join(' ')}`);
-                log(`[ClaudeAgentRunner]   Tools will be named: mcp__${serverKey}__<toolName>`);
-              } else if (config.type === 'sse') {
-                mcpServers[serverKey] = {
-                  type: 'sse',
-                  url: config.url,
-                  headers: config.headers || {},
-                };
-                log(`[ClaudeAgentRunner] Added SSE MCP server: ${serverKey}`);
-              }
-            } catch (error) {
-              logError('[ClaudeAgentRunner] Failed to prepare MCP server config, skipping server', {
-                serverId: config.id,
-                serverName: config.name,
-                error: toErrorText(error),
-              });
-            }
-          }
-
-          // Store in cache for subsequent queries
-          this._mcpServersCache = { fingerprint: mcpFingerprint, servers: { ...mcpServers } };
-        }
-
-        const mcpServersSummary = Object.entries(mcpServers).map(([name, serverConfig]) => {
-          const typedServerConfig = serverConfig as {
-            type?: string;
-            command?: string;
-            args?: unknown[];
-            env?: Record<string, unknown>;
-          };
-          return {
-            name,
-            type: typedServerConfig.type ?? 'unknown',
-            command: typedServerConfig.command ?? '',
-            argsCount: Array.isArray(typedServerConfig.args) ? typedServerConfig.args.length : 0,
-            envKeys: typedServerConfig.env ? Object.keys(typedServerConfig.env).length : 0,
-          };
-        });
-        log('[ClaudeAgentRunner] Final mcpServers summary:', safeStringify(mcpServersSummary, 2));
-        if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
-          log('[ClaudeAgentRunner] Final mcpServers config:', safeStringify(mcpServers, 2));
-        }
-      }
+      this.buildMcpServersConfig({ mcpFingerprint, allConfigs, imageCapable });
       logTiming('after building MCP servers config', runStartTime);
 
       logTiming('before agent session creation', runStartTime);
@@ -1126,6 +1182,8 @@ export class ClaudeAgentRunner {
       });
       logTiming(isReused ? 'agent session reused' : 'agent session created', runStartTime);
 
+      // ══════════════ Stage 4：执行（事件流桥接） ══════════════
+      // ── 4.1 bridge state: SDK 事件 → ServerEvent 协议的桥接状态 ──
       // Set up event handler to bridge agent SDK events → our ServerEvent protocol
 
       // Accumulate streamed text deltas in case message_end.content is empty (pi SDK streaming behaviour)
@@ -1140,7 +1198,7 @@ export class ClaudeAgentRunner {
       let messageStartTime: number | undefined;
       let apiCallCount = 0;
 
-      // ── Loop guard: protect against runaway tool-call loops ──
+      // ── 4.2 loop guard: protect against runaway tool-call loops ──
       // (e.g. gemini-3.1-pro with thinking=off has been observed producing hundreds
       //  of empty-text + single-tool-call responses in a single turn)
       // Two layers: hash of whole tool-call group (window=20, warn=3/halt=5/abort=8)
@@ -1201,6 +1259,7 @@ export class ClaudeAgentRunner {
         }
       };
 
+      // ── 4.3 cold-start feedback: Ollama 模型加载提示（10s 无流事件时） ──
       // Ollama cold-start feedback: if provider is 'ollama' and no stream event arrives
       // within 10 seconds, show a "model loading" trace update so users know what's happening.
       let ollamaColdStartTimerId: ReturnType<typeof setTimeout> | undefined;
@@ -1243,6 +1302,7 @@ export class ClaudeAgentRunner {
         }
       };
 
+      // ── 4.4 activity timeout: 5 分钟无 SDK 事件即中止（每个事件重置计时） ──
       // Activity-based timeout: reset the 5-min timer whenever the SDK sends events
       const PROMPT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
       let activityTimeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -1266,6 +1326,7 @@ export class ClaudeAgentRunner {
           )
         );
 
+      // ── 4.5 terminal error: 统一的终态错误发布（消息 + trace + 可选 abort） ──
       const emitTerminalError = (
         errorText: string,
         options: { abort?: boolean; includePartialText?: boolean } = {}
@@ -1334,6 +1395,7 @@ export class ClaudeAgentRunner {
         }
       };
 
+      // ── 4.6 subscribe dispatch: SDK 事件订阅（message_update/end、tool_execution_*、auto_compaction_*） ──
       const unsubscribe = piSession.subscribe((event) => {
         try {
           if (controller.signal.aborted) return;
@@ -1715,7 +1777,7 @@ export class ClaudeAgentRunner {
         }
       });
 
-      // ── Deferred memory injection ──
+      // ── 4.7 deferred memory injection ──
       // Background experience retrieval (see MemoryExtension) resolves in
       // parallel with the first LLM request; when it lands while the turn is
       // still running we inject it via pi's steering channel. This keeps the
@@ -1748,6 +1810,7 @@ export class ClaudeAgentRunner {
         });
       }
 
+      // ── 4.8 prompt execution: 发起请求，finally 中退订 + 清理计时器 ──
       // Execute the prompt — unsubscribe in finally to prevent event listener leak
       try {
         resetActivityTimeout();
