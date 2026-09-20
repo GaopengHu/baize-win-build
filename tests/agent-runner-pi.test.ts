@@ -17,6 +17,18 @@ const promptStrategyPath = path.resolve(
   'src/main/claude/pipeline/prompt-strategy.ts'
 );
 const promptStrategyContent = readFileSync(promptStrategyPath, 'utf8');
+// Phase 5 迁移：冷启动历史组装移入 pipeline/cold-start-history.ts（buildColdStartContextualPrompt），
+// session 缓存/签名/DefaultResourceLoader 移入 pipeline/session-factory.ts（PiSessionFactory）。
+const coldStartHistoryPath = path.resolve(
+  process.cwd(),
+  'src/main/claude/pipeline/cold-start-history.ts'
+);
+const coldStartHistoryContent = readFileSync(coldStartHistoryPath, 'utf8');
+const sessionFactoryPath = path.resolve(
+  process.cwd(),
+  'src/main/claude/pipeline/session-factory.ts'
+);
+const sessionFactoryContent = readFileSync(sessionFactoryPath, 'utf8');
 
 describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   it('avoids dynamic re-import shadowing for config store singletons', () => {
@@ -51,13 +63,17 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   });
 
   it('avoids duplicating the current user prompt in contextual history assembly', () => {
-    expect(agentRunnerContent).toContain('const conversationMessages = existingMessages');
+    // Phase 5 迁移：历史组装逻辑移入 pipeline/cold-start-history.ts
+    // （buildColdStartContextualPrompt），四段关键语义文本原样保留。
+    expect(coldStartHistoryContent).toContain('const conversationMessages = existingMessages');
     // Image-containing messages are filtered out individually (not skipping entire history)
-    expect(agentRunnerContent).toContain('const textOnlyMessages = conversationMessages');
-    expect(agentRunnerContent).toContain('textOnlyMessages.slice(0, -1)');
-    expect(agentRunnerContent).toContain(
+    expect(coldStartHistoryContent).toContain('const textOnlyMessages = conversationMessages');
+    expect(coldStartHistoryContent).toContain('textOnlyMessages.slice(0, -1)');
+    expect(coldStartHistoryContent).toContain(
       "textOnlyMessages[textOnlyMessages.length - 1]?.role === 'user'"
     );
+    // runner 侧只剩一行委托调用
+    expect(agentRunnerContent).toContain('buildColdStartContextualPrompt(');
   });
 
   it('keeps MCP server logging compact unless full debug logging is enabled', () => {
@@ -87,23 +103,43 @@ describe('ClaudeAgentRunner Open Cowork SDK integration', () => {
   });
 
   it('uses pi DefaultResourceLoader with additionalSkillPaths and appendSystemPrompt', () => {
-    expect(agentRunnerContent).toContain('additionalSkillPaths: skillPaths');
-    expect(agentRunnerContent).toContain('appendSystemPrompt: coworkAppendPrompt');
-    expect(agentRunnerContent).not.toContain('systemPromptOverride');
+    // Phase 5 迁移：loader 构造移入 pipeline/session-factory.ts create() 路径。
+    // appendSystemPrompt 改为 appendSystemPromptOverride mutable 闭包：
+    // 复用路径先写 appendPrompt.current 再 reload()，loader 在 reload 周期内
+    // 重新求值闭包完成 prompt 切换（SDK 0.60 resource-loader.js 已验证）。
+    expect(sessionFactoryContent).toContain('additionalSkillPaths: skillPaths');
+    expect(sessionFactoryContent).toContain('appendSystemPromptOverride:');
+    expect(sessionFactoryContent).toContain('appendPrompt.current = input.prompt.systemPrompt');
+    expect(sessionFactoryContent).toContain('await cached.session.reload()');
+    // 仍不得整体替换 system prompt：每一处 SystemPromptOverride 都必须以
+    // 'append' 前缀形式出现（追加语义），不得裸用（覆盖语义）
+    const overrideHits = sessionFactoryContent.split('SystemPromptOverride').length - 1;
+    const appendHits = sessionFactoryContent.split('appendSystemPromptOverride').length - 1;
+    expect(overrideHits).toBeGreaterThan(0);
+    expect(overrideHits).toBe(appendHits);
+    expect(agentRunnerContent).not.toContain('DefaultResourceLoader');
   });
 
   it('recreates cached pi sessions when the runtime signature changes', () => {
-    expect(agentRunnerContent).toContain(
-      "import { buildPiSessionRuntimeSignature } from './pi-session-runtime'"
+    // Phase 5 迁移：签名计算/比较/缓存全部移入 PiSessionFactory（buildSignature =
+    // runtimeSignature + skillsSignature + mcpFingerprint 三段组合）。
+    expect(sessionFactoryContent).toContain(
+      "import { buildPiSessionRuntimeSignature } from '../pi-session-runtime'"
     );
-    expect(agentRunnerContent).toContain(
-      'const sessionRuntimeSignature = buildPiSessionRuntimeSignature({'
+    expect(sessionFactoryContent).toContain(
+      'runtimeSignature: buildPiSessionRuntimeSignature(sig)'
     );
-    expect(agentRunnerContent).toContain(
-      'cachedSession.runtimeSignature !== sessionRuntimeSignature'
+    expect(sessionFactoryContent).toContain('cached.runtimeSignature !== runtimeSignature');
+    expect(sessionFactoryContent).toContain('Runtime changed, recreating cached pi session:');
+    expect(sessionFactoryContent).toContain(
+      'runtimeSignature: buildPiSessionRuntimeSignature(input.signature)'
     );
-    expect(agentRunnerContent).toContain('Runtime changed, recreating cached pi session:');
-    expect(agentRunnerContent).toContain('runtimeSignature: sessionRuntimeSignature');
+    // runner 侧：签名原料收集 + 早期失效检查
+    expect(agentRunnerContent).toContain('const signatureInput: SessionSignatureInput = {');
+    expect(agentRunnerContent).toContain(
+      'this.sessionFactory.invalidateIfStale(session.id, signatureInput)'
+    );
+    // 行为断言（apiKey 轮换 → 重建等）见 tests/claude/pipeline/session-factory.test.ts
   });
 
   it('uses the normalized route protocol so openrouter follows the openai-compatible path', () => {

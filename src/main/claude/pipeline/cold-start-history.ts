@@ -1,12 +1,15 @@
 /**
  * @module main/claude/pipeline/cold-start-history
  *
- * 冷启动 `<conversation_history>` 历史重建的序列化纯函数。
+ * 冷启动 `<conversation_history>` 历史重建。
  *
  * Phase 1 迁入：escapeXmlAttr/escapeXmlText/serializeMessageContentForHistory。
- * Phase 5 迁入：run() 内的历史组装逻辑（textOnlyMessages 过滤、去重当前 prompt）。
+ * Phase 5 迁入：run() 内的历史组装逻辑（textOnlyMessages 过滤、去重当前 prompt、
+ * token 预算裁剪）→ buildColdStartContextualPrompt。
  */
-import type { ContentBlock } from '../../../renderer/types';
+import type { ContentBlock, Message } from '../../../renderer/types';
+import { log } from '../../utils/logger';
+import { estimateCharsPerToken } from './context-types';
 
 // Escape characters that would break the cold-start `<conversation_history>`
 // envelope when interpolated into XML tag bodies or attribute values. Raw user
@@ -111,4 +114,91 @@ export function serializeMessageContentForHistory(content: ContentBlock[]): stri
     }
   }
   return parts.join('\n');
+}
+
+/**
+ * Build the contextual prompt for a cold start (new SDK session with existing
+ * DB history). Injects a token-budgeted `<conversation_history>` preamble
+ * before the new user prompt.
+ *
+ * Phase 5 迁入：原 agent-runner.ts run() 内联逻辑，行为保持不变——
+ * - 只取 user/assistant 消息；含图片的消息**逐条**过滤（不丢弃整段历史）；
+ * - 末尾若为当前 user prompt 则去重（slice(0, -1) 语义，避免重复注入）；
+ * - 预算：provider === 'ollama' && contextWindow < 16384 → 0.15，否则 0.3；
+ *   charsPerToken 按最近 3 条消息采样估算（CJK ~1.5 vs 英文 ~4）；
+ * - 从最新往最旧填充，保留 thinking/tool 块（DeepSeek V4 Flash 等需要
+ *   reasoning/tool-call 回放，见 #162 Bug B），超预算即停并标注省略条数。
+ *
+ * @returns 带 preamble 的 contextualPrompt；无可注入历史时原样返回 prompt。
+ */
+export function buildColdStartContextualPrompt(
+  prompt: string,
+  existingMessages: Message[],
+  provider: string,
+  contextWindow: number
+): string {
+  const conversationMessages = existingMessages.filter(
+    (msg) => msg.role === 'user' || msg.role === 'assistant'
+  );
+  // Filter out messages that contain images (images can't be serialized into text preamble)
+  const textOnlyMessages = conversationMessages.filter(
+    (msg) => !msg.content.some((c) => (c as { type?: string }).type === 'image')
+  );
+  const historyMessages =
+    textOnlyMessages.length > 0 && textOnlyMessages[textOnlyMessages.length - 1]?.role === 'user'
+      ? textOnlyMessages.slice(0, -1)
+      : textOnlyMessages;
+
+  if (historyMessages.length === 0) return prompt;
+
+  // Content-aware chars-per-token estimation (CJK text uses ~1.5 chars/token vs ~4 for English)
+  const historyBudgetRatio = provider === 'ollama' && contextWindow < 16384 ? 0.15 : 0.3;
+  const historyTokenBudget = Math.floor(contextWindow * historyBudgetRatio);
+
+  // Sample recent messages to estimate chars-per-token ratio. Sampling the
+  // full serialized form (text + thinking + tool blocks) gives a better CJK
+  // ratio estimate than sampling text only.
+  const sampleText = historyMessages
+    .slice(-3)
+    .map((m) => serializeMessageContentForHistory(m.content))
+    .join('');
+  const charsPerToken = estimateCharsPerToken(sampleText);
+  const historyCharBudget = Math.floor(historyTokenBudget * charsPerToken);
+
+  const historyItems: string[] = [];
+  let charCount = 0;
+  // Build from newest to oldest, then reverse. We preserve thinking and
+  // tool blocks (not just text) so providers requiring reasoning/tool-call
+  // replay (DeepSeek V4 Flash, and any thinking-capable model after a
+  // cwd switch) continue to function after a cold start. See #162 Bug B.
+  for (let i = historyMessages.length - 1; i >= 0; i--) {
+    const msg = historyMessages[i];
+    const serialized = serializeMessageContentForHistory(msg.content);
+    if (serialized.length === 0) continue;
+    const roleTag = msg.role === 'user' ? 'user' : 'assistant';
+    const entry = `<turn role="${roleTag}">${serialized}</turn>`;
+    if (charCount + entry.length > historyCharBudget) break;
+    charCount += entry.length;
+    historyItems.unshift(entry);
+  }
+
+  if (historyItems.length === 0) return prompt;
+
+  const trimmedCount = historyMessages.length - historyItems.length;
+  const historyNote = trimmedCount > 0 ? `[${trimmedCount} older messages omitted]\n` : '';
+  const preamble = `<conversation_history>\n${historyNote}${historyItems.join('\n')}\n</conversation_history>`;
+  log(
+    '[ClaudeAgentRunner] Cold start: injecting',
+    historyItems.length,
+    'of',
+    historyMessages.length,
+    'history messages (budget:',
+    historyCharBudget,
+    'chars, used:',
+    charCount,
+    ', charsPerToken:',
+    charsPerToken.toFixed(2),
+    ')'
+  );
+  return `${preamble}\n\n${prompt}`;
 }

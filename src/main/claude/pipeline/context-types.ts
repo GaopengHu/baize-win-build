@@ -15,7 +15,7 @@ import type {
   ToolDefinition,
 } from '@mariozechner/pi-coding-agent';
 import type { AppConfig } from '../../config/config-store';
-import type { Message } from '../../../renderer/types';
+import type { PermissionHookDeps } from '../tools/permission-hook';
 
 // ═══ Stage 1 输出：模型解析结果 ═══
 export interface ModelContext {
@@ -57,6 +57,25 @@ export interface AssembledTools {
 export type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 
 // ═══ Stage 3 输入/输出：Session 工厂 ═══
+
+/**
+ * 会话签名原料（§5.5.1 R1）：runtime 字段经 buildPiSessionRuntimeSignature
+ * 折叠为 runtimeSignature（apiKey 只以 sha256 指纹参与，不落明文），
+ * 另附 skillsSignature 与 MCP 配置指纹。三段任一变化 → dispose + 重建。
+ */
+export interface SessionSignatureInput {
+  configProvider?: string;
+  customProtocol?: string;
+  modelProvider?: string;
+  modelApi?: string;
+  modelBaseUrl?: string;
+  effectiveCwd?: string;
+  apiKey?: string;
+  skillsSignature?: string;
+  /** MCP 配置指纹：JSON.stringify(enabledConfigs) + String(imageCapable)。 */
+  mcpFingerprint?: string;
+}
+
 export interface SessionInput {
   sessionId: string;
   modelCtx: ModelContext;
@@ -66,7 +85,12 @@ export interface SessionInput {
   thinkingLevel: PiThinkingLevel;
   skillPaths: string[];
   customTools: ToolDefinition[];
-  existingMessages: Message[];
+  /** 完整签名原料（含 mcpFingerprint），由 runner 在 Stage 2/3 之间收集。 */
+  signature: SessionSignatureInput;
+  /** 用户会话 cwd（session.cwd ?? null），传给 installPermissionHook。 */
+  sessionCwd: string | null;
+  /** 权限钩子依赖（runner 注入回调与显示名解析）。 */
+  permissionDeps: PermissionHookDeps;
 }
 
 export interface SessionOutput {

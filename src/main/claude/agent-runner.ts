@@ -12,18 +12,10 @@
  *
  * Dependencies: session-manager, mcp-manager, config-store, skills-manager
  */
-import {
-  createAgentSession,
-  SessionManager as PiSessionManager,
-  SettingsManager as PiSettingsManager,
-  createCodingTools,
-  type BashToolOptions,
-  type AgentSession as PiAgentSession,
-} from '@mariozechner/pi-coding-agent';
-import { getSharedAuthStorage, ModelRegistry } from './shared-auth';
+import { type BashToolOptions } from '@mariozechner/pi-coding-agent';
+import { getSharedAuthStorage } from './shared-auth';
 import type { Session, Message, TraceStep, ServerEvent, ContentBlock } from '../../renderer/types';
 import { v4 as uuidv4 } from 'uuid';
-import { installPermissionHook } from './tools/permission-hook';
 import { PathResolver } from '../sandbox/path-resolver';
 import { MCPManager } from '../mcp/mcp-manager';
 import { mcpConfigStore } from '../mcp/mcp-config-store';
@@ -75,7 +67,6 @@ import {
   resolvePiRouteProtocol,
   resolveSyntheticPiModelFallback,
 } from './pi-model-resolution';
-import { buildPiSessionRuntimeSignature } from './pi-session-runtime';
 import { ThinkTagStreamParser } from './think-tag-parser';
 import {
   attachDeferredMemoryInjection,
@@ -92,7 +83,7 @@ import {
 import { normalizeToolExecutionResultForUi } from './tool-result-utils';
 import { fetchOllamaModelInfo } from '../config/ollama-api';
 import { createWindowsBashOperations } from './windows-bash-operations';
-import { estimateCharsPerToken } from './pipeline/context-types';
+import type { SessionSignatureInput } from './pipeline/context-types';
 import { enrichProcessPathForBuild, getBundledNodePaths } from './pipeline/path-utils';
 import {
   normalizeTokenUsage,
@@ -100,11 +91,14 @@ import {
   summarizeMessageForLog,
   toErrorText,
 } from './pipeline/utils';
-import { serializeMessageContentForHistory } from './pipeline/cold-start-history';
+import {
+  buildColdStartContextualPrompt,
+  serializeMessageContentForHistory,
+} from './pipeline/cold-start-history';
+import { PiSessionFactory } from './pipeline/session-factory';
 import { buildMcpCustomTools } from './tools/mcp-tool-bridge';
 // bash 工具包装链（timeout/sudo）已迁至 pipeline/tool-strategy.ts（Phase 4）。
-
-// 冷启动历史序列化器已迁至 pipeline/cold-start-history.ts（Phase 1）；
+// 冷启动历史序列化 + 组装已迁至 pipeline/cold-start-history.ts（Phase 1/5）；
 // 此处 re-export 保持外部导入方（如 src/tests/claude/agent-runner-history-rebuild.test.ts）兼容。
 export { serializeMessageContentForHistory };
 
@@ -129,14 +123,7 @@ interface AgentRunnerOptions {
   sessionAllowAll?: (sessionId: string) => boolean;
 }
 
-interface CachedPiSession {
-  session: PiAgentSession;
-  modelId: string;
-  thinkingLevel: string;
-  runtimeSignature: string;
-  skillsSignature?: string;
-  ollamaNumCtx?: { value: number };
-}
+// CachedPiSession 缓存已迁至 pipeline/session-factory.ts（Phase 5）。
 
 /**
  * ClaudeAgentRunner - Uses @mariozechner/pi-coding-agent SDK
@@ -167,9 +154,9 @@ export class ClaudeAgentRunner {
   private readonly skillsRuntime: SkillsRuntime;
   private extensionManager?: AgentRuntimeExtensionManager;
   private activeControllers: Map<string, AbortController> = new Map();
-  private piSessions: Map<string, CachedPiSession> = new Map();
   private toolDisplayNameCache: Map<string, string> = new Map();
-  private static readonly MAX_CACHED_SESSIONS = 50;
+  // Stage 3（Phase 5）：pi session 缓存/签名/热替换全部移入 PiSessionFactory。
+  private readonly sessionFactory = new PiSessionFactory();
 
   // Stage 2 策略（Phase 4，pipeline/*）：无状态，实例级单例即可
   private readonly promptStrategy = new PromptStrategy();
@@ -184,22 +171,11 @@ export class ClaudeAgentRunner {
    * Called when session's cwd changes - SDK sessions are bound to cwd
    */
   clearSdkSession(sessionId: string): void {
-    const cached = this.piSessions.get(sessionId);
-    if (cached) {
-      try {
-        cached.session.dispose();
-      } catch (e) {
-        logWarn('[ClaudeAgentRunner] dispose error:', e);
-      }
-      this.piSessions.delete(sessionId);
-      log('[ClaudeAgentRunner] Disposed pi session for:', sessionId);
-    }
+    this.sessionFactory.clearSession(sessionId);
   }
 
   clearAllSdkSessions(): void {
-    for (const sessionId of Array.from(this.piSessions.keys())) {
-      this.clearSdkSession(sessionId);
-    }
+    this.sessionFactory.clearAll();
   }
 
   /** Call after the user installs / removes a skill so the next query re-links everything. */
@@ -210,7 +186,9 @@ export class ClaudeAgentRunner {
   /** Call after the user changes MCP server config so the next query rebuilds mcpServers. */
   invalidateMcpServersCache(): void {
     this._mcpServersCache = null;
-    // Sessions stay alive — MCP tools are rebuilt each query via buildMcpCustomTools()
+    // Phase 5（§5.5.3 有意行为变更）：MCP 指纹已并入 session 签名——
+    // 配置变化的会话在下一次 run() 被 dispose + 重建（SDK 的 customTools
+    // 在 createAgentSession 时冻结，reload() 不刷新，重建是唯一送达途径）。
     log('[ClaudeAgentRunner] MCP servers cache invalidated — tools will rebuild on next query');
   }
 
@@ -833,8 +811,9 @@ export class ClaudeAgentRunner {
       // 调用 invalidateSkillsSetup() 强制重跑。
       this.skillsRuntime.ensureSetup();
 
-      // Build available skills section dynamically — now handled by pi's DefaultResourceLoader
-      // via additionalSkillPaths. No custom prompt building needed.
+      // Build available skills section dynamically — now handled by the pi
+      // resource loader inside PiSessionFactory (Phase 5) via additionalSkillPaths.
+      // No custom prompt building needed.
 
       log('[ClaudeAgentRunner] App claude dir:', userClaudeDir);
       log('[ClaudeAgentRunner] User working directory:', workingDir);
@@ -875,7 +854,32 @@ export class ClaudeAgentRunner {
         '→ thinkingLevel:',
         thinkingLevel
       );
-      const sessionRuntimeSignature = buildPiSessionRuntimeSignature({
+      const skillPaths = await this.skillsRuntime.resolveSkillPaths(session.id);
+      const skillsSignature = JSON.stringify(skillPaths);
+      log('[ClaudeAgentRunner] Skill paths for pi ResourceLoader:', skillPaths);
+      // Stage 3 签名原料（Phase 5：签名计算/比较/缓存全部移入 PiSessionFactory）。
+      // MCP 指纹需参与早期失效检查（§5.5.3 有意行为变更：SDK customTools 创建时
+      // 冻结，配置变化只能靠重建送达），因此 enabled configs 在此提前读取一次，
+      // 下方 MCP 配置构建块共享同一结果。
+      let allConfigs: ReturnType<typeof mcpConfigStore.getEnabledServers> = [];
+      try {
+        allConfigs = mcpConfigStore.getEnabledServers();
+        log(
+          '[ClaudeAgentRunner] Enabled MCP configs:',
+          allConfigs.map((c) => c.name)
+        );
+      } catch (error) {
+        logWarn(
+          '[ClaudeAgentRunner] Failed to read enabled MCP configs; MCP tools will be unavailable this query',
+          error
+        );
+        allConfigs = [];
+      }
+      // Cache key: serialized config list + imageCapable flag.  The bundled node
+      // paths are stable for the lifetime of the process so they don't need to be
+      // part of the fingerprint.
+      const mcpFingerprint = JSON.stringify(allConfigs) + String(imageCapable);
+      const signatureInput: SessionSignatureInput = {
         configProvider: runtimeConfig.provider,
         customProtocol: runtimeConfig.customProtocol,
         modelProvider: piModel.provider,
@@ -883,119 +887,32 @@ export class ClaudeAgentRunner {
         modelBaseUrl: piModel.baseUrl,
         effectiveCwd,
         apiKey,
-      });
-      const skillPaths = await this.skillsRuntime.resolveSkillPaths(session.id);
-      const skillsSignature = JSON.stringify(skillPaths);
-      log('[ClaudeAgentRunner] Skill paths for pi ResourceLoader:', skillPaths);
+        skillsSignature,
+        mcpFingerprint,
+      };
+      // 早期失效检查必须在 beforeSessionRun 之前，保证 isColdStart 反映真实缓存状态。
+      this.sessionFactory.invalidateIfStale(session.id, signatureInput);
 
-      // Build contextual prompt — if reusing an existing SDK session, the SDK
-      // already has conversation history so we only pass the new prompt.
-      // For cold starts (new SDK session with existing DB history), we inject
-      // a token-budgeted summary of recent history as a preamble.
-      let cachedSession = this.piSessions.get(session.id);
-      if (cachedSession && cachedSession.runtimeSignature !== sessionRuntimeSignature) {
-        logCtx('[ClaudeAgentRunner] Runtime changed, recreating cached pi session:', session.id);
-        try {
-          cachedSession.session.dispose();
-        } catch (disposeError) {
-          logWarn('[ClaudeAgentRunner] dispose error while recreating pi session:', disposeError);
-        }
-        this.piSessions.delete(session.id);
-        cachedSession = undefined;
-      }
-      if (cachedSession && cachedSession.skillsSignature !== skillsSignature) {
-        logCtx('[ClaudeAgentRunner] Skills changed, recreating cached pi session:', session.id);
-        try {
-          cachedSession.session.dispose();
-        } catch (disposeError) {
-          logWarn(
-            '[ClaudeAgentRunner] dispose error while recreating pi session for skills:',
-            disposeError
-          );
-        }
-        this.piSessions.delete(session.id);
-        cachedSession = undefined;
-      }
-
+      const isColdStart = !this.sessionFactory.hasValidSession(session.id);
       const extensionResult = this.extensionManager
         ? await this.extensionManager.beforeSessionRun({
             session,
             prompt,
             existingMessages,
-            isColdStart: !cachedSession,
+            isColdStart,
           })
         : { promptPrefix: undefined, customTools: [] };
 
       let contextualPrompt = prompt;
-      if (!cachedSession) {
+      if (isColdStart) {
         // Cold start: inject recent history into prompt if available
-        const conversationMessages = existingMessages.filter(
-          (msg) => msg.role === 'user' || msg.role === 'assistant'
+        // （Phase 5：组装逻辑迁至 pipeline/cold-start-history.ts，行为不变）
+        contextualPrompt = buildColdStartContextualPrompt(
+          prompt,
+          existingMessages,
+          provider,
+          piModel.contextWindow || 128000
         );
-        // Filter out messages that contain images (images can't be serialized into text preamble)
-        const textOnlyMessages = conversationMessages.filter(
-          (msg) => !msg.content.some((c) => (c as { type?: string }).type === 'image')
-        );
-        const historyMessages =
-          textOnlyMessages.length > 0 &&
-          textOnlyMessages[textOnlyMessages.length - 1]?.role === 'user'
-            ? textOnlyMessages.slice(0, -1)
-            : textOnlyMessages;
-
-        if (historyMessages.length > 0) {
-          // Content-aware chars-per-token estimation (CJK text uses ~1.5 chars/token vs ~4 for English)
-          const contextWindow = piModel.contextWindow || 128000;
-          const historyBudgetRatio = provider === 'ollama' && contextWindow < 16384 ? 0.15 : 0.3;
-          const historyTokenBudget = Math.floor(contextWindow * historyBudgetRatio);
-
-          // Sample recent messages to estimate chars-per-token ratio. Sampling the
-          // full serialized form (text + thinking + tool blocks) gives a better CJK
-          // ratio estimate than sampling text only.
-          const sampleText = historyMessages
-            .slice(-3)
-            .map((m) => serializeMessageContentForHistory(m.content))
-            .join('');
-          const charsPerToken = estimateCharsPerToken(sampleText);
-          const historyCharBudget = Math.floor(historyTokenBudget * charsPerToken);
-
-          const historyItems: string[] = [];
-          let charCount = 0;
-          // Build from newest to oldest, then reverse. We preserve thinking and
-          // tool blocks (not just text) so providers requiring reasoning/tool-call
-          // replay (DeepSeek V4 Flash, and any thinking-capable model after a
-          // cwd switch) continue to function after a cold start. See #162 Bug B.
-          for (let i = historyMessages.length - 1; i >= 0; i--) {
-            const msg = historyMessages[i];
-            const serialized = serializeMessageContentForHistory(msg.content);
-            if (serialized.length === 0) continue;
-            const roleTag = msg.role === 'user' ? 'user' : 'assistant';
-            const entry = `<turn role="${roleTag}">${serialized}</turn>`;
-            if (charCount + entry.length > historyCharBudget) break;
-            charCount += entry.length;
-            historyItems.unshift(entry);
-          }
-
-          if (historyItems.length > 0) {
-            const trimmedCount = historyMessages.length - historyItems.length;
-            const historyNote =
-              trimmedCount > 0 ? `[${trimmedCount} older messages omitted]\n` : '';
-            const preamble = `<conversation_history>\n${historyNote}${historyItems.join('\n')}\n</conversation_history>`;
-            contextualPrompt = `${preamble}\n\n${prompt}`;
-            log(
-              '[ClaudeAgentRunner] Cold start: injecting',
-              historyItems.length,
-              'of',
-              historyMessages.length,
-              'history messages (budget:',
-              historyCharBudget,
-              'chars, used:',
-              charCount,
-              ', charsPerToken:',
-              charsPerToken.toFixed(2),
-              ')'
-            );
-          }
-        }
       } else {
         // Reusing session — SDK already has the full conversation context
         logCtx('[ClaudeAgentRunner] Reusing existing SDK session for:', session.id);
@@ -1008,6 +925,7 @@ export class ClaudeAgentRunner {
 
       // Build MCP servers configuration for SDK
       // IMPORTANT: SDK uses tool names in format: mcp__<ServerKey>__<toolName>
+      // （enabled configs 已在上方会话签名处读取；此处共享 allConfigs/mcpFingerprint）
       const mcpServers: Record<string, unknown> = {};
       if (this.mcpManager) {
         const serverStatuses = this.mcpManager.getServerStatus();
@@ -1015,25 +933,6 @@ export class ClaudeAgentRunner {
         log('[ClaudeAgentRunner] MCP server statuses:', safeStringify(serverStatuses));
         log('[ClaudeAgentRunner] Connected MCP servers:', connectedServers.length);
 
-        let allConfigs: ReturnType<typeof mcpConfigStore.getEnabledServers> = [];
-        try {
-          allConfigs = mcpConfigStore.getEnabledServers();
-          log(
-            '[ClaudeAgentRunner] Enabled MCP configs:',
-            allConfigs.map((c) => c.name)
-          );
-        } catch (error) {
-          logWarn(
-            '[ClaudeAgentRunner] Failed to read enabled MCP configs; MCP tools will be unavailable this query',
-            error
-          );
-          allConfigs = [];
-        }
-
-        // Cache key: serialized config list + imageCapable flag.  The bundled node
-        // paths are stable for the lifetime of the process so they don't need to be
-        // part of the fingerprint.
-        const mcpFingerprint = JSON.stringify(allConfigs) + String(imageCapable);
         if (this._mcpServersCache?.fingerprint === mcpFingerprint) {
           Object.assign(mcpServers, this._mcpServersCache.servers);
           log('[ClaudeAgentRunner] MCP servers config reused from cache');
@@ -1182,8 +1081,6 @@ export class ClaudeAgentRunner {
       // 工具集恒定全量、不按任务裁剪（§3.3 锁定）。
       taskCtx.hasMCPTools = mcpCustomTools.length > 0;
       const assembledPrompt = this.promptStrategy.assemble(taskCtx);
-      // appendSystemPrompt 供下方 DefaultResourceLoader 消费（变量名保留，Phase 5 迁移到工厂）
-      const coworkAppendPrompt = assembledPrompt.systemPrompt;
       logCtx(
         '[ClaudeAgentRunner] Prompt subset assembled:',
         taskCtx.taskType,
@@ -1198,7 +1095,7 @@ export class ClaudeAgentRunner {
       }).codingTools;
 
       // Diagnostic: log tools being passed to SDK (helps debug Ollama tool use)
-      logCtx(`[ClaudeAgentRunner] Session reuse check: cached=${!!cachedSession}`);
+      logCtx(`[ClaudeAgentRunner] Session reuse check: cached=${!isColdStart}`);
       logCtx(`[ClaudeAgentRunner] Model=${piModel.id}, thinkingLevel=${thinkingLevel}`);
       log(
         `[ClaudeAgentRunner] Built-in tools (${wrappedTools.length}): ${wrappedTools.map((t: { name?: string; type?: string }) => t.name || t.type).join(', ')}`
@@ -1207,175 +1104,27 @@ export class ClaudeAgentRunner {
         `[ClaudeAgentRunner] Custom tools (${customTools.length}): ${customTools.map((t) => t.name).join(', ')}`
       );
 
-      let piSession: PiAgentSession;
-      if (cachedSession) {
-        // Reuse existing session — SDK retains full conversation history and handles compaction
-        piSession = cachedSession.session;
-
-        // Hot-swap model/thinking if changed — SDK supports this natively
-        if (cachedSession.modelId !== piModel.id) {
-          logCtx(
-            '[ClaudeAgentRunner] Model changed, hot-swapping:',
-            cachedSession.modelId,
-            '→',
-            piModel.id
-          );
-          await piSession.setModel(piModel);
-          cachedSession.modelId = piModel.id;
-          // Update Ollama num_ctx ref if present
-          if (cachedSession.ollamaNumCtx) {
-            cachedSession.ollamaNumCtx.value = piModel.contextWindow || 128000;
-            log(
-              '[ClaudeAgentRunner] Updated Ollama num_ctx on hot-swap:',
-              cachedSession.ollamaNumCtx.value
-            );
-          }
-        }
-        if (cachedSession.thinkingLevel !== thinkingLevel) {
-          logCtx(
-            '[ClaudeAgentRunner] Thinking level changed, hot-swapping:',
-            cachedSession.thinkingLevel,
-            '→',
-            thinkingLevel
-          );
-          piSession.setThinkingLevel(thinkingLevel);
-          cachedSession.thinkingLevel = thinkingLevel;
-        }
-
-        logCtx('[ClaudeAgentRunner] Reusing cached pi session for:', session.id);
-        logTiming('agent session reused', runStartTime);
-      } else {
-        // First query in this session — create new agent session
-        // ResourceLoader + ModelRegistry only needed for session creation — skip on reuse
-        const { DefaultResourceLoader } = await import('@mariozechner/pi-coding-agent');
-        const resourceLoader = new DefaultResourceLoader({
-          cwd: effectiveCwd,
-          additionalSkillPaths: skillPaths,
-          appendSystemPrompt: coworkAppendPrompt,
-          agentsFilesOverride: () => ({
-            agentsFiles: [],
-          }),
-        });
-        await resourceLoader.reload();
-
-        const modelRegistry = new ModelRegistry(authStorage);
-
-        // Ollama-specific compaction tuning based on actual context window
-        const contextWindow = piModel.contextWindow || 128000;
-        let compactionSettings: {
-          enabled: boolean;
-          reserveTokens?: number;
-          keepRecentTokens?: number;
-        };
-        if (provider === 'ollama' && contextWindow < 16384) {
-          // Very small context: disable compaction (weak models produce unreliable summaries)
-          compactionSettings = { enabled: false };
-          log(
-            '[ClaudeAgentRunner] Ollama small context model, disabling auto-compaction (contextWindow:',
-            contextWindow,
-            ')'
-          );
-        } else if (provider === 'ollama' && contextWindow < 65536) {
-          // Medium context: scale reserves proportionally
-          compactionSettings = {
-            enabled: true,
-            reserveTokens: Math.floor(contextWindow * 0.15),
-            keepRecentTokens: Math.floor(contextWindow * 0.25),
-          };
-          log(
-            '[ClaudeAgentRunner] Ollama medium context, scaled compaction:',
-            JSON.stringify(compactionSettings)
-          );
-        } else {
-          compactionSettings = { enabled: true };
-        }
-
-        const { session: newPiSession } = await createAgentSession({
-          model: piModel,
-          thinkingLevel,
-          authStorage,
-          modelRegistry,
-          tools: wrappedTools as unknown as ReturnType<typeof createCodingTools>,
-          customTools,
-          sessionManager: PiSessionManager.inMemory(),
-          settingsManager: PiSettingsManager.inMemory({
-            compaction: compactionSettings,
-            retry: { enabled: true, maxRetries: 2 },
-          }),
-          resourceLoader,
-          cwd: effectiveCwd,
-        });
-        piSession = newPiSession;
-
-        // Install permission-gating hook via the SDK's tool_call extension event.
-        // This must happen once per new session — the hook persists across reuses.
-        // （Phase 3 迁移至 tools/permission-hook.ts；deps 注入 runner 侧回调与显示名缓存）
-        installPermissionHook(piSession, session.id, session.cwd ?? null, {
+      // Stage 3（Phase 5）：创建/复用/热替换/Ollama 补丁全部在 PiSessionFactory 内完成。
+      // 复用路径：更新 appendSystemPromptOverride 闭包 → reload() → model/thinking 热替换；
+      // 新建路径：createAgentSession 构造参数直接生效（HIGH-4）。
+      const { piSession, isReused } = await this.sessionFactory.resolveOrCreate({
+        sessionId: session.id,
+        modelCtx,
+        taskCtx,
+        prompt: assembledPrompt,
+        tools: { codingTools: wrappedTools },
+        thinkingLevel,
+        skillPaths,
+        customTools,
+        signature: signatureInput,
+        sessionCwd: session.cwd ?? null,
+        permissionDeps: {
           requestPermission: this.requestPermission,
           sessionAllowAll: this.optionsAllowAll,
           getToolDisplayName: (name) => this.getToolDisplayName(name),
-        });
-
-        // Store session for reuse — evict oldest if cache is full
-        if (this.piSessions.size >= ClaudeAgentRunner.MAX_CACHED_SESSIONS) {
-          const oldestKey = this.piSessions.keys().next().value;
-          if (oldestKey) {
-            const oldest = this.piSessions.get(oldestKey);
-            if (oldest) {
-              try {
-                oldest.session.dispose();
-              } catch (e) {
-                logWarn('[ClaudeAgentRunner] dispose error on eviction:', e);
-              }
-            }
-            this.piSessions.delete(oldestKey);
-            log('[ClaudeAgentRunner] Evicted oldest cached session:', oldestKey);
-          }
-        }
-        this.piSessions.set(session.id, {
-          session: piSession,
-          modelId: piModel.id,
-          thinkingLevel,
-          runtimeSignature: sessionRuntimeSignature,
-          skillsSignature,
-        });
-
-        // Ollama: wrap _onPayload to inject num_ctx into every request
-        if (provider === 'ollama') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const agent = piSession.agent as any;
-          // Guard: only patch if the SDK exposes _onPayload (private API)
-          if (!('_onPayload' in agent)) {
-            logWarn(
-              '[ClaudeAgentRunner] SDK agent does not expose _onPayload — skipping Ollama num_ctx patch'
-            );
-          } else {
-            const originalOnPayload = agent._onPayload as
-              | ((
-                  payload: Record<string, unknown>,
-                  modelArg: unknown
-                ) => Promise<Record<string, unknown>>)
-              | undefined;
-            const ollamaNumCtx = {
-              value: piModel.contextWindow || 128000,
-            };
-            agent._onPayload = async (payload: Record<string, unknown>, modelArg: unknown) => {
-              let result = originalOnPayload
-                ? await originalOnPayload.call(agent, payload, modelArg)
-                : payload;
-              if (result === undefined) result = payload;
-              return { ...result, num_ctx: ollamaNumCtx.value };
-            };
-            this.piSessions.get(session.id)!.ollamaNumCtx = ollamaNumCtx;
-            log(
-              '[ClaudeAgentRunner] Ollama _onPayload wrapper installed, num_ctx:',
-              ollamaNumCtx.value
-            );
-          } // end else (_onPayload exists)
-        }
-
-        logTiming('agent session created', runStartTime);
-      }
+        },
+      });
+      logTiming(isReused ? 'agent session reused' : 'agent session created', runStartTime);
 
       // Set up event handler to bridge agent SDK events → our ServerEvent protocol
 
