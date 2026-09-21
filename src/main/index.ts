@@ -1335,6 +1335,40 @@ async function saveFileToDownloads(
   }
 }
 
+/**
+ * 产物路径归一化（reveal + checkPaths 共用）：
+ * 相对路径按 cwd 拼；模型手拼的 "default_working_dir/..." 嵌套直接回收锚定到
+ * 真实 default_working_dir；/workspace/... 虚拟前缀按 cwd 拼。
+ */
+function resolveArtifactCandidate(rawPath: string, cwd?: string): string {
+  let normalized = decodePathSafely(rawPath.trim());
+  if (normalized.startsWith('file://')) {
+    normalized = localPathFromFileUrl(normalized) ?? normalized;
+  }
+  const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
+  if (!isAbsolute(normalized) && !isWindowsDrivePath(normalized) && !isUncPath(normalized)) {
+    normalized = resolve(baseDir, normalized);
+  }
+  const defaultDir = getWorkingDir();
+  const defaultName = defaultDir ? basename(defaultDir).toLowerCase() : '';
+  if (defaultDir && defaultName) {
+    const parts = normalized.split(/[\\/]+/);
+    const index = parts.findIndex((part) => part.toLowerCase() === defaultName);
+    if (index >= 0 && index < parts.length - 1) {
+      normalized = resolve(defaultDir, ...parts.slice(index + 1));
+    }
+  }
+  if (normalized.startsWith('/workspace/') || /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalized)) {
+    const relative = normalized.startsWith('/workspace/')
+      ? normalized.slice('/workspace/'.length)
+      : normalized.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
+    normalized = resolve(baseDir, relative);
+  }
+  const resolved = isUncPath(normalized) ? normalized : resolve(normalized);
+  log('[artifacts] resolve candidate:', { rawPath, cwd, resolved });
+  return resolved;
+}
+
 async function revealFileInFolder(filePath: string, cwd?: string): Promise<boolean> {
   if (!filePath) {
     return false;
@@ -1356,29 +1390,7 @@ async function revealFileInFolder(filePath: string, cwd?: string): Promise<boole
     normalizedPath = localPath;
   }
 
-  const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
-  if (
-    !isAbsolute(normalizedPath) &&
-    !isWindowsDrivePath(normalizedPath) &&
-    !isUncPath(normalizedPath)
-  ) {
-    normalizedPath = resolve(baseDir, normalizedPath);
-  }
-
-  if (
-    normalizedPath.startsWith('/workspace/') ||
-    /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalizedPath)
-  ) {
-    const relativePart = normalizedPath.startsWith('/workspace/')
-      ? normalizedPath.slice('/workspace/'.length)
-      : normalizedPath.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
-    normalizedPath = resolve(baseDir, relativePart);
-  }
-
-  if (!isUncPath(normalizedPath)) {
-    normalizedPath = resolve(normalizedPath);
-  }
-  log('[shell.showItemInFolder] request:', { filePath, cwd, resolved: normalizedPath });
+  normalizedPath = resolveArtifactCandidate(normalizedPath, cwd);
 
   const findFileByName = (fileName: string, roots: string[]): string | null => {
     if (!fileName) {
@@ -1517,28 +1529,13 @@ ipcMain.handle('artifacts.checkPaths', async (_event, paths: string[], cwd?: str
   if (!Array.isArray(paths) || paths.length === 0) {
     return [];
   }
-  const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
 
   const checks = paths.map(async (raw): Promise<string | null> => {
     if (typeof raw !== 'string' || !raw.trim()) {
       return null;
     }
-    let normalized = raw.trim();
-
-    if (!isAbsolute(normalized) && !isWindowsDrivePath(normalized) && !isUncPath(normalized)) {
-      normalized = resolve(baseDir, normalized);
-    }
-
-    if (normalized.startsWith('/workspace/') || /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalized)) {
-      const relativePart = normalized.startsWith('/workspace/')
-        ? normalized.slice('/workspace/'.length)
-        : normalized.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
-      normalized = resolve(baseDir, relativePart);
-    }
-
-    if (!isUncPath(normalized)) {
-      normalized = resolve(normalized);
-    }
+    // 与 revealFileInFolder 同一套归一化（嵌套默认目录回收 + /workspace 映射）。
+    const normalized = resolveArtifactCandidate(raw, cwd);
 
     try {
       // Async stat: this handler is called on every finalized message and the

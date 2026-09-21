@@ -136,7 +136,12 @@ export function extractFilePathCandidatesFromText(text: string): string[] {
   // and only ever captured path tails (broke the artifacts panel on Windows).
   // NOTE: filename charset intentionally excludes CJK punctuation (U+3000-303F) so
   // things like "总结。docx" or "要点、png" are never treated as files.
-  const pathLikeRegex = /(?:[A-Za-z]:[\\/]|\/)?(?:[\w\u4e00-\u9fff.\-_]+[\\/])*[\w\u4e00-\u9fff.\-_]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz)/giu;
+  // ASCII brackets/parens ARE included: real-world filenames often contain
+  // them (e.g. "西直门外大街136号1(1).docx", "report[final].pdf"). A match that
+  // merely wraps a path in outer parens ("(C:\out\a.docx)") is unwrapped by
+  // normalizeArtifactPathValue, so including them nets far more true positives
+  // than false ones.
+  const pathLikeRegex = /(?:[A-Za-z]:[\\/]|\/)?(?:[\w\u4e00-\u9fff.\-_()\[\]]+[\\/])*[\w\u4e00-\u9fff.\-_()\[\]]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz)/giu;
   for (const found of decodedForScan.matchAll(pathLikeRegex)) {
     const index = typeof found.index === 'number' ? found.index : -1;
     // Skip matches that live inside a URL token (e.g. https://host/README.md),
@@ -178,8 +183,10 @@ function extractFilePathFromText(text: string): string | null {
     || text.match(/The file (.+?) has been updated(?: successfully)?(?:\.|$)/i)
     || text.match(/Saved screenshot to ([^\r\n]+)/i)
     // Chinese patterns: 文件已生成/已创建/已保存/已写入/路径
-    || text.match(/(?:已生成|已创建|已保存|已写入|已导出|路径|保存到|生成到|输出到|写入到|创建到)[:：\s]*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i)
-    || text.match(/(?:文件|报告|文档|演示文稿|表格|幻灯片)[:：\s]*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i);
+    // NOTE: 分隔符只认 [:：] 和空白，不认括号 —— 正文里
+    // "交付文件（已收到…）" 这种“文件（…”不能误命中。路径必须紧跟分隔符。
+    || text.match(/(?:已生成|已创建|已保存|已写入|已导出|保存到|生成到|输出到|写入到|创建到)\s*[:：]?\s*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i)
+    || text.match(/(?:文件|报告|文档|演示文稿|表格|幻灯片)\s*[:：]\s*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i);
   if (!match || !match[1]) {
     return null;
   }

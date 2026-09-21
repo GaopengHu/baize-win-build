@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     xz-utils \
+    unzip \
     wine \
     wine64 \
     && rm -rf /var/lib/apt/lists/*

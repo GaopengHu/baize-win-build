@@ -186,9 +186,15 @@ function main() {
   console.log('\nRunning pre-build checks...\n');
 
   const requestedArch = process.argv[2] || undefined;
+  // Allow cross-compile callers (e.g. build-win7.mjs running on linux) to
+  // request a target platform. Defaults to the host platform (old behaviour).
+  const targetPlatform = process.env.TARGET_PLATFORM || process.platform;
+  if (targetPlatform !== process.platform) {
+    console.log(`Target platform override: ${targetPlatform} (host: ${process.platform})`);
+  }
   const { passed, warnings, failed, hasFatal } = runChecks(
     PROJECT_ROOT,
-    process.platform,
+    targetPlatform,
     requestedArch
   );
 

@@ -73,7 +73,49 @@ const TITLE_GENERATION_TIMEOUT_MS = 20000;
 // message, never displayed). Carries the intent to keep generating from the
 // existing context, which already holds the rescued partial reply.
 const RESUME_PROMPT =
-  '请从上次中断的地方继续输出，不要重复已经输出过的内容，不要解释，直接继续。';
+  '请从上次中断的地方继续输出，不要重复已经输出过的内容，不要解释，直接继续.';
+
+/**
+ * Windows 下同名附件反复上传时，<cwd>\.tmp\<原名> 经常被占用（上次拷贝句柄 /
+ * 杀软扫描 / 资源管理器预览锁），直接 copyFileSync 会抛 EPERM 导致整条附件
+ * 被跳过（"Failed to process file attachment: EPERM..."）。
+ * 遇到 EPERM/EBUSY/EACCES 时改用 -1、-2… 后缀找空位，保证附件不丢失。
+ */
+function copyAttachmentWithRetry(
+  tmpDir: string,
+  baseFilename: string,
+  write: (target: string) => void
+): string {
+  const firstPath = path.join(tmpDir, baseFilename);
+  try {
+    write(firstPath);
+    return firstPath;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code ?? '';
+    if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') {
+      throw err;
+    }
+    let lastErr: unknown = err;
+    for (let i = 1; i < 1000; i++) {
+      const ext = path.extname(baseFilename);
+      const stem = baseFilename.slice(0, baseFilename.length - ext.length);
+      const retryPath = path.join(tmpDir, `${stem}-${i}${ext}`);
+      if (fs.existsSync(retryPath)) continue;
+      try {
+        write(retryPath);
+        log('[SessionManager] Destination locked, used fallback name:', retryPath);
+        return retryPath;
+      } catch (retryErr) {
+        const retryCode = (retryErr as NodeJS.ErrnoException)?.code ?? '';
+        if (retryCode !== 'EPERM' && retryCode !== 'EBUSY' && retryCode !== 'EACCES') {
+          throw retryErr;
+        }
+        lastErr = retryErr;
+      }
+    }
+    throw lastErr;
+  }
+}
 
 export class SessionManager {
   private db: DatabaseInstance;
@@ -566,14 +608,16 @@ export class SessionManager {
           const sourcePath = (fileBlock.relativePath || '').trim(); // This is the full path from Electron
           // IMPORTANT: Use path.basename() to extract only the filename, not the full path
           const fallbackFilename = fileBlock.filename || sourcePath || `attachment-${Date.now()}`;
-          const destFilename = path.basename(fallbackFilename);
-          if (!destFilename) continue;
-          const destPath = path.join(tmpDir, destFilename);
+          const baseFilename = path.basename(fallbackFilename);
+          if (!baseFilename) continue;
           let actualSize = 0;
+          let destPath: string;
 
-          // Copy file to .tmp directory
+          // Copy file to .tmp directory (locked same-name destination falls back to -1/-2… suffix)
           if (sourcePath && fs.existsSync(sourcePath)) {
-            fs.copyFileSync(sourcePath, destPath);
+            destPath = copyAttachmentWithRetry(tmpDir, baseFilename, (target) =>
+              fs.copyFileSync(sourcePath, target)
+            );
 
             // Get actual file size
             const stats = fs.statSync(destPath);
@@ -588,7 +632,9 @@ export class SessionManager {
             );
           } else if (fileBlock.inlineDataBase64) {
             const buffer = Buffer.from(fileBlock.inlineDataBase64, 'base64');
-            fs.writeFileSync(destPath, buffer);
+            destPath = copyAttachmentWithRetry(tmpDir, baseFilename, (target) =>
+              fs.writeFileSync(target, buffer)
+            );
             actualSize = buffer.length;
             log('[SessionManager] Wrote file from inline data:', destPath, `(${actualSize} bytes)`);
           } else {
@@ -602,6 +648,7 @@ export class SessionManager {
 
           // If sandbox is already initialized, sync the file to sandbox as well
           // This handles the case where user attaches files in subsequent messages
+          const destFilename = path.basename(destPath);
           const sandboxPath = SandboxSync.getSandboxPath(session.id);
           if (sandboxPath) {
             const sandboxRelativePath = `.tmp/${destFilename}`;

@@ -337,15 +337,18 @@ function resolveBundledFfmpegPath(): string | null {
 let pathEnriched = false;
 
 /**
- * Resolve the directory that holds bundled whisper models (read-only, shipped with the app).
- * Dev: <projectRoot>/resources/whisper-models  Packaged: <process.resourcesPath>/whisper-models
+ * Resolve the directory that holds bundled FunASR models (read-only, shipped with the app).
+ * Dev: <projectRoot>/resources/funasr-models  Packaged: <process.resourcesPath>/funasr-models
  */
-function resolveBundledWhisperModelsDir(): string | null {
+function resolveBundledAsrModelsDir(): string | null {
   const candidates: string[] = [];
   if (!app.isPackaged) {
     const projectRoot = path.join(__dirname, '..', '..');
+    candidates.push(path.join(projectRoot, 'resources', 'funasr-models'));
+    // 兼容旧目录名（历史版本曾用 resources/whisper-models）
     candidates.push(path.join(projectRoot, 'resources', 'whisper-models'));
   } else {
+    candidates.push(path.join(process.resourcesPath, 'funasr-models'));
     candidates.push(path.join(process.resourcesPath, 'whisper-models'));
   }
 
@@ -360,14 +363,19 @@ async function enrichProcessPathForBuild(): Promise<void> {
   pathEnriched = true;
 
   // ASR model dir resolution order:
-  // 1. Bundled models shipped inside the app (resources/whisper-models) — read-only, no download needed.
-  // 2. Per-user writable cache in userData/models/whisper — used when the app ships no bundled model.
-  const bundledWhisperModels = resolveBundledWhisperModelsDir();
-  const asrModelDir = bundledWhisperModels ?? path.join(app.getPath('userData'), 'models', 'whisper');
-  if (!process.env.ASR_WHISPER_MODEL_DIR) {
-    process.env.ASR_WHISPER_MODEL_DIR = asrModelDir;
+  // 1. Bundled models shipped inside the app (resources/funasr-models) — read-only, no download needed.
+  // 2. Per-user writable cache in userData/models/funasr — used when the app ships no bundled model.
+  // 新变量 ASR_MODEL_DIR 优先；旧 ASR_WHISPER_MODEL_DIR 若已由用户设置则沿用（兼容老版本）。
+  const bundledAsrModels = resolveBundledAsrModelsDir();
+  const asrModelDir =
+    process.env.ASR_MODEL_DIR ||
+    process.env.ASR_WHISPER_MODEL_DIR ||
+    bundledAsrModels ||
+    path.join(app.getPath('userData'), 'models', 'funasr');
+  if (!process.env.ASR_MODEL_DIR) {
+    process.env.ASR_MODEL_DIR = asrModelDir;
     log(
-      `[ClaudeAgentRunner] ASR_WHISPER_MODEL_DIR=${asrModelDir}${bundledWhisperModels ? ' (bundled, read-only)' : ' (userData cache)'}`
+      `[ClaudeAgentRunner] ASR_MODEL_DIR=${asrModelDir}${bundledAsrModels ? ' (bundled, read-only)' : ' (userData cache)'}`
     );
   }
 
@@ -1243,9 +1251,28 @@ ${hints.join('\n')}
    * Wrap the bash tool to inject a default timeout when the model omits one.
    * The agent SDK's bash tool has no default timeout, which means
    * commands can run indefinitely if the model doesn't specify a timeout.
+   *
+   * 长任务放行：ASR 转写 / 模型下载 / pip 安装首次跑要几分钟到几十分钟，
+   * 且转写脚本已切后台任务模式（--async 提交后秒退，--status 轮询）。
+   * 这些命令若只给 120 秒必被杀，还会拖出整轮 5 分钟无活动超时。
+   * 用命令特征识别后直接给 1 小时，短命令仍保持 120 秒防挂死。
    */
   private static wrapBashToolWithDefaultTimeout(tools: ToolDefinition[]): ToolDefinition[] {
     const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
+    const LONG_TASK_TIMEOUT_SECONDS = 3600;
+    // 命中任一即视为长任务：asr 转写/模型预下载、pip 安装、npm 安装、
+    // electron 打包、ffmpeg 音视频处理。
+    const LONG_TASK_PATTERNS = [
+      /transcribe\.py/i,
+      /download_model\.py/i,
+      /download-win-better-sqlite3/i,
+      /bundle-mcp/i,
+      /pre-build-check/i,
+      /pip(3)?\s+install/i,
+      /npm\s+(install|ci|run\s+build)/i,
+      /electron-builder/i,
+      /ffmpeg/i,
+    ];
 
     return tools.map((tool) => {
       if (tool.name !== 'bash') return tool;
@@ -1261,9 +1288,24 @@ ${hints.join('\n')}
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           ctx: any
         ) => {
-          const effectiveParams =
-            params.timeout != null ? params : { ...params, timeout: DEFAULT_BASH_TIMEOUT_SECONDS };
-          return originalExecute(toolCallId, effectiveParams, signal, onUpdate, ctx);
+          if (params.timeout != null) {
+            return originalExecute(toolCallId, params, signal, onUpdate, ctx);
+          }
+          const isLongTask = LONG_TASK_PATTERNS.some((re) => re.test(params.command || ''));
+          const timeout = isLongTask ? LONG_TASK_TIMEOUT_SECONDS : DEFAULT_BASH_TIMEOUT_SECONDS;
+          if (isLongTask) {
+            log(
+              `[ClaudeAgentRunner] Long-running task detected, timeout extended to ${timeout}s:`,
+              (params.command || '').slice(0, 120)
+            );
+          }
+          return originalExecute(
+            toolCallId,
+            { ...params, timeout },
+            signal,
+            onUpdate,
+            ctx
+          );
         },
       } as ToolDefinition;
     });
