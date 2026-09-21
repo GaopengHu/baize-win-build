@@ -128,9 +128,27 @@ export function wrapBashToolForSudo(
  * Wrap the bash tool to inject a default timeout when the model omits one.
  * The agent SDK's bash tool has no default timeout, which means
  * commands can run indefinitely if the model doesn't specify a timeout.
+ *
+ * 长任务放行：ASR 转写 / 模型下载 / pip 安装首次跑要几分钟到几十分钟。
+ * 这些命令若只给 120 秒必被杀，还会拖出整轮 5 分钟无活动超时。
+ * 用命令特征识别后直接给 1 小时，短命令仍保持 120 秒防挂死。
  */
 export function wrapBashToolWithDefaultTimeout(tools: ToolDefinition[]): ToolDefinition[] {
   const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
+  const LONG_TASK_TIMEOUT_SECONDS = 3600;
+  // 命中任一即视为长任务：asr 转写/模型预下载、pip 安装、npm 安装、
+  // electron 打包、ffmpeg 音视频处理。
+  const LONG_TASK_PATTERNS = [
+    /transcribe\.py/i,
+    /download_model\.py/i,
+    /download-win-better-sqlite3/i,
+    /bundle-mcp/i,
+    /pre-build-check/i,
+    /pip(3)?\s+install/i,
+    /npm\s+(install|ci|run\s+build)/i,
+    /electron-builder/i,
+    /ffmpeg/i,
+  ];
 
   return tools.map((tool) => {
     if (tool.name !== 'bash') return tool;
@@ -146,9 +164,18 @@ export function wrapBashToolWithDefaultTimeout(tools: ToolDefinition[]): ToolDef
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ctx: any
       ) => {
-        const effectiveParams =
-          params.timeout != null ? params : { ...params, timeout: DEFAULT_BASH_TIMEOUT_SECONDS };
-        return originalExecute(toolCallId, effectiveParams, signal, onUpdate, ctx);
+        if (params.timeout != null) {
+          return originalExecute(toolCallId, params, signal, onUpdate, ctx);
+        }
+        const isLongTask = LONG_TASK_PATTERNS.some((re) => re.test(params.command || ''));
+        const timeout = isLongTask ? LONG_TASK_TIMEOUT_SECONDS : DEFAULT_BASH_TIMEOUT_SECONDS;
+        if (isLongTask) {
+          log(
+            `[ClaudeAgentRunner] Long-running task detected, timeout extended to ${timeout}s:`,
+            (params.command || '').slice(0, 120)
+          );
+        }
+        return originalExecute(toolCallId, { ...params, timeout }, signal, onUpdate, ctx);
       },
     } as ToolDefinition;
   });

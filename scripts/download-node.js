@@ -23,6 +23,9 @@ const PLATFORMS = {
 const BASE_URL = process.env.NODEJS_DIST_URL || 'https://npmmirror.com/mirrors/node';
 const OUTPUT_DIR = path.join(__dirname, '..', 'resources', 'node');
 const DOWNLOAD_ALL_PLATFORMS = process.env.OPEN_COWORK_DOWNLOAD_ALL_NODE_BINARIES === '1';
+// 按需下载，例如 OPEN_COWORK_DOWNLOAD_NODE_TARGETS=win32-x64
+// 或多目标 OPEN_COWORK_DOWNLOAD_NODE_TARGETS=win32-x64,linux-x64
+const DOWNLOAD_TARGETS_RAW = (process.env.OPEN_COWORK_DOWNLOAD_NODE_TARGETS || '').trim();
 const WINDOWS_UNLINK_RETRY_COUNT = 8;
 const WINDOWS_UNLINK_RETRY_DELAY_MS = 500;
 
@@ -183,8 +186,17 @@ async function downloadAndExtract(platform, arch) {
         // PowerShell on Windows
         execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${extractDir}' -Force"`, { stdio: 'inherit' });
       } else {
-        // unzip on Unix
-        execSync(`unzip -q "${archivePath}" -d "${extractDir}"`, { stdio: 'inherit' });
+        // unzip on Unix; minimal images (e.g. ubuntu:22.04) may not ship
+        // unzip — fall back to python3's zipfile module which is always
+        // present in our build image.
+        try {
+          execSync(`unzip -q "${archivePath}" -d "${extractDir}"`, { stdio: 'inherit' });
+        } catch {
+          console.log('unzip not available, falling back to python3 -m zipfile');
+          execSync(`python3 -m zipfile -e "${archivePath}" "${extractDir}"`, {
+            stdio: 'inherit',
+          });
+        }
       }
       // Move contents up one level
       const innerDir = path.join(extractDir, nodeName);
@@ -252,26 +264,44 @@ async function downloadAndExtract(platform, arch) {
 async function main() {
   console.log('Downloading Node.js binaries...\n');
 
-  const downloads = [];
-  const platformsToDownload = DOWNLOAD_ALL_PLATFORMS
-    ? Object.entries(PLATFORMS)
-    : [[process.platform, PLATFORMS[process.platform] || {}]];
+  const jobs = [];
+  const push = (platform, arch) => jobs.push(downloadAndExtract(platform, arch));
 
-  if (!DOWNLOAD_ALL_PLATFORMS) {
+  if (DOWNLOAD_TARGETS_RAW) {
+    const targets = DOWNLOAD_TARGETS_RAW.split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    console.log(`Targeted platforms: ${targets.join(', ')}`);
+    for (const t of targets) {
+      const idx = t.lastIndexOf('-');
+      if (idx === -1) {
+        console.log(`Skipping invalid target: ${t}`);
+        continue;
+      }
+      const platform = t.slice(0, idx);
+      const arch = t.slice(idx + 1);
+      if (!PLATFORMS[platform]?.[arch]) {
+        console.log(`Skipping unknown target: ${t}`);
+        continue;
+      }
+      push(platform, arch);
+    }
+  } else if (DOWNLOAD_ALL_PLATFORMS) {
+    for (const [platform, arches] of Object.entries(PLATFORMS)) {
+      for (const arch of Object.keys(arches)) {
+        push(platform, arch);
+      }
+    }
+  } else {
     console.log(`Current platform only: ${process.platform}-${process.arch}`);
-  }
-
-  for (const [platform, arches] of platformsToDownload) {
-    const archList = DOWNLOAD_ALL_PLATFORMS
-      ? Object.keys(arches)
-      : [process.arch];
-
-    for (const arch of archList) {
-      downloads.push(downloadAndExtract(platform, arch));
+    if (PLATFORMS[process.platform]?.[process.arch]) {
+      push(process.platform, process.arch);
+    } else {
+      console.log(`Skipping ${process.platform}-${process.arch} (not configured)`);
     }
   }
 
-  await Promise.all(downloads);
+  await Promise.all(jobs);
   console.log('\n✓ All Node.js binaries downloaded!');
 }
 

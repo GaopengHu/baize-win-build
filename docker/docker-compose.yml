@@ -53,6 +53,11 @@ services:
       - NPM_INSTALL_ARGS=--ignore-scripts --no-fund --no-audit --legacy-peer-deps
       # 跳过 GPG 校验（内网环境没有 keyservers）
       - NODEJS_CHECK_SIGNATURES=0
+      # 下载全部平台的 Node 运行时（含 win32-x64），否则 win 打包会缺 resources/node
+      - OPEN_COWORK_DOWNLOAD_ALL_NODE_BINARIES=1
+      # 只打 Windows 包时，仅下载 win32-x64（逗号分隔可多选，如 win32-x64,linux-x64）；
+      # 该变量优先级高于上面的全量开关
+      - OPEN_COWORK_DOWNLOAD_NODE_TARGETS=win32-x64,linux-x64
     command: >
       sh -c "
         echo '--- 今点通 Win7 Build Container ---' &&
@@ -68,6 +73,11 @@ services:
         node scripts/download-node.js &&
         echo 'Step 3: Download Windows better-sqlite3' &&
         npm run prebuild:win &&
+        echo 'Step 3.5: Build WSL sandbox agent' &&
+        npm run build:wsl-agent &&
+        echo 'Step 3.6: Clean stale win-unpacked leftovers (avoids EnsureEmptyDir permission errors on bind mounts)' &&
+        (rm -rf release/win-unpacked || sudo rm -rf release/win-unpacked || true) &&
+        mkdir -p release/win-unpacked &&
         echo 'Step 4: Build MCP bundles' &&
         npm run build:mcp &&
         echo 'Step 5: Build installer' &&

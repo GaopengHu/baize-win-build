@@ -1,11 +1,11 @@
 # 输出格式样例
 
 以下为脱敏虚构内容，仅示意输出格式。实际转写命令见上级 SKILL.md。
-本地引擎 v2.1 起为 FunASR Paraformer-Large（默认 INT8 量化 ONNX；说话人分离走完整版 CAM++），输出形态不变。
+本地引擎 v2.0 起为 FunASR Paraformer-Large（默认 INT8 量化 ONNX；说话人分离走完整版 CAM++），输出形态不变。
 
 ## .srt 格式（带说话人标注 + 时间戳）
 
-`--diarize` 输出形态（说话人由 CAM++ 自动聚类，按首次出现顺序编号）：
+`--engine funasr --diarize` 输出形态（说话人由 CAM++ 自动聚类，按首次出现顺序编号）：
 
 ```
 1

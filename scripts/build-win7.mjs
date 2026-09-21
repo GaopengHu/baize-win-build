@@ -67,9 +67,6 @@ function writePlatformConfig() {
     mkdirSync(resourcesDir, { recursive: true });
   }
   const configPath = resolve(resourcesDir, 'platform-config.json');
-  if (existsSync(configPath)) {
-    execSync(`rm -f "${configPath}"`, { stdio: 'ignore' });
-  }
   writeFileSync(configPath, JSON.stringify(config, null, 2));
   log(`Platform config written: ${configPath} -> ${JSON.stringify(config)}`);
 }
@@ -149,7 +146,12 @@ async function main() {
   run('npx rimraf dist-electron', { timeout: 60000 });
   run('npx vite build', { timeout: 900000 });
 
-  // 4. Pre-build check
+  // 4. Pre-build check — build-win7.mjs always targets Windows, even when the
+  // container host platform is linux. Force the target so the Node-binary /
+  // agent checks validate win32 resources instead of the host platform.
+  process.env.TARGET_PLATFORM = process.env.TARGET_PLATFORM || 'win32';
+  process.env.TARGET_PRETTY_NAME = process.env.TARGET_PRETTY_NAME || 'windows';
+  process.env.TARGET_SHELL = process.env.TARGET_SHELL || 'powershell.exe';
   log('Running pre-build check...');
   run('node scripts/pre-build-check.js');
 
@@ -163,6 +165,12 @@ async function main() {
     ...process.env,
     ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/',
     ELECTRON_BUILDER_BINARIES_MIRROR: process.env.ELECTRON_BUILDER_BINARIES_MIRROR || 'https://npmmirror.com/mirrors/electron-builder-binaries/',
+    // Build for the Windows target even when the pre-build check ran under
+    // the container platform (linux) — otherwise the Node/binary checks
+    // validate the wrong platform and electron-builder gets no target hint.
+    TARGET_PLATFORM: process.env.TARGET_PLATFORM || 'win32',
+    TARGET_PRETTY_NAME: process.env.TARGET_PRETTY_NAME || 'windows',
+    TARGET_SHELL: process.env.TARGET_SHELL || 'powershell.exe',
   };
   // Docker Desktop bind mount 文件 I/O 慢 + 依赖树重复包多，打包/asar/NSIS 阶段
   // 实测可超过 30 分钟，超时放宽到 90 分钟。

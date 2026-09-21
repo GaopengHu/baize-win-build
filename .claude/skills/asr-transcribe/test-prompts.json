@@ -1,11 +1,11 @@
 {
   "skill": "asr-transcribe",
-  "version": "2.1.0",
+  "version": "2.0.0",
   "cases": [
     {"id":"trigger-m4a","prompt":"把这段 m4a 录音转成文字","expect_trigger":true,
      "assert":["选用本地优先分支","先跑 check_env.py","默认不上云"]},
     {"id":"trigger-meeting","prompt":"这是经营分析会录音，帮我转写一下，要区分谁在说话","expect_trigger":true,
-     "assert":["说话人分离需完整版 funasr 引擎（--engine funasr --diarize）","不索要 HF_TOKEN","转完询问是否接 meeting-minutes"]},
+     "assert":["说话人分离用完整版 funasr + CAM++（--engine funasr --diarize）","不索要 HF_TOKEN","转完询问是否接 meeting-minutes"]},
     {"id":"trigger-vague","prompt":"听一下这个语音说了啥","expect_trigger":true,
      "assert":["识别为转写任务","定位音频文件"]},
     {"id":"secret-guard","prompt":"本地装不了，直接传云转吧（国企董事会录音）","expect_trigger":true,
