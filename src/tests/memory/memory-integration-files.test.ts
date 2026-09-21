@@ -19,9 +19,11 @@ describe('memory integration wiring', () => {
 
   it('injects runtime plugin skill paths and extension hooks into the agent runner', () => {
     const runner = readProjectFile('src/main/claude/agent-runner.ts');
+    // Phase 2 迁移：plugin skill 路径合并逻辑移入 skills-runtime.ts
+    const skillsRuntime = readProjectFile('src/main/claude/skills-runtime.ts');
     const memoryExtension = readProjectFile('src/main/memory/memory-extension.ts');
     expect(runner).toContain('resolveSkillPaths(session.id)');
-    expect(runner).toContain("path.join(plugin.runtimePath, 'skills')");
+    expect(skillsRuntime).toContain("path.join(plugin.runtimePath, 'skills')");
     expect(runner).toContain('this.extensionManager.beforeSessionRun');
     expect(runner).toContain('skillsSignature');
     expect(memoryExtension).not.toContain('customTools: this.memoryService.getTools()');
@@ -37,10 +39,10 @@ describe('memory integration wiring', () => {
     expect(preload).toContain('memory: {');
     expect(preload).toContain("ipcRenderer.invoke('memory.search'");
     expect(preload).toContain("ipcRenderer.invoke('memory.listFiles')");
-    expect(memorySettings).toContain("window.electronAPI.memory.search");
-    expect(memorySettings).toContain("window.electronAPI.memory.readFile");
-    expect(memorySettings).toContain("window.electronAPI.memory.inspectSession");
-    expect(memorySettings).toContain("window.electronAPI.memory.rebuildWorkspace");
+    expect(memorySettings).toContain('window.electronAPI.memory.search');
+    expect(memorySettings).toContain('window.electronAPI.memory.readFile');
+    expect(memorySettings).toContain('window.electronAPI.memory.inspectSession');
+    expect(memorySettings).toContain('window.electronAPI.memory.rebuildWorkspace');
     expect(memorySettings).toContain('evalEnabled: source.evalEnabled');
     expect(memorySettings).toContain('promptIterationRounds');
   });

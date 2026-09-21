@@ -1,7 +1,23 @@
 /**
  * @module main/claude/agent-runner
  *
- * AI query execution engine (1514 lines).
+ * AI 查询执行编排器（Phase 0-6 重构后；AGENT-RUNNER-REFACTOR-PLAN.md §2.1-§2.2）。
+ *
+ * 架构地图（原 3322 行 God Class 拆分后各阶段落点）：
+ * - Stage 0 沙箱准备/回同步           → 本文件 run()（合法留在编排器）
+ * - Stage 1 模型解析                  → pi-model-resolution.ts
+ * - Stage 2 任务分类 + 三策略         → pipeline/task-classifier + prompt/tool/thinking-strategy
+ * - Stage 3 会话装配                  → pipeline/session-factory（PiSessionFactory）
+ *   + 冷启动历史                      → pipeline/cold-start-history
+ *   + MCP servers 配置                → 本文件 buildMcpServersConfig()（Phase 6 提取）
+ *   + MCP customTools 桥接            → tools/mcp-tool-bridge
+ *   + 权限钩子                        → tools/permission-hook
+ *   + skills 目录/路径管理            → skills-runtime.ts
+ * - Stage 4 执行（事件流桥接/loop guard/prompt）→ 本文件 run()（合法留在编排器）
+ * - Stage 5 收尾（abort 判定/trace/沙箱回同步） → 本文件 run()
+ *
+ * 行为不变量：工具集恒定全量、从不按任务裁剪（§3.3）；从不调用
+ * setActiveToolsByName；session 缓存签名机制维持（含 apiKeyFingerprint，R1）。
  *
  * Responsibilities:
  * - Runs AI conversations via the 今点通 agent SDK (createAgentSession)
@@ -12,21 +28,10 @@
  *
  * Dependencies: session-manager, mcp-manager, config-store, skills-manager
  */
-import {
-  createAgentSession,
-  SessionManager as PiSessionManager,
-  SettingsManager as PiSettingsManager,
-  createCodingTools,
-  type BashToolOptions,
-  type AgentSession as PiAgentSession,
-  type ToolDefinition,
-} from '@mariozechner/pi-coding-agent';
-import { Type, type TSchema } from '@sinclair/typebox';
-import { getSharedAuthStorage, ModelRegistry } from './shared-auth';
+import { type BashToolOptions } from '@mariozechner/pi-coding-agent';
+import { getSharedAuthStorage } from './shared-auth';
 import type { Session, Message, TraceStep, ServerEvent, ContentBlock } from '../../renderer/types';
 import { v4 as uuidv4 } from 'uuid';
-import { decidePermission, rememberAlwaysAllow } from '../config/permission-rules-store';
-import { classifyPermission, resolvePermissionGate } from '../utils/permission-classifier';
 import { PathResolver } from '../sandbox/path-resolver';
 import { MCPManager } from '../mcp/mcp-manager';
 import { mcpConfigStore } from '../mcp/mcp-config-store';
@@ -41,9 +46,7 @@ import {
 } from '../utils/logger';
 import * as path from 'path';
 import * as fs from 'fs';
-import * as os from 'os';
-import { execFileSync, spawn } from 'child_process';
-import { app } from 'electron';
+import { execFileSync } from 'child_process';
 import { setMaxListeners } from 'node:events';
 import { getSandboxAdapter } from '../sandbox/sandbox-adapter';
 import { pathConverter } from '../sandbox/wsl-bridge';
@@ -53,10 +56,14 @@ import {
   buildArtifactTraceSteps,
   buildArtifactCompletionText,
 } from '../utils/artifact-parser';
-import { getDefaultShell } from '../utils/shell-resolver';
-import { detectCommandTools, formatDetectedTools } from '../utils/detect-command-tools';
+import { classifyTask } from './pipeline/task-classifier';
+import { PromptStrategy, VIRTUAL_WORKSPACE_PATH } from './pipeline/prompt-strategy';
+import { ToolStrategy } from './pipeline/tool-strategy';
+import { ThinkingStrategy } from './pipeline/thinking-strategy';
+import type { ModelContext, PiThinkingLevel, TaskContext } from './pipeline/context-types';
 import { PluginRuntimeService } from '../skills/plugin-runtime-service';
 import type { SkillsAdapter } from '../skills/skills-adapter';
+import { SkillsRuntime } from './skills-runtime';
 import { AgentRuntimeExtensionManager } from '../extensions/agent-runtime-extension-manager';
 import { configStore } from '../config/config-store';
 import { normalizeOpenAICompatibleBaseUrl } from '../config/auth-utils';
@@ -76,7 +83,6 @@ import {
   resolvePiRouteProtocol,
   resolveSyntheticPiModelFallback,
 } from './pi-model-resolution';
-import { buildPiSessionRuntimeSignature } from './pi-session-runtime';
 import { ThinkTagStreamParser } from './think-tag-parser';
 import {
   attachDeferredMemoryInjection,
@@ -90,517 +96,30 @@ import {
   type LoopGuardDecision,
   type ToolCallDescriptor,
 } from './agent-runner-loop-guard';
-import {
-  normalizeMcpToolResultForModel,
-  normalizeToolExecutionResultForUi,
-} from './tool-result-utils';
+import { normalizeToolExecutionResultForUi } from './tool-result-utils';
 import { fetchOllamaModelInfo } from '../config/ollama-api';
 import { createWindowsBashOperations } from './windows-bash-operations';
+import type { SessionSignatureInput } from './pipeline/context-types';
+import { enrichProcessPathForBuild, getBundledNodePaths } from './pipeline/path-utils';
+import {
+  normalizeTokenUsage,
+  safeStringify,
+  summarizeMessageForLog,
+  toErrorText,
+} from './pipeline/utils';
+import {
+  buildColdStartContextualPrompt,
+  serializeMessageContentForHistory,
+} from './pipeline/cold-start-history';
+import { PiSessionFactory } from './pipeline/session-factory';
+import { buildMcpCustomTools } from './tools/mcp-tool-bridge';
+// bash 工具包装链（timeout/sudo）已迁至 pipeline/tool-strategy.ts（Phase 4）。
+// 冷启动历史序列化 + 组装已迁至 pipeline/cold-start-history.ts（Phase 1/5）；
+// 此处 re-export 保持外部导入方（如 src/tests/claude/agent-runner-history-rebuild.test.ts）兼容。
+export { serializeMessageContentForHistory };
 
 // Virtual workspace path shown to the model (hides real sandbox path)
-const VIRTUAL_WORKSPACE_PATH = '/workspace';
-
-/**
- * Estimate chars-per-token ratio based on content language.
- * CJK characters tokenize at ~1.5 chars/token vs ~4 for English.
- */
-function estimateCharsPerToken(sampleText: string): number {
-  if (!sampleText || sampleText.length === 0) return 4;
-  const sample = sampleText.substring(0, 500);
-  const cjkCount = (sample.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || [])
-    .length;
-  const cjkRatio = cjkCount / sample.length;
-  return 4 - cjkRatio * 2.5; // Range: 1.5 (pure CJK) ~ 4 (pure English)
-}
-
-// Escape characters that would break the cold-start `<conversation_history>`
-// envelope when interpolated into XML tag bodies or attribute values. Raw user
-// text blocks are intentionally not escaped (preserves legacy compatibility);
-// only the new wrapper tags (`<thinking>`, `<tool_use>`, `<tool_result>`) and
-// their attributes pass through these.
-//
-// Attribute values additionally need `"` escaped because attributes are
-// double-quoted. Tag bodies do not (keeping `"` keeps JSON input legible to
-// the model).
-function escapeXmlAttr(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function escapeXmlText(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-/**
- * Serialize a message's content blocks into the XML representation used inside the
- * cold-start `<conversation_history>` preamble.
- *
- * Why this exists: when the cached pi-coding-agent SDK session is disposed (cwd
- * change or runtime-signature change), agent-runner rebuilds history from
- * DB-persisted messages. The previous implementation only kept `text` blocks,
- * which silently dropped `thinking`, `tool_use`, and `tool_result` blocks.
- * Providers that require previous reasoning/tool-call replay (e.g. DeepSeek V4
- * Flash) then fail with 400 on the next turn, and every other thinking-capable
- * model loses its reasoning trace across cwd switches (issue #162 \u2014 Bug B).
- *
- * Blocks handled:
- *   - text          \u2192 raw text (matches the legacy serializer's output)
- *   - thinking      \u2192 `<thinking>\u2026</thinking>`
- *   - tool_use      \u2192 `<tool_use name="\u2026" id="\u2026">{json input}</tool_use>`
- *   - tool_result   \u2192 `<tool_result tool_use_id="\u2026"[ is_error="true"]>\u2026</tool_result>`
- *   - image         \u2192 skipped (binary, cannot live inside an XML text preamble)
- *   - file_attachment \u2192 skipped (large, would bloat the prompt)
- */
-export function serializeMessageContentForHistory(content: ContentBlock[]): string {
-  const parts: string[] = [];
-  for (const block of content) {
-    switch (block.type) {
-      case 'text': {
-        const text = block.text ?? '';
-        if (text.length > 0) parts.push(text);
-        break;
-      }
-      case 'thinking': {
-        const thinking = block.thinking ?? '';
-        if (thinking.length > 0) parts.push(`<thinking>${escapeXmlText(thinking)}</thinking>`);
-        break;
-      }
-      case 'tool_use': {
-        const name = block.name ?? 'unknown';
-        const id = block.id ?? '';
-        let inputStr: string;
-        try {
-          inputStr = JSON.stringify(block.input ?? {});
-        } catch {
-          inputStr = '{}';
-        }
-        parts.push(
-          `<tool_use name="${escapeXmlAttr(name)}" id="${escapeXmlAttr(id)}">${escapeXmlText(inputStr)}</tool_use>`
-        );
-        break;
-      }
-      case 'tool_result': {
-        const id = block.toolUseId ?? '';
-        const errAttr = block.isError ? ' is_error="true"' : '';
-        // Local type says `content: string`, but Anthropic-style payloads
-        // from older message rows or third-party providers may store an
-        // array of content blocks. Flatten defensively so we never serialize
-        // "[object Object]".
-        const rawContent = (block as { content: unknown }).content;
-        let text: string;
-        if (typeof rawContent === 'string') {
-          text = rawContent;
-        } else if (Array.isArray(rawContent)) {
-          text = rawContent
-            .map((c) =>
-              c && typeof c === 'object' && 'text' in c
-                ? String((c as { text: unknown }).text ?? '')
-                : ''
-            )
-            .join('\n');
-        } else {
-          text = '';
-        }
-        parts.push(
-          `<tool_result tool_use_id="${escapeXmlAttr(id)}"${errAttr}>${escapeXmlText(text)}</tool_result>`
-        );
-        break;
-      }
-      case 'image':
-      case 'file_attachment':
-        // Skip \u2014 not representable as XML text in a history preamble.
-        break;
-    }
-  }
-  return parts.join('\n');
-}
-
-// Bundled node/npx paths never change at runtime — resolve once.
-let cachedBundledNodePaths: { node: string; npx: string } | null | undefined = undefined;
-
-function getBundledNodePaths(): { node: string; npx: string } | null {
-  if (cachedBundledNodePaths !== undefined) {
-    return cachedBundledNodePaths;
-  }
-  const platform = process.platform;
-  const arch = process.arch;
-  let resourcesPath: string;
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    resourcesPath = path.join(projectRoot, 'resources', 'node', `${platform}-${arch}`);
-  } else {
-    resourcesPath = path.join(process.resourcesPath, 'node');
-  }
-  const binDir = platform === 'win32' ? resourcesPath : path.join(resourcesPath, 'bin');
-  const nodePath = path.join(binDir, platform === 'win32' ? 'node.exe' : 'node');
-  const npxPath = path.join(binDir, platform === 'win32' ? 'npx.cmd' : 'npx');
-  cachedBundledNodePaths =
-    fs.existsSync(nodePath) && fs.existsSync(npxPath) ? { node: nodePath, npx: npxPath } : null;
-  return cachedBundledNodePaths;
-}
-
-/**
- * Resolve bundled Python bin directory path (if available).
- * Checks packaged and dev layouts, returns the bin dir containing python3.
- */
-function resolveBundledPythonBinDir(): string | null {
-  const platform = process.platform;
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    if (platform === 'darwin') {
-      candidates.push(path.join(projectRoot, 'resources', 'python', `darwin-${arch}`, 'bin'));
-    }
-    candidates.push(path.join(projectRoot, 'resources', 'python', 'bin'));
-  } else {
-    // Packaged layout: Resources/python/bin/python3
-    candidates.push(path.join(process.resourcesPath, 'python', 'bin'));
-  }
-
-  const pythonExe = platform === 'win32' ? 'python.exe' : 'python3';
-  for (const binDir of candidates) {
-    if (fs.existsSync(path.join(binDir, pythonExe))) return binDir;
-  }
-  return null;
-}
-
-/**
- * Resolve bundled tools directory (cliclick etc., macOS only).
- */
-function resolveBundledToolsBinDir(): string | null {
-  if (process.platform !== 'darwin') return null;
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    candidates.push(path.join(projectRoot, 'resources', 'tools', `darwin-${arch}`, 'bin'));
-    candidates.push(path.join(projectRoot, 'resources', 'tools', 'bin'));
-  } else {
-    candidates.push(path.join(process.resourcesPath, 'tools', `darwin-${arch}`, 'bin'));
-    candidates.push(path.join(process.resourcesPath, 'tools', 'bin'));
-  }
-
-  for (const binDir of candidates) {
-    if (fs.existsSync(binDir)) return binDir;
-  }
-  return null;
-}
-
-/**
- * Resolve bundled ffmpeg executable (used by the ASR skill for audio decode).
- * Dev: <projectRoot>/resources/ffmpeg/<platform>/ffmpeg[.exe]
- * Packaged: <process.resourcesPath>/ffmpeg/<platform>/ffmpeg[.exe]
- */
-function resolveBundledFfmpegPath(): string | null {
-  const isWin = process.platform === 'win32';
-  const exeName = isWin ? 'ffmpeg.exe' : 'ffmpeg';
-
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'windows', 'ffmpeg.exe'));
-    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'macos', 'ffmpeg'));
-    candidates.push(path.join(projectRoot, 'resources', 'ffmpeg', 'linux', 'ffmpeg'));
-  } else {
-    const platformDir = process.platform === 'win32' ? 'windows' : process.platform;
-    candidates.push(path.join(process.resourcesPath, 'ffmpeg', platformDir, exeName));
-    candidates.push(path.join(process.resourcesPath, 'ffmpeg', 'windows', 'ffmpeg.exe'));
-  }
-
-  for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-/**
- * One-time enrichment of process.env.PATH for build (production) mode.
- *
- * In dev mode, Electron inherits the user's full shell PATH, so Skill commands
- * like `python3` and `node` just work. In build mode, `process.env.PATH` is
- * minimal (often just `/usr/bin:/bin`).
- *
- * This function:
- * 1. Restores the user's login-shell PATH (safe: uses execFileSync, not execSync)
- * 2. Prepends bundled Node, Python, and tools bin dirs (highest priority)
- * 3. Deduplicates all entries
- * 4. Writes the result back to `process.env.PATH`
- *
- * Called once before the first `createCodingTools()` — subsequent calls are no-ops.
- */
-let pathEnriched = false;
-
-/**
- * Resolve the directory that holds bundled FunASR models (read-only, shipped with the app).
- * Dev: <projectRoot>/resources/funasr-models  Packaged: <process.resourcesPath>/funasr-models
- */
-function resolveBundledAsrModelsDir(): string | null {
-  const candidates: string[] = [];
-  if (!app.isPackaged) {
-    const projectRoot = path.join(__dirname, '..', '..');
-    candidates.push(path.join(projectRoot, 'resources', 'funasr-models'));
-    // 兼容旧目录名（历史版本曾用 resources/whisper-models）
-    candidates.push(path.join(projectRoot, 'resources', 'whisper-models'));
-  } else {
-    candidates.push(path.join(process.resourcesPath, 'funasr-models'));
-    candidates.push(path.join(process.resourcesPath, 'whisper-models'));
-  }
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-async function enrichProcessPathForBuild(): Promise<void> {
-  if (pathEnriched) return;
-  pathEnriched = true;
-
-  // ASR model dir resolution order:
-  // 1. Bundled models shipped inside the app (resources/funasr-models) — read-only, no download needed.
-  // 2. Per-user writable cache in userData/models/funasr — used when the app ships no bundled model.
-  // 新变量 ASR_MODEL_DIR 优先；旧 ASR_WHISPER_MODEL_DIR 若已由用户设置则沿用（兼容老版本）。
-  const bundledAsrModels = resolveBundledAsrModelsDir();
-  const asrModelDir =
-    process.env.ASR_MODEL_DIR ||
-    process.env.ASR_WHISPER_MODEL_DIR ||
-    bundledAsrModels ||
-    path.join(app.getPath('userData'), 'models', 'funasr');
-  if (!process.env.ASR_MODEL_DIR) {
-    process.env.ASR_MODEL_DIR = asrModelDir;
-    log(
-      `[ClaudeAgentRunner] ASR_MODEL_DIR=${asrModelDir}${bundledAsrModels ? ' (bundled, read-only)' : ' (userData cache)'}`
-    );
-  }
-
-  if (!app.isPackaged) {
-    log('[ClaudeAgentRunner] Dev mode — skipping PATH enrichment');
-    return;
-  }
-
-  const platform = process.platform;
-  const delimiter = platform === 'win32' ? ';' : ':';
-  const currentPaths = (process.env.PATH || '').split(delimiter).filter((p: string) => p.trim());
-
-  // 1. Restore user's login-shell PATH
-  let shellPaths: string[] = [];
-  if (platform === 'darwin' || platform === 'linux') {
-    try {
-      const shell = getDefaultShell();
-      const output = (
-        execFileSync(shell, ['-l', '-c', 'echo $PATH'], {
-          encoding: 'utf-8',
-          timeout: 5000,
-          env: { ...process.env, HOME: os.homedir() },
-        }) as string
-      ).trim();
-      if (output) {
-        shellPaths = output.split(':').filter((p: string) => p.trim());
-        log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from login shell`);
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logWarn(`[ClaudeAgentRunner] Could not restore shell PATH: ${message}`);
-    }
-  } else if (platform === 'win32') {
-    try {
-      const output = (
-        execFileSync(
-          'powershell.exe',
-          [
-            '-NoProfile',
-            '-Command',
-            "[Environment]::GetEnvironmentVariable('Path', 'User') + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine')",
-          ],
-          { encoding: 'utf-8', timeout: 5000 }
-        ) as string
-      ).trim();
-      if (output) {
-        shellPaths = output.split(';').filter((p: string) => p.trim());
-        log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from Windows registry`);
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logWarn(`[ClaudeAgentRunner] Could not restore Windows PATH: ${message}`);
-    }
-  }
-
-  // 2. Collect bundled bin directories (highest priority)
-  const bundledDirs: string[] = [];
-
-  const nodePaths = getBundledNodePaths();
-  if (nodePaths) {
-    bundledDirs.push(path.dirname(nodePaths.node));
-  }
-
-  const pythonBinDir = resolveBundledPythonBinDir();
-  if (pythonBinDir) {
-    bundledDirs.push(pythonBinDir);
-  }
-
-  const toolsBinDir = resolveBundledToolsBinDir();
-  if (toolsBinDir) {
-    bundledDirs.push(toolsBinDir);
-  }
-
-  const ffmpegPath = resolveBundledFfmpegPath();
-  if (ffmpegPath) {
-    process.env.ASR_FFMPEG_PATH = ffmpegPath;
-    const ffmpegDir = path.dirname(ffmpegPath);
-    bundledDirs.push(ffmpegDir);
-    log(`[ClaudeAgentRunner] Using bundled ffmpeg: ${ffmpegPath}`);
-  }
-
-  // 3. Merge: bundled (highest) → shell → current process, deduplicate
-  const seen = new Set<string>();
-  const merged: string[] = [];
-
-  for (const p of [...bundledDirs, ...shellPaths, ...currentPaths]) {
-    const normalized = platform === 'win32' ? p.toLowerCase() : p;
-    if (!seen.has(normalized)) {
-      seen.add(normalized);
-      merged.push(p);
-    }
-  }
-
-  process.env.PATH = merged.join(delimiter);
-  log(
-    `[ClaudeAgentRunner] Enriched process.env.PATH for build mode: ${bundledDirs.length} bundled + ${shellPaths.length} shell + ${currentPaths.length} process → ${merged.length} total`
-  );
-}
-
-// Shared pi-ai auth storage — created once, reused across sessions.
-
-/**
- * Bridge MCP tools from MCPManager into ToolDefinition[] format for the agent SDK.
- * Each MCP tool becomes a customTool whose execute() delegates to mcpManager.callTool().
- */
-function buildMcpCustomTools(mcpManager: MCPManager): ToolDefinition[] {
-  const mcpTools = mcpManager.getTools();
-  return mcpTools.map((mcpTool) => {
-    // Wrap the raw JSON Schema inputSchema as a TypeBox TSchema
-    const parameters = Type.Unsafe<Record<string, unknown>>(
-      mcpTool.inputSchema as Record<string, unknown>
-    );
-
-    const toolDef: ToolDefinition<TSchema, unknown> = {
-      name: mcpTool.name,
-      label: `${mcpTool.serverName} → ${mcpTool.originalName || mcpTool.name}`,
-      description: mcpTool.description || `MCP tool from ${mcpTool.serverName}`,
-      parameters,
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        try {
-          const result = await mcpManager.callTool(mcpTool.name, params as Record<string, unknown>);
-          const normalizedResult = normalizeMcpToolResultForModel(result);
-          return {
-            content: [{ type: 'text' as const, text: normalizedResult.text }],
-            details:
-              normalizedResult.images.length > 0
-                ? { openCoworkImages: normalizedResult.images }
-                : undefined,
-          };
-        } catch (err: unknown) {
-          logError(`[ClaudeAgentRunner] MCP tool ${mcpTool.name} failed:`, err);
-          throw err instanceof Error ? err : new Error(String(err));
-        }
-      },
-    };
-    return toolDef;
-  });
-}
-
-/**
- * Get shell environment with proper PATH (including node, npm, etc.)
- * GUI apps on macOS don't inherit shell PATH, so we need to extract it
- */
-
-function safeStringify(value: unknown, space = 0): string {
-  try {
-    return JSON.stringify(value, null, space);
-  } catch (error) {
-    const details = error instanceof Error ? error.message : String(error);
-    return `[Unserializable: ${details}]`;
-  }
-}
-
-function summarizeMessageForLog(message: unknown): Record<string, unknown> {
-  if (!message || typeof message !== 'object') {
-    return { present: false };
-  }
-
-  const typedMessage = message as {
-    role?: unknown;
-    stopReason?: unknown;
-    content?: unknown[];
-    usage?: unknown;
-  };
-  const content = Array.isArray(typedMessage.content) ? typedMessage.content : [];
-
-  return {
-    present: true,
-    role: typeof typedMessage.role === 'string' ? typedMessage.role : undefined,
-    stopReason: typedMessage.stopReason ?? undefined,
-    contentBlocks: content.length,
-    contentTypes: content.slice(0, 8).map((block) => {
-      if (!block || typeof block !== 'object') {
-        return typeof block;
-      }
-      const type = (block as { type?: unknown }).type;
-      return typeof type === 'string' ? type : 'unknown';
-    }),
-    usage: normalizeTokenUsage(typedMessage.usage),
-  };
-}
-
-function toErrorText(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (typeof error === 'string') {
-    return error;
-  }
-  if (error && typeof error === 'object') {
-    const maybeMessage = (error as { message?: unknown }).message;
-    if (typeof maybeMessage === 'string' && maybeMessage.trim()) {
-      return maybeMessage;
-    }
-  }
-  const serialized = safeStringify(error);
-  if (serialized.startsWith('[Unserializable:')) {
-    return String(error);
-  }
-  return serialized;
-}
-
-function normalizeTokenUsage(usage: unknown): Message['tokenUsage'] | undefined {
-  if (!usage || typeof usage !== 'object') {
-    return undefined;
-  }
-
-  const raw = usage as {
-    input?: unknown;
-    output?: unknown;
-    input_tokens?: unknown;
-    output_tokens?: unknown;
-    inputTokens?: unknown;
-    outputTokens?: unknown;
-  };
-
-  const input = raw.input ?? raw.input_tokens ?? raw.inputTokens;
-  const output = raw.output ?? raw.output_tokens ?? raw.outputTokens;
-
-  if (typeof input !== 'number' || typeof output !== 'number') {
-    return undefined;
-  }
-
-  return { input, output };
-}
+// （Phase 4 迁移至 pipeline/prompt-strategy.ts，此处改为 import 共享常量）
 
 interface AgentRunnerOptions {
   sendToRenderer: (event: ServerEvent) => void;
@@ -620,14 +139,7 @@ interface AgentRunnerOptions {
   sessionAllowAll?: (sessionId: string) => boolean;
 }
 
-interface CachedPiSession {
-  session: PiAgentSession;
-  modelId: string;
-  thinkingLevel: string;
-  runtimeSignature: string;
-  skillsSignature?: string;
-  ollamaNumCtx?: { value: number };
-}
+// CachedPiSession 缓存已迁至 pipeline/session-factory.ts（Phase 5）。
 
 /**
  * ClaudeAgentRunner - Uses @mariozechner/pi-coding-agent SDK
@@ -655,11 +167,9 @@ export class ClaudeAgentRunner {
   private optionsAllowAll?: (sessionId: string) => boolean;
   private pathResolver: PathResolver;
   private mcpManager?: MCPManager;
-  private _pluginRuntimeService?: PluginRuntimeService;
-  private _skillsAdapter?: SkillsAdapter;
+  private readonly skillsRuntime: SkillsRuntime;
   private extensionManager?: AgentRuntimeExtensionManager;
   private activeControllers: Map<string, AbortController> = new Map();
-  private piSessions: Map<string, CachedPiSession> = new Map();
   /**
    * Set when cancel() is invoked by a user stop. Consumed once by the turn
    * that was in flight, so a later natural completion can't mistake an old
@@ -667,44 +177,40 @@ export class ClaudeAgentRunner {
    */
   private userStopFlags: Set<string> = new Set();
   private toolDisplayNameCache: Map<string, string> = new Map();
-  private static readonly MAX_CACHED_SESSIONS = 50;
+  // Stage 3（Phase 5）：pi session 缓存/签名/热替换全部移入 PiSessionFactory。
+  private readonly sessionFactory = new PiSessionFactory();
+
+  // Stage 2 策略（Phase 4，pipeline/*）：无状态，实例级单例即可
+  private readonly promptStrategy = new PromptStrategy();
+  private readonly toolStrategy = new ToolStrategy();
+  private readonly thinkingStrategy = new ThinkingStrategy();
 
   // Per-instance caches — invalidated when the underlying config changes.
   private _mcpServersCache: { fingerprint: string; servers: Record<string, unknown> } | null = null;
-  private _skillsSetupDone = false;
 
   /**
    * Clear SDK session cache for a session
    * Called when session's cwd changes - SDK sessions are bound to cwd
    */
   clearSdkSession(sessionId: string): void {
-    const cached = this.piSessions.get(sessionId);
-    if (cached) {
-      try {
-        cached.session.dispose();
-      } catch (e) {
-        logWarn('[ClaudeAgentRunner] dispose error:', e);
-      }
-      this.piSessions.delete(sessionId);
-      log('[ClaudeAgentRunner] Disposed pi session for:', sessionId);
-    }
+    this.sessionFactory.clearSession(sessionId);
   }
 
   clearAllSdkSessions(): void {
-    for (const sessionId of Array.from(this.piSessions.keys())) {
-      this.clearSdkSession(sessionId);
-    }
+    this.sessionFactory.clearAll();
   }
 
   /** Call after the user installs / removes a skill so the next query re-links everything. */
   invalidateSkillsSetup(): void {
-    this._skillsSetupDone = false;
+    this.skillsRuntime.invalidate();
   }
 
   /** Call after the user changes MCP server config so the next query rebuilds mcpServers. */
   invalidateMcpServersCache(): void {
     this._mcpServersCache = null;
-    // Sessions stay alive — MCP tools are rebuilt each query via buildMcpCustomTools()
+    // Phase 5（§5.5.3 有意行为变更）：MCP 指纹已并入 session 签名——
+    // 配置变化的会话在下一次 run() 被 dispose + 重建（SDK 的 customTools
+    // 在 createAgentSession 时冻结，reload() 不刷新，重建是唯一送达途径）。
     log('[ClaudeAgentRunner] MCP servers cache invalidated — tools will rebuild on next query');
   }
 
@@ -712,267 +218,8 @@ export class ClaudeAgentRunner {
   // not injected as plaintext into the system prompt. The getCredentialsPrompt()
   // method was removed to eliminate credential leakage risk.
 
-  /**
-   * Generate bundled executable path hints for production mode system prompt.
-   * In dev mode returns empty string (user PATH already works).
-   * This is a defense-in-depth layer — even if PATH enrichment works, explicit
-   * paths help the model avoid ambiguity when Skills reference bare commands.
-   */
-  private getBundledPathHints(): string {
-    if (!app.isPackaged) return '';
-
-    const hints: string[] = [];
-
-    const nodePaths = getBundledNodePaths();
-    if (nodePaths) {
-      hints.push(`- node: ${nodePaths.node}`);
-      hints.push(`- npx: ${nodePaths.npx}`);
-    }
-
-    const pythonBinDir = resolveBundledPythonBinDir();
-    if (pythonBinDir) {
-      const pythonExe = process.platform === 'win32' ? 'python.exe' : 'python3';
-      const pipExe = process.platform === 'win32' ? 'pip.exe' : 'pip3';
-      hints.push(`- python3: ${path.join(pythonBinDir, pythonExe)}`);
-      if (fs.existsSync(path.join(pythonBinDir, pipExe))) {
-        hints.push(`- pip3: ${path.join(pythonBinDir, pipExe)}`);
-      }
-    }
-
-    if (hints.length === 0) return '';
-
-    return `<bundled_executables>
-This application bundles its own executables. When executing commands, prefer these absolute paths:
-${hints.join('\n')}
-</bundled_executables>`;
-  }
-
-  /** Fallback skill path resolution when SkillsAdapter is not provided. */
-  private legacySkillPaths(): string[] {
-    const paths: string[] = [];
-    const builtin = this.getBuiltinSkillsPath();
-    if (builtin && fs.existsSync(builtin)) paths.push(builtin);
-    const global = this.getConfiguredGlobalSkillsDir();
-    if (global && fs.existsSync(global)) paths.push(global);
-    return paths;
-  }
-
-  private async resolveSkillPaths(sessionId?: string): Promise<string[]> {
-    const basePaths = this._skillsAdapter
-      ? await this._skillsAdapter.getSkillPaths()
-      : this.legacySkillPaths();
-    const mergedPaths = new Set(
-      basePaths.filter((item): item is string => Boolean(item && fs.existsSync(item)))
-    );
-    const appliedPlugins: Array<{ name: string; path: string }> = [];
-
-    if (this._pluginRuntimeService) {
-      try {
-        const runtimePlugins = await this._pluginRuntimeService.getEnabledRuntimePlugins();
-        for (const plugin of runtimePlugins) {
-          if (!plugin.componentsEnabled.skills || plugin.componentCounts.skills <= 0) {
-            continue;
-          }
-          const runtimeSkillsPath = path.join(plugin.runtimePath, 'skills');
-          if (!fs.existsSync(runtimeSkillsPath)) {
-            continue;
-          }
-          mergedPaths.add(runtimeSkillsPath);
-          appliedPlugins.push({ name: plugin.name, path: runtimeSkillsPath });
-        }
-      } catch (error) {
-        logWarn('[ClaudeAgentRunner] Failed to resolve runtime plugin skill paths:', error);
-      }
-    }
-
-    if (sessionId && appliedPlugins.length > 0) {
-      this.sendToRenderer({
-        type: 'plugins.runtimeApplied',
-        payload: { sessionId, plugins: appliedPlugins },
-      });
-    }
-
-    return Array.from(mergedPaths);
-  }
-
-  /**
-   * Get the built-in skills directory (shipped with the app)
-   */
-  private getBuiltinSkillsPath(): string {
-    // In development, skills are in the project's .claude/skills directory
-    // In production, they're extracted via extraResources to resources/skills
-    const appPath = app.getAppPath();
-    const unpackedPath = appPath.replace(/\.asar$/, '.asar.unpacked');
-
-    const possiblePaths = [
-      // Development: relative to this file
-      path.join(__dirname, '..', '..', '..', '.claude', 'skills'),
-      // Production: extraResources extracts .claude/skills → resources/skills
-      // This is the preferred production path (real directory, no asar issues)
-      path.join(process.resourcesPath || '', 'skills'),
-      // Legacy: in app.asar.unpacked (for older builds with asarUnpack)
-      ...(this.physicalDirExists(path.join(unpackedPath, '.claude', 'skills'))
-        ? [path.join(unpackedPath, '.claude', 'skills')]
-        : []),
-      // Last resort: read from inside the asar archive (Electron intercepts this)
-      path.join(appPath, '.claude', 'skills'),
-    ];
-
-    for (const p of possiblePaths) {
-      if (fs.existsSync(p)) {
-        log('[ClaudeAgentRunner] Found built-in skills at:', p);
-        return p;
-      }
-    }
-
-    logWarn('[ClaudeAgentRunner] No built-in skills directory found');
-    return '';
-  }
-
-  /**
-   * Check if a directory physically exists on disk, bypassing Electron's
-   * asar interception.
-   */
-  private physicalDirExists(dirPath: string): boolean {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const originalFs = require('original-fs') as typeof import('fs');
-      return originalFs.existsSync(dirPath) && originalFs.statSync(dirPath).isDirectory();
-    } catch {
-      return false;
-    }
-  }
-
-  private getAppClaudeDir(): string {
-    return path.join(app.getPath('userData'), 'claude');
-  }
-
-  private getRuntimeSkillsDir(): string {
-    return path.join(this.getAppClaudeDir(), 'skills');
-  }
-
-  private getConfiguredGlobalSkillsDir(): string {
-    const configuredPath = (configStore.get('globalSkillsPath') || '').trim();
-    if (!configuredPath) {
-      return this.getRuntimeSkillsDir();
-    }
-
-    const resolvedPath = path.resolve(configuredPath);
-    try {
-      if (!fs.existsSync(resolvedPath)) {
-        fs.mkdirSync(resolvedPath, { recursive: true });
-      }
-      if (fs.statSync(resolvedPath).isDirectory()) {
-        return resolvedPath;
-      }
-      logWarn(
-        '[ClaudeAgentRunner] Configured skills path is not a directory, fallback to runtime path:',
-        resolvedPath
-      );
-    } catch (error) {
-      logWarn(
-        '[ClaudeAgentRunner] Configured skills path is unavailable, fallback to runtime path:',
-        resolvedPath,
-        error
-      );
-    }
-
-    return this.getRuntimeSkillsDir();
-  }
-
-  private getUserClaudeSkillsDir(): string {
-    return path.join(app.getPath('home'), '.claude', 'skills');
-  }
-
-  private syncUserSkillsToAppDir(appSkillsDir: string): void {
-    const userSkillsDir = this.getUserClaudeSkillsDir();
-    if (!fs.existsSync(userSkillsDir)) {
-      return;
-    }
-
-    const entries = fs.readdirSync(userSkillsDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const sourcePath = path.join(userSkillsDir, entry.name);
-      const targetPath = path.join(appSkillsDir, entry.name);
-
-      if (fs.existsSync(targetPath)) {
-        try {
-          const stat = fs.lstatSync(targetPath);
-          if (!stat.isSymbolicLink()) {
-            continue;
-          }
-          fs.unlinkSync(targetPath);
-        } catch {
-          continue;
-        }
-      }
-
-      try {
-        fs.symlinkSync(sourcePath, targetPath, 'dir');
-      } catch (err) {
-        try {
-          this.copyDirectorySync(sourcePath, targetPath);
-        } catch (copyErr) {
-          logWarn('[ClaudeAgentRunner] Failed to import user skill:', entry.name, copyErr);
-        }
-      }
-    }
-  }
-
-  private syncConfiguredSkillsToRuntimeDir(runtimeSkillsDir: string): void {
-    const configuredSkillsDir = this.getConfiguredGlobalSkillsDir();
-    if (configuredSkillsDir === runtimeSkillsDir) {
-      return;
-    }
-    if (!fs.existsSync(configuredSkillsDir) || !fs.statSync(configuredSkillsDir).isDirectory()) {
-      return;
-    }
-
-    const entries = fs.readdirSync(configuredSkillsDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const sourcePath = path.join(configuredSkillsDir, entry.name);
-      const targetPath = path.join(runtimeSkillsDir, entry.name);
-      try {
-        if (fs.existsSync(targetPath)) {
-          // Use lstatSync so we don't follow symlinks — check the entry itself
-          const stat = fs.lstatSync(targetPath);
-          if (stat.isSymbolicLink()) {
-            fs.unlinkSync(targetPath);
-          } else {
-            fs.rmSync(targetPath, { recursive: true, force: true });
-          }
-        }
-        fs.symlinkSync(sourcePath, targetPath, 'dir');
-      } catch (err) {
-        try {
-          this.copyDirectorySync(sourcePath, targetPath);
-        } catch (copyErr) {
-          logWarn('[ClaudeAgentRunner] Failed to sync configured skill:', entry.name, copyErr);
-        }
-      }
-    }
-  }
-
-  private copyDirectorySync(source: string, target: string): void {
-    if (!fs.existsSync(target)) {
-      fs.mkdirSync(target, { recursive: true });
-    }
-
-    const entries = fs.readdirSync(source);
-    for (const entry of entries) {
-      const sourcePath = path.join(source, entry);
-      const targetPath = path.join(target, entry);
-      const stat = fs.statSync(sourcePath);
-
-      if (stat.isDirectory()) {
-        this.copyDirectorySync(sourcePath, targetPath);
-      } else {
-        fs.copyFileSync(sourcePath, targetPath);
-      }
-    }
-  }
+  // getBundledPathHints()（Phase 4 迁移至 pipeline/prompt-strategy.ts 的自由函数，
+  // 由 PromptStrategy.assemble 统一注入 <bundled_executables> 段。）
 
   constructor(
     options: AgentRunnerOptions,
@@ -989,8 +236,11 @@ ${hints.join('\n')}
     this.optionsAllowAll = options.sessionAllowAll;
     this.pathResolver = pathResolver;
     this.mcpManager = mcpManager;
-    this._pluginRuntimeService = pluginRuntimeService;
-    this._skillsAdapter = skillsAdapter;
+    this.skillsRuntime = new SkillsRuntime({
+      sendToRenderer: options.sendToRenderer,
+      pluginRuntimeService,
+      skillsAdapter,
+    });
     this.extensionManager = extensionManager;
 
     log('[ClaudeAgentRunner] Initialized with 今点通 agent SDK');
@@ -1001,127 +251,9 @@ ${hints.join('\n')}
   }
 
   /**
-   * Install a permission-gating hook on the pi-coding-agent session via
-   * `agent.setBeforeToolCall`. This is the only interception point that
-   * fires for built-in tools (read, bash, edit, write) — the SDK ignores
-   * wrapped `execute` functions on built-in tools passed via `options.tools`.
-   *
-   * The hook consults `decidePermission` from the main-process rules cache:
-   *  - 'allow' → delegate to SDK's original hook (proceeds normally)
-   *  - 'deny'  → return { block: true, reason } (SDK treats as tool error)
-   *  - 'ask'   → await requestPermission() IPC round-trip to PermissionDialog
-   *
-   * Known limitation: the async requestPermission wait (user dialog) causes
-   * the renderer to miss UI update events. The tool executes correctly on
-   * the backend, but the renderer's loading spinner may not clear. This is
-   * a renderer-side issue tracked as a follow-up.
+   * 工具显示名解析（MCP sanitized 名 → 原始名）。
+   * 权限钩子已迁至 tools/permission-hook.ts（Phase 3），通过 deps 注入本方法复用缓存。
    */
-  private installPermissionHook(
-    piSession: PiAgentSession,
-    sessionId: string,
-    sessionCwd: string | null
-  ): void {
-    if (!this.requestPermission) {
-      log('[ClaudeAgentRunner] No requestPermission callback — skipping permission hook');
-      return;
-    }
-
-    // Access the Agent instance (public readonly property on AgentSession)
-    // and wrap its beforeToolCall hook with our permission gate.
-    //
-    // We must chain to the SDK's original beforeToolCall hook because it
-    // fires extension tool_call events and manages the _agentEventQueue.
-    // Without chaining, the renderer misses completion events.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const agent = (piSession as any).agent;
-    if (!agent || typeof agent.setBeforeToolCall !== 'function') {
-      logWarn(
-        '[ClaudeAgentRunner] Cannot access agent.setBeforeToolCall — skipping permission hook'
-      );
-      return;
-    }
-
-    // Capture the SDK's hook before we overwrite it
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sdkBeforeToolCall: ((ctx: any, signal?: AbortSignal) => Promise<any>) | undefined =
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (agent as any)._beforeToolCall;
-
-    const requestPermission = this.requestPermission;
-    const getDisplayName = (name: string): string => this.getToolDisplayName(name);
-
-    agent.setBeforeToolCall(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      async (ctx: any, signal?: AbortSignal): Promise<any> => {
-        const toolName: string = ctx.toolCall?.name ?? '';
-        const input: Record<string, unknown> = ctx.args ?? {};
-        // Human-readable name for prompts/messages (e.g. MCP sanitized
-        // 'mcp__chrome__chrome_screenshot__ab12' → 'chrome_screenshot').
-        // Rule matching and rememberAlwaysAllow still use the canonical
-        // `toolName` so allow-once decisions stay stable across calls.
-        const displayName = getDisplayName(toolName);
-
-        const sessionAllowAll = this.optionsAllowAll?.call(this, sessionId) ?? false;
-        const { kind, reason } = classifyPermission(sessionCwd, toolName, input);
-        const decision = decidePermission(sessionId, toolName, input);
-        const gate = resolvePermissionGate(kind, decision, sessionAllowAll);
-
-        if (gate === 'deny') {
-          log(`[ClaudeAgentRunner] Tool '${toolName}' denied by rule`);
-          return {
-            block: true,
-            reason: `Tool '${displayName}' is denied by your permission rules.`,
-          };
-        }
-
-        if (gate === 'ask') {
-          const toolUseId = `${ctx.toolCall?.id ?? 'unknown'}-perm-${uuidv4().slice(0, 8)}`;
-          let result: 'allow' | 'deny' | 'allow_always';
-          try {
-            result = await requestPermission(sessionId, toolUseId, displayName, input, kind);
-          } catch (permErr) {
-            logError(
-              `[ClaudeAgentRunner] Permission request failed for '${toolName}' — failing closed`,
-              permErr
-            );
-            return {
-              block: true,
-              reason: `Permission request failed for '${displayName}'; tool not executed.`,
-            };
-          }
-
-          if (result === 'deny') {
-            log(`[ClaudeAgentRunner] Tool '${toolName}' denied by user`);
-            return { block: true, reason: `User denied permission for '${displayName}'.` };
-          }
-
-          if (result === 'allow_always') {
-            rememberAlwaysAllow(sessionId, toolName);
-          }
-        }
-
-        log(
-          `[ClaudeAgentRunner] Permission gate allowed '${toolName}' (${kind}${
-            reason ? `: ${reason}` : ''
-          })`
-        );
-        // Allowed — delegate to SDK's original hook for event pipeline
-        return sdkBeforeToolCall ? sdkBeforeToolCall(ctx, signal) : undefined;
-      }
-    );
-
-    log(
-      `[ClaudeAgentRunner] Permission hook installed on session ${sessionId} via agent.setBeforeToolCall`
-    );
-  }
-
-  /**
-   * Check if a command contains sudo
-   */
-  private static isSudoCommand(command: string): boolean {
-    return /\bsudo\b/.test(command);
-  }
-
   private getToolDisplayName(toolName: string): string {
     const cached = this.toolDisplayNameCache.get(toolName);
     if (cached) {
@@ -1147,171 +279,6 @@ ${hints.join('\n')}
   }
 
   /**
-   * Wrap the bash tool in the coding tools array to intercept sudo commands.
-   * When a sudo command is detected, prompts the user for a password,
-   * then rewrites the command to pipe the password into sudo -S.
-   */
-  private wrapBashToolForSudo(
-    tools: ToolDefinition[],
-    sessionId: string,
-    effectiveCwd: string
-  ): ToolDefinition[] {
-    if (!this.requestSudoPassword) return tools;
-
-    const requestSudoPassword = this.requestSudoPassword;
-
-    return tools.map((tool) => {
-      if (tool.name !== 'bash') return tool;
-
-      const originalExecute = tool.execute;
-      return {
-        ...tool,
-        execute: async (
-          toolCallId: string,
-          params: { command: string; timeout?: number },
-          signal: AbortSignal | undefined,
-          onUpdate: ((update: unknown) => void) | undefined,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          ctx: any
-        ) => {
-          const command = params.command;
-
-          if (ClaudeAgentRunner.isSudoCommand(command)) {
-            log('[ClaudeAgentRunner] Sudo command detected, requesting password');
-            const password = await requestSudoPassword(sessionId, toolCallId, command);
-
-            if (!password) {
-              log('[ClaudeAgentRunner] Sudo password cancelled by user');
-              return {
-                content: [
-                  { type: 'text' as const, text: 'Command cancelled: user denied sudo password.' },
-                ],
-                details: undefined as unknown,
-              };
-            }
-
-            // Add -S flag to sudo invocations that don't already have it
-            const rewrittenCommand = command.replace(/\bsudo\b(?!\s+-S)/g, 'sudo -S');
-
-            // Pass password via stdin pipe so it never appears in process args
-            // or environment variables. Uses async spawn with stdio: 'pipe'.
-            log(
-              '[ClaudeAgentRunner] Executing sudo command with password injection (via stdin pipe)'
-            );
-            try {
-              const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
-              const shellArgs =
-                process.platform === 'win32' ? ['/c', rewrittenCommand] : ['-c', rewrittenCommand];
-              const timeoutMs = (params.timeout ?? 120) * 1000;
-              const output = await new Promise<string>((resolve, reject) => {
-                const child = spawn(shell, shellArgs, {
-                  stdio: ['pipe', 'pipe', 'pipe'],
-                  cwd: effectiveCwd,
-                });
-                let stdout = '';
-                let stderr = '';
-                const timer = setTimeout(() => {
-                  child.kill('SIGKILL');
-                  reject(new Error(`Sudo command timed out after ${timeoutMs}ms`));
-                }, timeoutMs);
-                child.stdout.on('data', (chunk: Buffer) => {
-                  stdout += chunk.toString();
-                });
-                child.stderr.on('data', (chunk: Buffer) => {
-                  stderr += chunk.toString();
-                });
-                child.on('error', (err) => {
-                  clearTimeout(timer);
-                  reject(err);
-                });
-                child.on('close', () => {
-                  clearTimeout(timer);
-                  resolve(stdout + stderr);
-                });
-                child.stdin.write(password + '\n');
-                child.stdin.end();
-              });
-              return {
-                content: [{ type: 'text' as const, text: output || '(no output)' }],
-                details: undefined as unknown,
-              };
-            } catch (sudoErr) {
-              logError('[ClaudeAgentRunner] Sudo command failed:', sudoErr);
-              throw sudoErr instanceof Error ? sudoErr : new Error(String(sudoErr));
-            }
-          }
-
-          return originalExecute(toolCallId, params, signal, onUpdate, ctx);
-        },
-      } as ToolDefinition;
-    });
-  }
-
-  /**
-   * Wrap the bash tool to inject a default timeout when the model omits one.
-   * The agent SDK's bash tool has no default timeout, which means
-   * commands can run indefinitely if the model doesn't specify a timeout.
-   *
-   * 长任务放行：ASR 转写 / 模型下载 / pip 安装首次跑要几分钟到几十分钟，
-   * 且转写脚本已切后台任务模式（--async 提交后秒退，--status 轮询）。
-   * 这些命令若只给 120 秒必被杀，还会拖出整轮 5 分钟无活动超时。
-   * 用命令特征识别后直接给 1 小时，短命令仍保持 120 秒防挂死。
-   */
-  private static wrapBashToolWithDefaultTimeout(tools: ToolDefinition[]): ToolDefinition[] {
-    const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
-    const LONG_TASK_TIMEOUT_SECONDS = 3600;
-    // 命中任一即视为长任务：asr 转写/模型预下载、pip 安装、npm 安装、
-    // electron 打包、ffmpeg 音视频处理。
-    const LONG_TASK_PATTERNS = [
-      /transcribe\.py/i,
-      /download_model\.py/i,
-      /download-win-better-sqlite3/i,
-      /bundle-mcp/i,
-      /pre-build-check/i,
-      /pip(3)?\s+install/i,
-      /npm\s+(install|ci|run\s+build)/i,
-      /electron-builder/i,
-      /ffmpeg/i,
-    ];
-
-    return tools.map((tool) => {
-      if (tool.name !== 'bash') return tool;
-
-      const originalExecute = tool.execute;
-      return {
-        ...tool,
-        execute: async (
-          toolCallId: string,
-          params: { command: string; timeout?: number },
-          signal: AbortSignal | undefined,
-          onUpdate: ((update: unknown) => void) | undefined,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          ctx: any
-        ) => {
-          if (params.timeout != null) {
-            return originalExecute(toolCallId, params, signal, onUpdate, ctx);
-          }
-          const isLongTask = LONG_TASK_PATTERNS.some((re) => re.test(params.command || ''));
-          const timeout = isLongTask ? LONG_TASK_TIMEOUT_SECONDS : DEFAULT_BASH_TIMEOUT_SECONDS;
-          if (isLongTask) {
-            log(
-              `[ClaudeAgentRunner] Long-running task detected, timeout extended to ${timeout}s:`,
-              (params.command || '').slice(0, 120)
-            );
-          }
-          return originalExecute(
-            toolCallId,
-            { ...params, timeout },
-            signal,
-            onUpdate,
-            ctx
-          );
-        },
-      } as ToolDefinition;
-    });
-  }
-
-  /**
    * Resolve current model string from runtime config.
    */
   private getCurrentModelString(preferredModel?: string): string {
@@ -1326,6 +293,169 @@ ${hints.join('\n')}
     return model;
   }
 
+  /**
+   * Stage 3a：构建 SDK mcpServers 配置（Phase 6 从 run() 内联块提取，行为不变）。
+   *
+   * - 指纹命中 `_mcpServersCache` 时直接复用（bundled node 路径进程内稳定，不入指纹）；
+   * - stdio 服务器：npx/node 命令替换为内置路径 + PATH 注入；
+   *   `{SOFTWARE_DEV_SERVER_PATH}` / `{GUI_OPERATE_SERVER_PATH}` 占位符经
+   *   mcpConfigStore.createFromPreset 解析；
+   * - 单服务器构建失败仅跳过该服务器（'Failed to prepare MCP server config'）；
+   * - 结果写回缓存并输出 summary 日志（COWORK_LOG_SDK_MESSAGES_FULL=1 时输出全量）。
+   *
+   * 注意：返回值当前仅供日志/缓存——MCP 工具本体经 buildMcpCustomTools
+   * 以 customTools 桥接进 SDK（tools/mcp-tool-bridge.ts），不走 mcpServers 字段。
+   */
+  private buildMcpServersConfig(input: {
+    mcpFingerprint: string;
+    allConfigs: ReturnType<typeof mcpConfigStore.getEnabledServers>;
+    imageCapable: boolean;
+  }): Record<string, unknown> {
+    const { mcpFingerprint, allConfigs, imageCapable } = input;
+
+    // Build MCP servers configuration for SDK
+    // IMPORTANT: SDK uses tool names in format: mcp__<ServerKey>__<toolName>
+    const mcpServers: Record<string, unknown> = {};
+    if (!this.mcpManager) {
+      return mcpServers;
+    }
+
+    const serverStatuses = this.mcpManager.getServerStatus();
+    const connectedServers = serverStatuses.filter((s) => s.connected);
+    log('[ClaudeAgentRunner] MCP server statuses:', safeStringify(serverStatuses));
+    log('[ClaudeAgentRunner] Connected MCP servers:', connectedServers.length);
+
+    if (this._mcpServersCache?.fingerprint === mcpFingerprint) {
+      Object.assign(mcpServers, this._mcpServersCache.servers);
+      log('[ClaudeAgentRunner] MCP servers config reused from cache');
+    } else {
+      // Use the module-level memoized helper — no more per-query fs.existsSync calls.
+      const bundledNodePaths = getBundledNodePaths();
+      const bundledNpx = bundledNodePaths?.npx ?? null;
+
+      for (const config of allConfigs) {
+        try {
+          // Use a simpler key without spaces to avoid issues
+          const serverKey = config.name;
+
+          if (config.type === 'stdio') {
+            // 当命令是 npx 或 node 时优先使用内置路径
+            const command =
+              config.command === 'npx' && bundledNpx
+                ? bundledNpx
+                : config.command === 'node' && bundledNodePaths
+                  ? bundledNodePaths.node
+                  : config.command;
+
+            // 使用内置 npx/node 时，将内置 node bin 注入 PATH
+            const serverEnv = { ...config.env };
+            if (bundledNodePaths && (config.command === 'npx' || config.command === 'node')) {
+              const nodeBinDir = path.dirname(bundledNodePaths.node);
+              const currentPath = process.env.PATH || '';
+              // Prepend bundled node bin to PATH so npx can find node
+              serverEnv.PATH = `${nodeBinDir}${path.delimiter}${currentPath}`;
+              log(`[ClaudeAgentRunner]   Added bundled node bin to PATH: ${nodeBinDir}`);
+            }
+
+            if (!imageCapable) {
+              serverEnv.OPEN_COWORK_DISABLE_IMAGE_TOOL_OUTPUT = '1';
+            }
+
+            // Resolve path placeholders for presets
+            let resolvedArgs = config.args || [];
+
+            // Check if any args contain placeholders that need resolving
+            const hasPlaceholders = resolvedArgs.some(
+              (arg) =>
+                arg.includes('{SOFTWARE_DEV_SERVER_PATH}') ||
+                arg.includes('{GUI_OPERATE_SERVER_PATH}')
+            );
+
+            if (hasPlaceholders) {
+              // Get the appropriate preset based on config name
+              let presetKey: string | null = null;
+              if (
+                config.name === 'Software_Development' ||
+                config.name === 'Software Development'
+              ) {
+                presetKey = 'software-development';
+              } else if (config.name === 'GUI_Operate' || config.name === 'GUI Operate') {
+                presetKey = 'gui-operate';
+              }
+
+              if (presetKey) {
+                const preset = mcpConfigStore.createFromPreset(presetKey, true);
+                if (preset && preset.args) {
+                  resolvedArgs = preset.args;
+                }
+              }
+            }
+
+            mcpServers[serverKey] = {
+              type: 'stdio',
+              command,
+              args: resolvedArgs,
+              env: serverEnv,
+            };
+            log(`[ClaudeAgentRunner] Added STDIO MCP server: ${serverKey}`);
+            log(`[ClaudeAgentRunner]   Command: ${command} ${resolvedArgs.join(' ')}`);
+            log(`[ClaudeAgentRunner]   Tools will be named: mcp__${serverKey}__<toolName>`);
+          } else if (config.type === 'sse') {
+            mcpServers[serverKey] = {
+              type: 'sse',
+              url: config.url,
+              headers: config.headers || {},
+            };
+            log(`[ClaudeAgentRunner] Added SSE MCP server: ${serverKey}`);
+          }
+        } catch (error) {
+          logError('[ClaudeAgentRunner] Failed to prepare MCP server config, skipping server', {
+            serverId: config.id,
+            serverName: config.name,
+            error: toErrorText(error),
+          });
+        }
+      }
+
+      // Store in cache for subsequent queries
+      this._mcpServersCache = { fingerprint: mcpFingerprint, servers: { ...mcpServers } };
+    }
+
+    const mcpServersSummary = Object.entries(mcpServers).map(([name, serverConfig]) => {
+      const typedServerConfig = serverConfig as {
+        type?: string;
+        command?: string;
+        args?: unknown[];
+        env?: Record<string, unknown>;
+      };
+      return {
+        name,
+        type: typedServerConfig.type ?? 'unknown',
+        command: typedServerConfig.command ?? '',
+        argsCount: Array.isArray(typedServerConfig.args) ? typedServerConfig.args.length : 0,
+        envKeys: typedServerConfig.env ? Object.keys(typedServerConfig.env).length : 0,
+      };
+    });
+    log('[ClaudeAgentRunner] Final mcpServers summary:', safeStringify(mcpServersSummary, 2));
+    if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
+      log('[ClaudeAgentRunner] Final mcpServers config:', safeStringify(mcpServers, 2));
+    }
+
+    return mcpServers;
+  }
+
+  /**
+   * 执行一次 AI 查询（编排器主入口）。
+   *
+   * Pipeline 分阶段（AGENT-RUNNER-REFACTOR-PLAN.md §2.1）：
+   * - Stage 0：沙箱准备（WSL/Lima 同步、pathResolver 注册）
+   * - Stage 1：模型解析（pi-model-resolution：路由协议/注册表/合成回退）
+   * - Stage 2：任务分类 + 三策略（classifyTask → Prompt/Tool/ThinkingStrategy）
+   * - Stage 3：会话装配（签名原料 → PiSessionFactory.invalidateIfStale →
+   *   冷启动历史 → MCP servers 配置 → customTools → resolveOrCreate）
+   * - Stage 4：执行（事件流桥接 + loop guard + prompt，留在本文件）
+   * - Stage 5：收尾（abort 判定、trace 完成、沙箱回同步）
+   */
   async run(session: Session, prompt: string, existingMessages: Message[]): Promise<void> {
     const runStartTime = Date.now();
     logCtx('[ClaudeAgentRunner] run() started');
@@ -1449,7 +579,7 @@ ${hints.join('\n')}
           }
 
           // Copy skills to sandbox ~/.claude/skills/
-          const builtinSkillsPath = this.getBuiltinSkillsPath();
+          const builtinSkillsPath = this.skillsRuntime.getBuiltinSkillsPath();
           try {
             const distro = sandbox.wslStatus!.distro!;
             const sandboxSkillsPath = `${sandboxPath}/.claude/skills`;
@@ -1477,12 +607,12 @@ ${hints.join('\n')}
               );
             }
 
-            const appSkillsDir = this.getRuntimeSkillsDir();
+            const appSkillsDir = this.skillsRuntime.getRuntimeSkillsDir();
             if (!fs.existsSync(appSkillsDir)) {
               fs.mkdirSync(appSkillsDir, { recursive: true });
             }
-            this.syncUserSkillsToAppDir(appSkillsDir);
-            this.syncConfiguredSkillsToRuntimeDir(appSkillsDir);
+            this.skillsRuntime.syncUserSkillsToAppDir(appSkillsDir);
+            this.skillsRuntime.syncConfiguredSkillsToRuntimeDir(appSkillsDir);
 
             if (fs.existsSync(appSkillsDir)) {
               const wslSourcePath = pathConverter.toWSL(appSkillsDir);
@@ -1600,7 +730,7 @@ ${hints.join('\n')}
           }
 
           // Copy skills to sandbox ~/.claude/skills/
-          const builtinSkillsPath = this.getBuiltinSkillsPath();
+          const builtinSkillsPath = this.skillsRuntime.getBuiltinSkillsPath();
           try {
             const sandboxSkillsPath = `${sandboxPath}/.claude/skills`;
 
@@ -1639,12 +769,12 @@ ${hints.join('\n')}
               );
             }
 
-            const appSkillsDir = this.getRuntimeSkillsDir();
+            const appSkillsDir = this.skillsRuntime.getRuntimeSkillsDir();
             if (!fs.existsSync(appSkillsDir)) {
               fs.mkdirSync(appSkillsDir, { recursive: true });
             }
-            this.syncUserSkillsToAppDir(appSkillsDir);
-            this.syncConfiguredSkillsToRuntimeDir(appSkillsDir);
+            this.skillsRuntime.syncUserSkillsToAppDir(appSkillsDir);
+            this.skillsRuntime.syncConfiguredSkillsToRuntimeDir(appSkillsDir);
 
             if (fs.existsSync(appSkillsDir)) {
               log(
@@ -1869,82 +999,16 @@ ${hints.join('\n')}
 
       // Use app-specific Claude config directory to avoid conflicts with user settings
       // SDK uses CLAUDE_CONFIG_DIR to locate skills
-      const userClaudeDir = this.getAppClaudeDir();
+      const userClaudeDir = this.skillsRuntime.getAppClaudeDir();
 
-      // Skills directory setup: only run on the first query per runner instance.
-      // Symlinks and directories are stable across queries; re-running every time
-      // wastes ~10-30 syscalls per query for no benefit. Call invalidateSkillsSetup()
-      // to force a re-run after the user installs or removes a skill.
-      if (!this._skillsSetupDone) {
-        // Set flag at start to prevent re-entrant calls from concurrent queries
-        this._skillsSetupDone = true;
+      // Skills directory setup（Phase 2 迁移至 skills-runtime.ts）：
+      // 只在每个 runner 实例的首次查询时执行；skills 安装/删除后
+      // 调用 invalidateSkillsSetup() 强制重跑。
+      this.skillsRuntime.ensureSetup();
 
-        // Ensure app Claude config directory exists
-        if (!fs.existsSync(userClaudeDir)) {
-          fs.mkdirSync(userClaudeDir, { recursive: true });
-        }
-
-        // Ensure app Claude skills directory exists
-        const appSkillsDir = this.getRuntimeSkillsDir();
-        if (!fs.existsSync(appSkillsDir)) {
-          fs.mkdirSync(appSkillsDir, { recursive: true });
-        }
-
-        // Copy built-in skills to app Claude skills directory if they don't exist
-        const builtinSkillsPath = this.getBuiltinSkillsPath();
-        if (builtinSkillsPath && fs.existsSync(builtinSkillsPath)) {
-          // Symlinks into .asar archives don't work at the OS level (ENOTDIR),
-          // so always copy when the source is inside an asar archive.
-          // Use regex to match .asar/ but NOT .asar.unpacked/ (which is a real directory).
-          const sourceInsideAsar = /\.asar[/\\]/.test(builtinSkillsPath);
-          const builtinSkills = fs.readdirSync(builtinSkillsPath);
-          for (const skillName of builtinSkills) {
-            const builtinSkillPath = path.join(builtinSkillsPath, skillName);
-            const userSkillPath = path.join(appSkillsDir, skillName);
-
-            // Clean up broken symlinks pointing into .asar from previous versions
-            try {
-              const lstat = fs.lstatSync(userSkillPath);
-              if (lstat.isSymbolicLink()) {
-                const linkTarget = fs.readlinkSync(userSkillPath);
-                if (/\.asar[/\\]/.test(linkTarget)) {
-                  fs.unlinkSync(userSkillPath);
-                  log(`[ClaudeAgentRunner] Removed broken asar symlink: ${userSkillPath}`);
-                }
-              }
-            } catch {
-              // Path doesn't exist — fine, we'll create it below
-            }
-
-            // Only set up if it's a directory and doesn't exist in app directory
-            if (fs.statSync(builtinSkillPath).isDirectory() && !fs.existsSync(userSkillPath)) {
-              if (sourceInsideAsar) {
-                // Source is inside .asar — must copy (symlinks to asar paths fail at OS level)
-                this.copyDirectorySync(builtinSkillPath, userSkillPath);
-                log(`[ClaudeAgentRunner] Copied built-in skill from asar: ${skillName}`);
-              } else {
-                // Source is a real directory — symlink for space efficiency
-                try {
-                  fs.symlinkSync(builtinSkillPath, userSkillPath, 'dir');
-                  log(`[ClaudeAgentRunner] Linked built-in skill: ${skillName}`);
-                } catch (err) {
-                  logWarn(
-                    `[ClaudeAgentRunner] Failed to symlink ${skillName}, copying instead:`,
-                    err
-                  );
-                  this.copyDirectorySync(builtinSkillPath, userSkillPath);
-                }
-              }
-            }
-          }
-        }
-
-        this.syncUserSkillsToAppDir(appSkillsDir);
-        this.syncConfiguredSkillsToRuntimeDir(appSkillsDir);
-      }
-
-      // Build available skills section dynamically — now handled by pi's DefaultResourceLoader
-      // via additionalSkillPaths. No custom prompt building needed.
+      // Build available skills section dynamically — now handled by the pi
+      // resource loader inside PiSessionFactory (Phase 5) via additionalSkillPaths.
+      // No custom prompt building needed.
 
       log('[ClaudeAgentRunner] App claude dir:', userClaudeDir);
       log('[ClaudeAgentRunner] User working directory:', workingDir);
@@ -1954,12 +1018,63 @@ ${hints.join('\n')}
       // pi-ai handles auth and model routing natively — no proxy, no env overrides needed.
       logCtx('[ClaudeAgentRunner] Using pi-ai native routing for:', piModel.provider, piModel.id);
 
-      // Resolve thinking level early — needed for session reuse check below
+      // Stage 2（Phase 4）：任务分类 + 三策略（pipeline/task-classifier + *-strategy）。
+      // Thinking level must be resolved before the session reuse check below.
       const enableThinking = configStore.get('enableThinking') ?? false;
       logCtx('[ClaudeAgentRunner] Enable thinking mode:', enableThinking);
-      type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
-      const thinkingLevel: PiThinkingLevel = enableThinking ? 'medium' : 'off';
-      const sessionRuntimeSignature = buildPiSessionRuntimeSignature({
+      const modelCtx: ModelContext = {
+        piModel,
+        provider,
+        configProtocol,
+        contextWindow: piModel.contextWindow || 128000,
+        authStorage,
+        runtimeConfig,
+      };
+      const taskCtx: TaskContext = {
+        taskType: classifyTask(prompt),
+        sessionId: session.id,
+        userMessage: prompt,
+        modelCtx,
+        platform: process.platform,
+        // hasMCPTools 在下方 MCP custom tools 构建后回填（citation 段依赖它）
+        hasMCPTools: false,
+        sandboxPath: useSandboxIsolation && sandboxPath ? sandboxPath : undefined,
+        workingDir,
+        effectiveCwd,
+      };
+      const thinkingLevel: PiThinkingLevel = this.thinkingStrategy.resolve(taskCtx, enableThinking);
+      logCtx(
+        '[ClaudeAgentRunner] Task classification:',
+        taskCtx.taskType,
+        '→ thinkingLevel:',
+        thinkingLevel
+      );
+      const skillPaths = await this.skillsRuntime.resolveSkillPaths(session.id);
+      const skillsSignature = JSON.stringify(skillPaths);
+      log('[ClaudeAgentRunner] Skill paths for pi ResourceLoader:', skillPaths);
+      // Stage 3 签名原料（Phase 5：签名计算/比较/缓存全部移入 PiSessionFactory）。
+      // MCP 指纹需参与早期失效检查（§5.5.3 有意行为变更：SDK customTools 创建时
+      // 冻结，配置变化只能靠重建送达），因此 enabled configs 在此提前读取一次，
+      // 下方 MCP 配置构建块共享同一结果。
+      let allConfigs: ReturnType<typeof mcpConfigStore.getEnabledServers> = [];
+      try {
+        allConfigs = mcpConfigStore.getEnabledServers();
+        log(
+          '[ClaudeAgentRunner] Enabled MCP configs:',
+          allConfigs.map((c) => c.name)
+        );
+      } catch (error) {
+        logWarn(
+          '[ClaudeAgentRunner] Failed to read enabled MCP configs; MCP tools will be unavailable this query',
+          error
+        );
+        allConfigs = [];
+      }
+      // Cache key: serialized config list + imageCapable flag.  The bundled node
+      // paths are stable for the lifetime of the process so they don't need to be
+      // part of the fingerprint.
+      const mcpFingerprint = JSON.stringify(allConfigs) + String(imageCapable);
+      const signatureInput: SessionSignatureInput = {
         configProvider: runtimeConfig.provider,
         customProtocol: runtimeConfig.customProtocol,
         modelProvider: piModel.provider,
@@ -1967,119 +1082,32 @@ ${hints.join('\n')}
         modelBaseUrl: piModel.baseUrl,
         effectiveCwd,
         apiKey,
-      });
-      const skillPaths = await this.resolveSkillPaths(session.id);
-      const skillsSignature = JSON.stringify(skillPaths);
-      log('[ClaudeAgentRunner] Skill paths for pi ResourceLoader:', skillPaths);
+        skillsSignature,
+        mcpFingerprint,
+      };
+      // 早期失效检查必须在 beforeSessionRun 之前，保证 isColdStart 反映真实缓存状态。
+      this.sessionFactory.invalidateIfStale(session.id, signatureInput);
 
-      // Build contextual prompt — if reusing an existing SDK session, the SDK
-      // already has conversation history so we only pass the new prompt.
-      // For cold starts (new SDK session with existing DB history), we inject
-      // a token-budgeted summary of recent history as a preamble.
-      let cachedSession = this.piSessions.get(session.id);
-      if (cachedSession && cachedSession.runtimeSignature !== sessionRuntimeSignature) {
-        logCtx('[ClaudeAgentRunner] Runtime changed, recreating cached pi session:', session.id);
-        try {
-          cachedSession.session.dispose();
-        } catch (disposeError) {
-          logWarn('[ClaudeAgentRunner] dispose error while recreating pi session:', disposeError);
-        }
-        this.piSessions.delete(session.id);
-        cachedSession = undefined;
-      }
-      if (cachedSession && cachedSession.skillsSignature !== skillsSignature) {
-        logCtx('[ClaudeAgentRunner] Skills changed, recreating cached pi session:', session.id);
-        try {
-          cachedSession.session.dispose();
-        } catch (disposeError) {
-          logWarn(
-            '[ClaudeAgentRunner] dispose error while recreating pi session for skills:',
-            disposeError
-          );
-        }
-        this.piSessions.delete(session.id);
-        cachedSession = undefined;
-      }
-
+      const isColdStart = !this.sessionFactory.hasValidSession(session.id);
       const extensionResult = this.extensionManager
         ? await this.extensionManager.beforeSessionRun({
             session,
             prompt,
             existingMessages,
-            isColdStart: !cachedSession,
+            isColdStart,
           })
         : { promptPrefix: undefined, customTools: [] };
 
       let contextualPrompt = prompt;
-      if (!cachedSession) {
+      if (isColdStart) {
         // Cold start: inject recent history into prompt if available
-        const conversationMessages = existingMessages.filter(
-          (msg) => msg.role === 'user' || msg.role === 'assistant'
+        // （Phase 5：组装逻辑迁至 pipeline/cold-start-history.ts，行为不变）
+        contextualPrompt = buildColdStartContextualPrompt(
+          prompt,
+          existingMessages,
+          provider,
+          piModel.contextWindow || 128000
         );
-        // Filter out messages that contain images (images can't be serialized into text preamble)
-        const textOnlyMessages = conversationMessages.filter(
-          (msg) => !msg.content.some((c) => (c as { type?: string }).type === 'image')
-        );
-        const historyMessages =
-          textOnlyMessages.length > 0 &&
-          textOnlyMessages[textOnlyMessages.length - 1]?.role === 'user'
-            ? textOnlyMessages.slice(0, -1)
-            : textOnlyMessages;
-
-        if (historyMessages.length > 0) {
-          // Content-aware chars-per-token estimation (CJK text uses ~1.5 chars/token vs ~4 for English)
-          const contextWindow = piModel.contextWindow || 128000;
-          const historyBudgetRatio = provider === 'ollama' && contextWindow < 16384 ? 0.15 : 0.3;
-          const historyTokenBudget = Math.floor(contextWindow * historyBudgetRatio);
-
-          // Sample recent messages to estimate chars-per-token ratio. Sampling the
-          // full serialized form (text + thinking + tool blocks) gives a better CJK
-          // ratio estimate than sampling text only.
-          const sampleText = historyMessages
-            .slice(-3)
-            .map((m) => serializeMessageContentForHistory(m.content))
-            .join('');
-          const charsPerToken = estimateCharsPerToken(sampleText);
-          const historyCharBudget = Math.floor(historyTokenBudget * charsPerToken);
-
-          const historyItems: string[] = [];
-          let charCount = 0;
-          // Build from newest to oldest, then reverse. We preserve thinking and
-          // tool blocks (not just text) so providers requiring reasoning/tool-call
-          // replay (DeepSeek V4 Flash, and any thinking-capable model after a
-          // cwd switch) continue to function after a cold start. See #162 Bug B.
-          for (let i = historyMessages.length - 1; i >= 0; i--) {
-            const msg = historyMessages[i];
-            const serialized = serializeMessageContentForHistory(msg.content);
-            if (serialized.length === 0) continue;
-            const roleTag = msg.role === 'user' ? 'user' : 'assistant';
-            const entry = `<turn role="${roleTag}">${serialized}</turn>`;
-            if (charCount + entry.length > historyCharBudget) break;
-            charCount += entry.length;
-            historyItems.unshift(entry);
-          }
-
-          if (historyItems.length > 0) {
-            const trimmedCount = historyMessages.length - historyItems.length;
-            const historyNote =
-              trimmedCount > 0 ? `[${trimmedCount} older messages omitted]\n` : '';
-            const preamble = `<conversation_history>\n${historyNote}${historyItems.join('\n')}\n</conversation_history>`;
-            contextualPrompt = `${preamble}\n\n${prompt}`;
-            log(
-              '[ClaudeAgentRunner] Cold start: injecting',
-              historyItems.length,
-              'of',
-              historyMessages.length,
-              'history messages (budget:',
-              historyCharBudget,
-              'chars, used:',
-              charCount,
-              ', charsPerToken:',
-              charsPerToken.toFixed(2),
-              ')'
-            );
-          }
-        }
       } else {
         // Reusing session — SDK already has the full conversation context
         logCtx('[ClaudeAgentRunner] Reusing existing SDK session for:', session.id);
@@ -2088,243 +1116,12 @@ ${hints.join('\n')}
         contextualPrompt = `${extensionResult.promptPrefix.trim()}\n\n${contextualPrompt}`;
       }
 
+      // Stage 3a（Phase 6）：MCP servers 配置构建提取为私有方法（行为不变），
+      // 日志/缓存指纹语义与内联实现完全一致。返回值仅用于日志与缓存——
+      // MCP 工具本体经 buildMcpCustomTools 以 customTools 桥接进 SDK。
       logTiming('before building MCP servers config', runStartTime);
-
-      // Build MCP servers configuration for SDK
-      // IMPORTANT: SDK uses tool names in format: mcp__<ServerKey>__<toolName>
-      const mcpServers: Record<string, unknown> = {};
-      if (this.mcpManager) {
-        const serverStatuses = this.mcpManager.getServerStatus();
-        const connectedServers = serverStatuses.filter((s) => s.connected);
-        log('[ClaudeAgentRunner] MCP server statuses:', safeStringify(serverStatuses));
-        log('[ClaudeAgentRunner] Connected MCP servers:', connectedServers.length);
-
-        let allConfigs: ReturnType<typeof mcpConfigStore.getEnabledServers> = [];
-        try {
-          allConfigs = mcpConfigStore.getEnabledServers();
-          log(
-            '[ClaudeAgentRunner] Enabled MCP configs:',
-            allConfigs.map((c) => c.name)
-          );
-        } catch (error) {
-          logWarn(
-            '[ClaudeAgentRunner] Failed to read enabled MCP configs; MCP tools will be unavailable this query',
-            error
-          );
-          allConfigs = [];
-        }
-
-        // Cache key: serialized config list + imageCapable flag.  The bundled node
-        // paths are stable for the lifetime of the process so they don't need to be
-        // part of the fingerprint.
-        const mcpFingerprint = JSON.stringify(allConfigs) + String(imageCapable);
-        if (this._mcpServersCache?.fingerprint === mcpFingerprint) {
-          Object.assign(mcpServers, this._mcpServersCache.servers);
-          log('[ClaudeAgentRunner] MCP servers config reused from cache');
-        } else {
-          // Use the module-level memoized helper — no more per-query fs.existsSync calls.
-          const bundledNodePaths = getBundledNodePaths();
-          const bundledNpx = bundledNodePaths?.npx ?? null;
-
-          for (const config of allConfigs) {
-            try {
-              // Use a simpler key without spaces to avoid issues
-              const serverKey = config.name;
-
-              if (config.type === 'stdio') {
-                // 当命令是 npx 或 node 时优先使用内置路径
-                const command =
-                  config.command === 'npx' && bundledNpx
-                    ? bundledNpx
-                    : config.command === 'node' && bundledNodePaths
-                      ? bundledNodePaths.node
-                      : config.command;
-
-                // 使用内置 npx/node 时，将内置 node bin 注入 PATH
-                const serverEnv = { ...config.env };
-                if (bundledNodePaths && (config.command === 'npx' || config.command === 'node')) {
-                  const nodeBinDir = path.dirname(bundledNodePaths.node);
-                  const currentPath = process.env.PATH || '';
-                  // Prepend bundled node bin to PATH so npx can find node
-                  serverEnv.PATH = `${nodeBinDir}${path.delimiter}${currentPath}`;
-                  log(`[ClaudeAgentRunner]   Added bundled node bin to PATH: ${nodeBinDir}`);
-                }
-
-                if (!imageCapable) {
-                  serverEnv.OPEN_COWORK_DISABLE_IMAGE_TOOL_OUTPUT = '1';
-                }
-
-                // Resolve path placeholders for presets
-                let resolvedArgs = config.args || [];
-
-                // Check if any args contain placeholders that need resolving
-                const hasPlaceholders = resolvedArgs.some(
-                  (arg) =>
-                    arg.includes('{SOFTWARE_DEV_SERVER_PATH}') ||
-                    arg.includes('{GUI_OPERATE_SERVER_PATH}')
-                );
-
-                if (hasPlaceholders) {
-                  // Get the appropriate preset based on config name
-                  let presetKey: string | null = null;
-                  if (
-                    config.name === 'Software_Development' ||
-                    config.name === 'Software Development'
-                  ) {
-                    presetKey = 'software-development';
-                  } else if (config.name === 'GUI_Operate' || config.name === 'GUI Operate') {
-                    presetKey = 'gui-operate';
-                  }
-
-                  if (presetKey) {
-                    const preset = mcpConfigStore.createFromPreset(presetKey, true);
-                    if (preset && preset.args) {
-                      resolvedArgs = preset.args;
-                    }
-                  }
-                }
-
-                mcpServers[serverKey] = {
-                  type: 'stdio',
-                  command,
-                  args: resolvedArgs,
-                  env: serverEnv,
-                };
-                log(`[ClaudeAgentRunner] Added STDIO MCP server: ${serverKey}`);
-                log(`[ClaudeAgentRunner]   Command: ${command} ${resolvedArgs.join(' ')}`);
-                log(`[ClaudeAgentRunner]   Tools will be named: mcp__${serverKey}__<toolName>`);
-              } else if (config.type === 'sse') {
-                mcpServers[serverKey] = {
-                  type: 'sse',
-                  url: config.url,
-                  headers: config.headers || {},
-                };
-                log(`[ClaudeAgentRunner] Added SSE MCP server: ${serverKey}`);
-              }
-            } catch (error) {
-              logError('[ClaudeAgentRunner] Failed to prepare MCP server config, skipping server', {
-                serverId: config.id,
-                serverName: config.name,
-                error: toErrorText(error),
-              });
-            }
-          }
-
-          // Store in cache for subsequent queries
-          this._mcpServersCache = { fingerprint: mcpFingerprint, servers: { ...mcpServers } };
-        }
-
-        const mcpServersSummary = Object.entries(mcpServers).map(([name, serverConfig]) => {
-          const typedServerConfig = serverConfig as {
-            type?: string;
-            command?: string;
-            args?: unknown[];
-            env?: Record<string, unknown>;
-          };
-          return {
-            name,
-            type: typedServerConfig.type ?? 'unknown',
-            command: typedServerConfig.command ?? '',
-            argsCount: Array.isArray(typedServerConfig.args) ? typedServerConfig.args.length : 0,
-            envKeys: typedServerConfig.env ? Object.keys(typedServerConfig.env).length : 0,
-          };
-        });
-        log('[ClaudeAgentRunner] Final mcpServers summary:', safeStringify(mcpServersSummary, 2));
-        if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
-          log('[ClaudeAgentRunner] Final mcpServers config:', safeStringify(mcpServers, 2));
-        }
-      }
+      this.buildMcpServersConfig({ mcpFingerprint, allConfigs, imageCapable });
       logTiming('after building MCP servers config', runStartTime);
-
-      const workspaceInfoPrompt =
-        useSandboxIsolation && sandboxPath
-          ? `<workspace_info>
-Your current workspace is located at: ${VIRTUAL_WORKSPACE_PATH}
-This is an isolated sandbox environment. Use ${VIRTUAL_WORKSPACE_PATH} as the root path for file operations.
-</workspace_info>`
-          : workingDir
-            ? `<workspace_info>Your current workspace is: ${workingDir}</workspace_info>`
-            : '';
-
-      const coworkAppendPrompt = [
-        '你是今点通智能助手，请用中文回复用户。',
-        `CRITICAL BEHAVIORAL RULES:
-1. CHAT FIRST: By default, respond to the user in plain text within the conversation. Do NOT create, write, or edit files unless the user explicitly asks you to (e.g., "create a file", "write this to...", "edit the code", "save as...", mentions a specific file path, or describes code changes they want applied). For questions, summaries, explanations, analysis, and general conversation — always reply directly in chat text.
-2. LANGUAGE: Always respond in the same language as the user's input. If the user asks in Chinese, reply in Chinese. If the user asks in English, reply in English.
-3. When a request is actionable, proceed immediately with reasonable assumptions. If you need clarification, ask briefly in plain text.
-4. For relative time windows like "within two days" in browsing or research tasks, assume the most recent two relevant publication days unless the user explicitly defines another date range.
-5. For bracketed placeholders like [Agent], [Topic], etc., treat the word inside brackets as the literal search keyword unless the user says otherwise.
-6. When given a task, START DOING IT. Do not restate the task, do not list what you will do, do not ask for confirmation. Just execute.`,
-        workspaceInfoPrompt,
-        process.platform === 'win32'
-          ? (() => {
-              const detected = detectCommandTools();
-              const selectedShell = getDefaultShell();
-              const shellName = selectedShell.toLowerCase();
-              const isPowerShell = shellName.includes('powershell') || shellName === 'pwsh.exe';
-              const isCmd = shellName === 'cmd.exe';
-              return `<platform_info>
-You are running on Windows. Commands will be executed using: ${selectedShell}
-${isPowerShell ? '- PowerShell has built-in aliases for `ls`, `cat`, `cp`, `mv`, `rm`, `pwd`, `clear`' : ''}
-${isPowerShell ? '- Use `;` (semicolon) to chain commands, NOT `&&` (PowerShell 5.x does not support `&&`)' : ''}
-${isCmd ? '- Use `&&` to chain commands (cmd.exe syntax)' : ''}
-${isPowerShell ? '- Redirect stderr with `2>` (PowerShell syntax)' : ''}
-${isCmd ? '- Redirect stderr with `2>` (cmd.exe syntax)' : ''}
-- Use \`dir\` instead of \`ls\`
-- Use \`type\` instead of \`cat\`
-- Use \`findstr\` instead of \`grep\`
-- Use \`del\` instead of \`rm\`
-- Use \`copy\` instead of \`cp\`
-- Use \`move\` instead of \`mv\`
-- Use \`cls\` instead of \`clear\`
-- File paths use backslashes (but forward slashes also work in most cases)
-
-${formatDetectedTools(detected)}
-</platform_info>`;
-            })()
-          : '',
-        `<citation_requirements>
-If your answer uses linkable content from MCP tools, include a "Sources:" section and otherwise use standard Markdown links: [Title](https://claude.ai/chat/URL).
-</citation_requirements>`,
-        `<tool_behavior>
-Tool routing:
-- If user explicitly asks to use Chrome/browser/web navigation, prioritize Chrome MCP tools (mcp__Chrome__*) over generic WebSearch/WebFetch.
-- Use WebSearch/WebFetch only when Chrome MCP is unavailable or the user explicitly asks for generic web search.
-
-Tool parameter naming (CRITICAL - incorrect parameter names will cause validation errors):
-- read tool: use \`path\` (NOT \`file_path\` or \`filePath\`)
-- write tool: use \`path\` and \`content\` (NOT \`file_path\` or \`filePath\`)
-- edit tool: use \`path\`, \`oldText\`, and \`newText\` (NOT \`file_path\`, \`old_string\`, or \`new_string\`)
-- bash tool: use \`command\` and optionally \`timeout\`
-</tool_behavior>`,
-        `<code_quality_rules>
-When writing or modifying code:
-1. DEPENDENCY CHECK: Before using any library, verify it exists in package.json (or equivalent manifest). If not available, install it first or use an existing alternative.
-2. READ BEFORE WRITE: Always read existing files before modifying them. Never assume file contents or structure.
-3. ERROR HANDLING: Include proper error handling (try-catch, null checks, boundary validation). Never silently swallow errors.
-4. SECURITY: Validate user inputs. Never hardcode secrets or API keys. Use parameterized queries for databases.
-5. CODE STYLE: Match the existing project style — indentation, naming conventions, import patterns, and comment style.
-6. VERIFICATION: After making changes, run available verification commands (lint, typecheck, test) if defined in package.json scripts or equivalent.
-7. MINIMAL CHANGES: Make the smallest change that achieves the goal. Do not refactor unrelated code unless asked.
-8. EXPLAIN BRIEFLY: After completing changes, summarize what was done and why in 2-3 sentences.
-</code_quality_rules>`,
-        `<document_generation_rules>
-When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
-
-1. READ SKILL DOCS FIRST: Read the relevant SKILL.md to understand the API and best practices before writing code. Do not skip this step — understanding the API prevents errors.
-
-2. ONE COMPLETE SCRIPT: Plan the full document content, then write ONE script that generates everything in a single execution.
-
-3. EXECUTE AND FIX: Run the script. If it fails, read the error carefully, fix the issue, and re-run. Maximum 3 retry attempts. Do not rewrite from scratch — fix the specific error.
-
-4. BUDGET: Aim for 5-10 tool calls total for a complete document. Complex documents may require more.
-
-5. CONTENT FIRST: Focus on delivering correct, complete content the user asked for. Use clean, simple formatting unless the user explicitly requests elaborate styling.
-</document_generation_rules>`,
-        this.getBundledPathHints(),
-      ]
-        .filter((section): section is string => Boolean(section && section.trim()))
-        .join('\n\n');
 
       logTiming('before agent session creation', runStartTime);
 
@@ -2333,7 +1130,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
       // Re-read every query so newly added/removed MCP servers take effect immediately.
       const mcpCustomTools = this.mcpManager ? buildMcpCustomTools(this.mcpManager) : [];
       const extensionCustomTools = extensionResult.customTools || [];
-      const customTools = [...mcpCustomTools, ...extensionCustomTools];
+      const customTools = this.toolStrategy.mergeCustomTools(mcpCustomTools, extensionCustomTools);
       if (mcpCustomTools.length > 0) {
         log(
           `[ClaudeAgentRunner] Registered ${mcpCustomTools.length} MCP tools as customTools:`,
@@ -2351,26 +1148,26 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
       // executed via Pi SDK's Bash tool can find bundled and user-installed executables.
       await enrichProcessPathForBuild();
 
+      // Stage 2（Phase 4）：PromptStrategy.assemble() 取代原 coworkAppendPrompt 内联数组；
+      // ToolStrategy.assemble() 取代原 createCodingTools + timeout/sudo 包装链。
+      // 工具集恒定全量、不按任务裁剪（§3.3 锁定）。
+      taskCtx.hasMCPTools = mcpCustomTools.length > 0;
+      const assembledPrompt = this.promptStrategy.assemble(taskCtx);
+      logCtx(
+        '[ClaudeAgentRunner] Prompt subset assembled:',
+        taskCtx.taskType,
+        `~${assembledPrompt.tokenEstimate} tokens`
+      );
+
       const bashOptions: BashToolOptions | undefined =
         process.platform === 'win32' ? { operations: createWindowsBashOperations() } : undefined;
-      const codingTools = createCodingTools(
-        effectiveCwd,
-        bashOptions ? { bash: bashOptions } : undefined
-      );
-
-      // Inject a default 120s timeout for bash commands when the model omits one
-      const withTimeout = ClaudeAgentRunner.wrapBashToolWithDefaultTimeout(
-        codingTools as ToolDefinition[]
-      );
-
-      // Wrap the bash tool to intercept sudo commands and request passwords
-      // Note: wrapBashToolForSudo returns ToolDefinition[] (5-param execute) but
-      // createAgentSession.tools expects Tool[] (4-param execute). The extra ctx
-      // parameter is simply not passed by the session runner — safe to cast.
-      const wrappedTools = this.wrapBashToolForSudo(withTimeout, session.id, effectiveCwd);
+      const wrappedTools = this.toolStrategy.assemble(taskCtx, {
+        bashOptions,
+        requestSudoPassword: this.requestSudoPassword,
+      }).codingTools;
 
       // Diagnostic: log tools being passed to SDK (helps debug Ollama tool use)
-      logCtx(`[ClaudeAgentRunner] Session reuse check: cached=${!!cachedSession}`);
+      logCtx(`[ClaudeAgentRunner] Session reuse check: cached=${!isColdStart}`);
       logCtx(`[ClaudeAgentRunner] Model=${piModel.id}, thinkingLevel=${thinkingLevel}`);
       log(
         `[ClaudeAgentRunner] Built-in tools (${wrappedTools.length}): ${wrappedTools.map((t: { name?: string; type?: string }) => t.name || t.type).join(', ')}`
@@ -2379,185 +1176,37 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         `[ClaudeAgentRunner] Custom tools (${customTools.length}): ${customTools.map((t) => t.name).join(', ')}`
       );
 
-      let piSession: PiAgentSession;
-      if (cachedSession) {
-        // Reuse existing session — SDK retains full conversation history and handles compaction
-        piSession = cachedSession.session;
+      // Stage 3（Phase 5）：创建/复用/热替换/Ollama 补丁全部在 PiSessionFactory 内完成。
+      // 复用路径：更新 appendSystemPromptOverride 闭包 → reload() → model/thinking 热替换；
+      // 新建路径：createAgentSession 构造参数直接生效（HIGH-4）。
+      const { piSession, isReused } = await this.sessionFactory.resolveOrCreate({
+        sessionId: session.id,
+        modelCtx,
+        taskCtx,
+        prompt: assembledPrompt,
+        tools: { codingTools: wrappedTools },
+        thinkingLevel,
+        skillPaths,
+        customTools,
+        signature: signatureInput,
+        sessionCwd: session.cwd ?? null,
+        permissionDeps: {
+          requestPermission: this.requestPermission,
+          sessionAllowAll: this.optionsAllowAll,
+          getToolDisplayName: (name) => this.getToolDisplayName(name),
+        },
+      });
+      logTiming(isReused ? 'agent session reused' : 'agent session created', runStartTime);
 
-        // Hot-swap model/thinking if changed — SDK supports this natively
-        if (cachedSession.modelId !== piModel.id) {
-          logCtx(
-            '[ClaudeAgentRunner] Model changed, hot-swapping:',
-            cachedSession.modelId,
-            '→',
-            piModel.id
-          );
-          await piSession.setModel(piModel);
-          cachedSession.modelId = piModel.id;
-          // Update Ollama num_ctx ref if present
-          if (cachedSession.ollamaNumCtx) {
-            cachedSession.ollamaNumCtx.value = piModel.contextWindow || 128000;
-            log(
-              '[ClaudeAgentRunner] Updated Ollama num_ctx on hot-swap:',
-              cachedSession.ollamaNumCtx.value
-            );
-          }
-        }
-        if (cachedSession.thinkingLevel !== thinkingLevel) {
-          logCtx(
-            '[ClaudeAgentRunner] Thinking level changed, hot-swapping:',
-            cachedSession.thinkingLevel,
-            '→',
-            thinkingLevel
-          );
-          piSession.setThinkingLevel(thinkingLevel);
-          cachedSession.thinkingLevel = thinkingLevel;
-        }
-
-        logCtx('[ClaudeAgentRunner] Reusing cached pi session for:', session.id);
-        logTiming('agent session reused', runStartTime);
-      } else {
-        // First query in this session — create new agent session
-        // ResourceLoader + ModelRegistry only needed for session creation — skip on reuse
-        const { DefaultResourceLoader } = await import('@mariozechner/pi-coding-agent');
-        const resourceLoader = new DefaultResourceLoader({
-          cwd: effectiveCwd,
-          additionalSkillPaths: skillPaths,
-          appendSystemPrompt: coworkAppendPrompt,
-          agentsFilesOverride: () => ({
-            agentsFiles: [],
-          }),
-        });
-        await resourceLoader.reload();
-
-        const modelRegistry = new ModelRegistry(authStorage);
-
-        // Ollama-specific compaction tuning based on actual context window
-        const contextWindow = piModel.contextWindow || 128000;
-        let compactionSettings: {
-          enabled: boolean;
-          reserveTokens?: number;
-          keepRecentTokens?: number;
-        };
-        if (provider === 'ollama' && contextWindow < 16384) {
-          // Very small context: disable compaction (weak models produce unreliable summaries)
-          compactionSettings = { enabled: false };
-          log(
-            '[ClaudeAgentRunner] Ollama small context model, disabling auto-compaction (contextWindow:',
-            contextWindow,
-            ')'
-          );
-        } else if (provider === 'ollama' && contextWindow < 65536) {
-          // Medium context: scale reserves proportionally
-          compactionSettings = {
-            enabled: true,
-            reserveTokens: Math.floor(contextWindow * 0.15),
-            keepRecentTokens: Math.floor(contextWindow * 0.25),
-          };
-          log(
-            '[ClaudeAgentRunner] Ollama medium context, scaled compaction:',
-            JSON.stringify(compactionSettings)
-          );
-        } else {
-          compactionSettings = { enabled: true };
-        }
-
-        const { session: newPiSession } = await createAgentSession({
-          model: piModel,
-          thinkingLevel,
-          authStorage,
-          modelRegistry,
-          tools: wrappedTools as unknown as ReturnType<typeof createCodingTools>,
-          customTools,
-          sessionManager: PiSessionManager.inMemory(),
-          settingsManager: PiSettingsManager.inMemory({
-            compaction: compactionSettings,
-            retry: { enabled: true, maxRetries: 2 },
-          }),
-          resourceLoader,
-          cwd: effectiveCwd,
-        });
-        piSession = newPiSession;
-
-        // Install permission-gating hook via the SDK's tool_call extension event.
-        // This must happen once per new session — the hook persists across reuses.
-        this.installPermissionHook(piSession, session.id, session.cwd ?? null);
-
-        // Store session for reuse — evict oldest if cache is full
-        if (this.piSessions.size >= ClaudeAgentRunner.MAX_CACHED_SESSIONS) {
-          const oldestKey = this.piSessions.keys().next().value;
-          if (oldestKey) {
-            const oldest = this.piSessions.get(oldestKey);
-            if (oldest) {
-              try {
-                oldest.session.dispose();
-              } catch (e) {
-                logWarn('[ClaudeAgentRunner] dispose error on eviction:', e);
-              }
-            }
-            this.piSessions.delete(oldestKey);
-            log('[ClaudeAgentRunner] Evicted oldest cached session:', oldestKey);
-          }
-        }
-        this.piSessions.set(session.id, {
-          session: piSession,
-          modelId: piModel.id,
-          thinkingLevel,
-          runtimeSignature: sessionRuntimeSignature,
-          skillsSignature,
-        });
-
-        // Ollama: wrap _onPayload to inject num_ctx into every request
-        if (provider === 'ollama') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const agent = piSession.agent as any;
-          // Guard: only patch if the SDK exposes _onPayload (private API)
-          if (!('_onPayload' in agent)) {
-            logWarn(
-              '[ClaudeAgentRunner] SDK agent does not expose _onPayload — skipping Ollama num_ctx patch'
-            );
-          } else {
-            const originalOnPayload = agent._onPayload as
-              | ((
-                  payload: Record<string, unknown>,
-                  modelArg: unknown
-                ) => Promise<Record<string, unknown>>)
-              | undefined;
-            const ollamaNumCtx = {
-              value: piModel.contextWindow || 128000,
-            };
-            agent._onPayload = async (payload: Record<string, unknown>, modelArg: unknown) => {
-              let result = originalOnPayload
-                ? await originalOnPayload.call(agent, payload, modelArg)
-                : payload;
-              if (result === undefined) result = payload;
-              return { ...result, num_ctx: ollamaNumCtx.value };
-            };
-            this.piSessions.get(session.id)!.ollamaNumCtx = ollamaNumCtx;
-            log(
-              '[ClaudeAgentRunner] Ollama _onPayload wrapper installed, num_ctx:',
-              ollamaNumCtx.value
-            );
-          } // end else (_onPayload exists)
-        }
-
-        logTiming('agent session created', runStartTime);
-      }
-
+      // ══════════════ Stage 4：执行（事件流桥接） ══════════════
+      // ── 4.1 bridge state: SDK 事件 → ServerEvent 协议的桥接状态 ──
       // Set up event handler to bridge agent SDK events → our ServerEvent protocol
 
       // Accumulate streamed text deltas in case message_end.content is empty (pi SDK streaming behaviour)
       let streamedText = '';
-      // Turn-scoped pause-rescue state (lives at run() scope so BOTH the
-      // event-handler closure AND the AbortError catch below can reach it):
-      // raw text streamed so far + how many text messages this turn has
-      // persisted. The user-abort branch uses them to emit the rescue message
-      // (keeping the visible reply) and to decide on the placeholder.
-      const pauseRescue: { text: string; persistedTextCount: number; apiCallCount: number } = {
-        text: '',
-        persistedTextCount: 0,
-        apiCallCount: 0,
-      };
+      // 注意：此处不再声明内层 pauseRescue——它会遮蔽外层（run() 顶部 line ~503），
+      // 导致事件处理器写 inner 而 AbortError catch 读 outer，两个对象不同，
+      // 用户停止时 rescue 永远落空。统一通过作用域链引用 run() 顶部声明的同一个对象。
       let compactionStepId: string | undefined;
       let hasEmittedError = false;
       let terminalErrorText: string | undefined;
@@ -2568,7 +1217,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
       let messageStartTime: number | undefined;
       let apiCallCount = 0;
 
-      // ── Loop guard: protect against runaway tool-call loops ──
+      // ── 4.2 loop guard: protect against runaway tool-call loops ──
       // (e.g. gemini-3.1-pro with thinking=off has been observed producing hundreds
       //  of empty-text + single-tool-call responses in a single turn)
       // Two layers: hash of whole tool-call group (window=20, warn=3/halt=5/abort=8)
@@ -2629,6 +1278,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         }
       };
 
+      // ── 4.3 cold-start feedback: Ollama 模型加载提示（10s 无流事件时） ──
       // Ollama cold-start feedback: if provider is 'ollama' and no stream event arrives
       // within 10 seconds, show a "model loading" trace update so users know what's happening.
       let ollamaColdStartTimerId: ReturnType<typeof setTimeout> | undefined;
@@ -2671,6 +1321,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         }
       };
 
+      // ── 4.4 activity timeout: 5 分钟无 SDK 事件即中止（每个事件重置计时） ──
       // Activity-based timeout: reset the 5-min timer whenever the SDK sends events
       const PROMPT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
       let activityTimeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -2694,6 +1345,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
           )
         );
 
+      // ── 4.5 terminal error: 统一的终态错误发布（消息 + trace + 可选 abort） ──
       const emitTerminalError = (
         errorText: string,
         options: { abort?: boolean; includePartialText?: boolean } = {}
@@ -2763,6 +1415,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         }
       };
 
+      // ── 4.6 subscribe dispatch: SDK 事件订阅（message_update/end、tool_execution_*、auto_compaction_*） ──
       const unsubscribe = piSession.subscribe((event) => {
         try {
           if (controller.signal.aborted) return;
@@ -3153,7 +1806,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         }
       });
 
-      // ── Deferred memory injection ──
+      // ── 4.7 deferred memory injection ──
       // Background experience retrieval (see MemoryExtension) resolves in
       // parallel with the first LLM request; when it lands while the turn is
       // still running we inject it via pi's steering channel. This keeps the
@@ -3186,6 +1839,7 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
         });
       }
 
+      // ── 4.8 prompt execution: 发起请求，finally 中退订 + 清理计时器 ──
       // Execute the prompt — unsubscribe in finally to prevent event listener leak
       try {
         resetActivityTimeout();
@@ -3457,13 +2111,10 @@ When generating documents (Word/DOCX, PowerPoint/PPTX, Excel/XLSX, PDF, etc.):
     // Mark the user-stop flag so the prompt-returned-without-error path can
     // run the same partial-rescue as the AbortError path.
     this.userStopFlags.add(sessionId);
-    const cached = this.piSessions.get(sessionId);
-    if (cached) {
-      try {
-        void cached.session.abort();
-      } catch (error) {
-        logWarn('[ClaudeAgentRunner] pi session abort error:', error);
-      }
+    try {
+      this.sessionFactory.abortCachedSession(sessionId);
+    } catch (error) {
+      logWarn('[ClaudeAgentRunner] pi session abort error:', error);
     }
     const controller = this.activeControllers.get(sessionId);
     if (controller) controller.abort();
