@@ -124,6 +124,9 @@ export interface AppConfig {
   // Dedicated memory runtime config
   memoryRuntime: MemoryRuntimeConfig;
 
+  // 子 agent 联网检索端点（Phase 7.1 research profile 用；MVP 默认 bing-cn）
+  searchRuntime: SearchRuntimeConfig;
+
   // Enable thinking mode (show thinking steps)
   enableThinking: boolean;
 
@@ -161,6 +164,28 @@ export interface MemoryRuntimeConfig {
   evalMaxRounds?: number;
   evalArtifactsRoot?: string;
   promptIterationRounds?: number;
+}
+
+/**
+ * 子 agent 联网检索端点配置（Phase 7.1）。
+ * 独立配置段，不嵌套进 memoryRuntime——搜索与记忆运行时无语义关系。
+ * MVP 默认 'bing-cn'（国内可达 + 免费 + 免 key，零配置开箱即用）；
+ * Settings UI 切换界面不进 MVP（7.1.2+），企业部署如需付费端点可直接写 config 文件。
+ */
+export type SearchEngine =
+  | 'bing-cn'
+  | 'sogou'
+  | 'chrome-mcp'
+  | 'bing-api'
+  | 'serper'
+  | 'duckduckgo'
+  | 'none';
+
+export interface SearchRuntimeConfig {
+  engine: SearchEngine;
+  /** 仅 bing-api/serper 需要（企业部署在 config 文件预置，不要求终端用户申请）。 */
+  apiKey: string;
+  timeoutMs: number;
 }
 
 const DEFAULT_CONFIG_SET_ID = 'default';
@@ -288,6 +313,11 @@ const defaultConfig: AppConfig = {
     evalMaxRounds: 12,
     evalArtifactsRoot: '',
     promptIterationRounds: 2,
+  },
+  searchRuntime: {
+    engine: 'bing-cn',
+    apiKey: '',
+    timeoutMs: 10000,
   },
   enableThinking: false,
   isConfigured: false,
@@ -452,6 +482,31 @@ function normalizeMemoryRuntimeConfig(raw: unknown): MemoryRuntimeConfig {
       Number.isFinite(value.promptIterationRounds)
         ? Math.max(0, Math.min(10, Math.round(value.promptIterationRounds)))
         : defaultConfig.memoryRuntime.promptIterationRounds,
+  };
+}
+
+const SEARCH_ENGINES: SearchEngine[] = [
+  'bing-cn',
+  'sogou',
+  'chrome-mcp',
+  'bing-api',
+  'serper',
+  'duckduckgo',
+  'none',
+];
+
+function normalizeSearchRuntimeConfig(raw: unknown): SearchRuntimeConfig {
+  const value =
+    typeof raw === 'object' && raw !== null ? (raw as Partial<SearchRuntimeConfig>) : {};
+  return {
+    engine: SEARCH_ENGINES.includes(value.engine as SearchEngine)
+      ? (value.engine as SearchEngine)
+      : defaultConfig.searchRuntime.engine,
+    apiKey: typeof value.apiKey === 'string' ? value.apiKey : defaultConfig.searchRuntime.apiKey,
+    timeoutMs:
+      typeof value.timeoutMs === 'number' && Number.isFinite(value.timeoutMs)
+        ? Math.max(3000, Math.min(60000, Math.round(value.timeoutMs)))
+        : defaultConfig.searchRuntime.timeoutMs,
   };
 }
 
@@ -1013,6 +1068,7 @@ export class ConfigStore {
       sandboxEnabled: toBoolean(raw.sandboxEnabled, defaultConfig.sandboxEnabled),
       memoryEnabled: toBoolean(raw.memoryEnabled, defaultConfig.memoryEnabled),
       memoryRuntime: normalizeMemoryRuntimeConfig(raw.memoryRuntime),
+      searchRuntime: normalizeSearchRuntimeConfig(raw.searchRuntime),
       enableThinking: projected.enableThinking,
       isConfigured: toBoolean(raw.isConfigured, defaultConfig.isConfigured),
     };
@@ -1430,6 +1486,10 @@ export class ConfigStore {
         updates.memoryRuntime !== undefined
           ? normalizeMemoryRuntimeConfig(updates.memoryRuntime)
           : current.memoryRuntime,
+      searchRuntime:
+        updates.searchRuntime !== undefined
+          ? normalizeSearchRuntimeConfig(updates.searchRuntime)
+          : current.searchRuntime,
       isConfigured:
         updates.isConfigured !== undefined ? updates.isConfigured : current.isConfigured,
     });

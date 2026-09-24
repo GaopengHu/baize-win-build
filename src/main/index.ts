@@ -73,6 +73,8 @@ import {
   buildScheduledTaskTitle,
 } from '../shared/schedule/task-title';
 import { CompanyMarketplaceService } from './skills/company-marketplace-service';
+import { MarketplaceRatingStore } from './skills/marketplace-rating-store';
+import { createHash } from 'node:crypto';
 import {
   isUncPath,
   isWindowsDrivePath,
@@ -2061,6 +2063,31 @@ function getMarketplaceService(): CompanyMarketplaceService {
   return new CompanyMarketplaceService();
 }
 
+// 当前模型 API Key 的指纹（SHA-256 前 16 位 hex），原文绝不离开本机。
+// 同一用户删库重装也换不掉自己的 Key：随评分上报后，服务端可用它做
+// (key_fp, app_id) 去重；端侧同时用它隔离“每位用户”的半年度额。
+function getApiKeyFingerprint(): string {
+  try {
+    const apiKey = (configStore.get('apiKey') || '').trim();
+    if (!apiKey) return '';
+    return createHash('sha256').update(apiKey, 'utf8').digest('hex').slice(0, 16);
+  } catch {
+    return '';
+  }
+}
+
+// 评分凭证主进程备份：与 Chromium Local Storage 物理隔离（独立 JSON 文件），
+// 用户单删 Local Storage 文件夹或清浏览器数据时，冷却与下载记录可恢复。
+// 惰性初始化：app ready 之前拿不到 userData 路径，首次调用时再建。
+let marketplaceRatingStore: MarketplaceRatingStore | null = null;
+
+function getMarketplaceRatingStore(): MarketplaceRatingStore {
+  if (!marketplaceRatingStore) {
+    marketplaceRatingStore = new MarketplaceRatingStore(app.getPath('userData'));
+  }
+  return marketplaceRatingStore;
+}
+
 ipcMain.handle('marketplace.getBaseUrl', () => {
   try {
     return getMarketplaceService().getBaseUrl();
@@ -2083,6 +2110,8 @@ ipcMain.handle('marketplace.listSkillApps', async () => {
       downloadCount: app.download_count,
       updatedTime: app.updated_time,
       hasIcon: Boolean(app.icon),
+      avgScore: app.avg_score,
+      ratingCount: app.rating_count,
       packages: app.packages.map((pkg) => ({
         packageId: pkg.id,
         appId: pkg.app_id || app.id,
@@ -2113,8 +2142,7 @@ ipcMain.handle('marketplace.getIcon', async (_event, appId: number) => {
 });
 
 ipcMain.handle(
-  'marketplace.installSkill',
-  async (
+  'marketplace.installSkill',  async (
     _event,
     input: { appId: number; packageId: number; skillName?: string }
   ) => {
@@ -2134,6 +2162,54 @@ ipcMain.handle(
     }
   }
 );
+
+ipcMain.handle(
+  'marketplace.submitRating',
+  async (_event, input: { appId: number; score: number; deviceId?: string }) => {
+    try {
+      const marketplace = getMarketplaceService();
+      return await marketplace.submitRating(
+        Number(input?.appId),
+        Number(input?.score),
+        typeof input?.deviceId === 'string' ? input.deviceId : undefined,
+        getApiKeyFingerprint() || undefined
+      );
+    } catch (error) {
+      logError('[Marketplace] Error submitting rating:', error);
+      throw error;
+    }
+  }
+);
+
+ipcMain.handle('marketplace.getRatingState', () => {
+  try {
+    return { ...getMarketplaceRatingStore().getState(), keyFp: getApiKeyFingerprint() };
+  } catch (error) {
+    logError('[Marketplace] Error reading rating state:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.markDownloaded', (_event, input: { appId: number }) => {
+  try {
+    return getMarketplaceRatingStore().markDownloaded(Number(input?.appId));
+  } catch (error) {
+    logError('[Marketplace] Error recording download:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.recordRating', (_event, input: { appId: number }) => {
+  try {
+    return getMarketplaceRatingStore().recordRating(
+      Number(input?.appId),
+      getApiKeyFingerprint()
+    );
+  } catch (error) {
+    logError('[Marketplace] Error recording rating:', error);
+    throw error;
+  }
+});
 
 // Window control IPC handlers
 ipcMain.on('window.minimize', () => {

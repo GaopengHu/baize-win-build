@@ -114,6 +114,11 @@ import {
 import { expandSkillCommand } from './pipeline/skill-command';
 import { PiSessionFactory } from './pipeline/session-factory';
 import { buildMcpCustomTools } from './tools/mcp-tool-bridge';
+import {
+  buildDispatchAgentTool,
+  resetTurnBudget,
+} from './subagent/subagent-tool';
+import { resolveSearchEndpoint } from './subagent/search-endpoint';
 // bash 工具包装链（timeout/sudo）已迁至 pipeline/tool-strategy.ts（Phase 4）。
 // 冷启动历史序列化 + 组装已迁至 pipeline/cold-start-history.ts（Phase 1/5）；
 // 此处 re-export 保持外部导入方（如 src/tests/claude/agent-runner-history-rebuild.test.ts）兼容。
@@ -469,6 +474,9 @@ export class ClaudeAgentRunner {
       // 旧运行时不支持 EventTarget 调整监听上限时忽略即可。
     }
     this.activeControllers.set(session.id, controller);
+
+    // Phase 7.1：本轮开始，清零该会话的子 agent 轮次预算（dispatch budget 按轮计算）。
+    resetTurnBudget(session.id);
 
     // Sandbox isolation state (defined outside try for finally access)
     let sandboxPath: string | null = null;
@@ -1117,7 +1125,44 @@ export class ClaudeAgentRunner {
       // Re-read every query so newly added/removed MCP servers take effect immediately.
       const mcpCustomTools = this.mcpManager ? buildMcpCustomTools(this.mcpManager) : [];
       const extensionCustomTools = extensionResult.customTools || [];
-      const customTools = this.toolStrategy.mergeCustomTools(mcpCustomTools, extensionCustomTools);
+      // Phase 7.1 dispatch_agent：runner 侧直接组装（刻意不走 AgentRuntimeExtension）。
+      // 原因：beforeSessionRun ctx 里没有 piModel/authStorage/effectiveCwd，
+      // 为单个消费者扩展该接口不值得；runner 内三者现成，且 dispatch_agent 定义
+      // 为纯静态文本（不随 run 变化），不触发会话签名重建（§3.3 边界守住）。
+      // Child 组装同样不经过 extension 链（见 subagent-runner），深度 1 结构性保证。
+      const chromeToolNames = new Set(
+        (this.mcpManager?.getTools() ?? [])
+          .filter((t) => t.serverName.toLowerCase().includes('chrome'))
+          .map((t) => t.name)
+      );
+      const chromeBrowsingTools = mcpCustomTools.filter((t) => chromeToolNames.has(t.name));
+      const searchEndpoint = resolveSearchEndpoint(configStore.getAll());
+      const dispatchAgentTool = buildDispatchAgentTool({
+        parentSessionId: session.id,
+        runnerDeps: {
+          cwd: effectiveCwd,
+          model: piModel,
+          authStorage,
+          thinkingLevel,
+          search: searchEndpoint,
+          chromeBrowsingTools,
+          mergeCustomTools: (...groups) => this.toolStrategy.mergeCustomTools(...groups),
+          // Phase 7.1.2：document/general child 的权限与技能底座。
+          // hook 安装时 sessionId 传父 session.id（§1.10 第 1 点）。
+          parentSessionId: session.id,
+          skillPaths,
+          permissionDeps: {
+            requestPermission: this.requestPermission,
+            sessionAllowAll: this.optionsAllowAll,
+            getToolDisplayName: (name) => this.getToolDisplayName(name),
+          },
+        },
+      });
+      const customTools = this.toolStrategy.mergeCustomTools(
+        mcpCustomTools,
+        extensionCustomTools,
+        [dispatchAgentTool]
+      );
       if (mcpCustomTools.length > 0) {
         log(
           `[ClaudeAgentRunner] Registered ${mcpCustomTools.length} MCP tools as customTools:`,

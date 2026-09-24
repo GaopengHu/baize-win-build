@@ -132,8 +132,28 @@ export class SessionManager {
     new Map();
   private pendingPermissions: Map<
     string,
-    { sessionId: string; resolve: (result: PermissionResult) => void }
+    {
+      sessionId: string;
+      resolve: (result: PermissionResult) => void;
+      /** 串行派发时暂存，轮到时才下发 permission.request IPC。 */
+      payload: {
+        toolUseId: string;
+        toolName: string;
+        input: Record<string, unknown>;
+        sessionId: string;
+        kind?: 'advanced' | 'delete' | 'outside' | 'normal';
+        source?: { label: string };
+      };
+    }
   > = new Map();
+  /**
+   * Phase 7.1.2（修 §1.10 P0 单槽覆盖）：权限请求主进程串行派发。
+   * 同一时刻只向 renderer 派发一个 permission.request，其余在队列中等待，
+   * 前一个 resolve/超时后才发下一个。renderer 仍是单弹窗，但保证
+   * 「看到的都能答、答了的都算数」。并行 child 场景下审批天然逐个确认。
+   */
+  private permissionQueue: string[] = [];
+  private activePermissionId: string | null = null;
   /** Session-scoped "allow all non-elevated operations" flag (renderer button). */
   private sessionAllowAll = new Set<string>();
   private pendingSudoPasswords: Map<
@@ -1057,6 +1077,17 @@ export class SessionManager {
         this.sendToRenderer({ type: 'sudo.password.dismiss', payload: { toolUseId } });
       }
     }
+    // Phase 7.1.2（§1.10 第 4 点）：父 run cancel → child abort 时，
+    // 属于该会话的在途权限请求逐个 dismiss + resolve('deny')，
+    // 避免「取消后弹窗仍挂着、点了也没人收」的孤儿弹窗。
+    for (const [toolUseId, entry] of this.pendingPermissions) {
+      if (entry.sessionId === sessionId) {
+        entry.resolve('deny');
+        this.pendingPermissions.delete(toolUseId);
+        this.dequeuePermission(toolUseId);
+        this.sendToRenderer({ type: 'permission.dismiss', payload: { toolUseId } });
+      }
+    }
     // Also abort any pending controller we tracked
     const controller = this.activeSessions.get(sessionId);
     if (controller) {
@@ -1523,8 +1554,40 @@ export class SessionManager {
         log('[SessionManager] Session allow-all enabled:', pending.sessionId);
       }
       this.pendingPermissions.delete(toolUseId);
+      this.dequeuePermission(toolUseId);
       pending.resolve(result);
     }
+  }
+
+  /** 串行派发：当前无在途弹窗且队列非空时，发出队首请求的 IPC。 */
+  private dispatchNextPermission(): void {
+    if (this.activePermissionId !== null || this.permissionQueue.length === 0) {
+      return;
+    }
+    const nextId = this.permissionQueue.shift();
+    if (!nextId) {
+      return;
+    }
+    const pending = this.pendingPermissions.get(nextId);
+    if (!pending) {
+      // 已被取消/超时清理，继续尝试下一个
+      this.dispatchNextPermission();
+      return;
+    }
+    this.activePermissionId = nextId;
+    this.sendToRenderer({
+      type: 'permission.request',
+      payload: pending.payload,
+    });
+  }
+
+  /** 完成/超时/取消后出队并触发下一个。 */
+  private dequeuePermission(toolUseId: string): void {
+    this.permissionQueue = this.permissionQueue.filter((id) => id !== toolUseId);
+    if (this.activePermissionId === toolUseId) {
+      this.activePermissionId = null;
+    }
+    this.dispatchNextPermission();
   }
 
   setSessionAllowAll(sessionId: string, enabled: boolean): void {
@@ -1545,11 +1608,14 @@ export class SessionManager {
     toolUseId: string,
     toolName: string,
     input: Record<string, unknown>,
-    kind?: 'advanced' | 'delete' | 'outside' | 'normal'
+    kind?: 'advanced' | 'delete' | 'outside' | 'normal',
+    /** Phase 7.1.2：来源标注（child dispatch description），渲染端展示。 */
+    sourceLabel?: string
   ): Promise<PermissionResult> {
     return new Promise((resolve) => {
       const timeoutId = setTimeout(() => {
         this.pendingPermissions.delete(toolUseId);
+        this.dequeuePermission(toolUseId);
         resolve('deny');
         this.sendToRenderer({ type: 'permission.dismiss', payload: { toolUseId } });
       }, 60_000);
@@ -1559,11 +1625,18 @@ export class SessionManager {
           clearTimeout(timeoutId);
           resolve(result);
         },
+        payload: {
+          toolUseId,
+          toolName,
+          input,
+          sessionId,
+          kind,
+          ...(sourceLabel ? { source: { label: sourceLabel } } : {}),
+        },
       });
-      this.sendToRenderer({
-        type: 'permission.request',
-        payload: { toolUseId, toolName, input, sessionId, kind },
-      });
+      // 串行派发：排队，有空闲槽位时才下发 IPC（修 P0 单槽覆盖）
+      this.permissionQueue.push(toolUseId);
+      this.dispatchNextPermission();
     });
   }
 

@@ -267,6 +267,10 @@ export interface MarketplaceSkillApp {
   updatedTime: number;
   /** Icon is fetched separately via marketplace.icon; false hides the img. */
   hasIcon: boolean;
+  /** 服务端平均分（0~5，保留一位小数）；null 表示暂无评分。 */
+  avgScore: number | null;
+  /** 服务端评价次数。 */
+  ratingCount: number;
   packages: MarketplacePackageInfo[];
 }
 
@@ -476,6 +480,8 @@ export interface PermissionRequest {
   input: Record<string, unknown>;
   sessionId: string;
   kind?: PermissionKind;
+  /** Phase 7.1.2：来源标注（child dispatch description），无则不渲染。 */
+  source?: { label: string };
 }
 
 export type PermissionResult = 'allow' | 'deny' | 'allow_always';
@@ -739,6 +745,21 @@ export interface MemoryRuntimeConfig {
   promptIterationRounds?: number;
 }
 
+export type SearchEngine =
+  | 'bing-cn'
+  | 'sogou'
+  | 'chrome-mcp'
+  | 'bing-api'
+  | 'serper'
+  | 'duckduckgo'
+  | 'none';
+
+export interface SearchRuntimeConfig {
+  engine: SearchEngine;
+  apiKey?: string;
+  timeoutMs?: number;
+}
+
 export interface AppConfig {
   provider: ProviderType;
   apiKey: string;
@@ -759,6 +780,7 @@ export interface AppConfig {
   sandboxEnabled?: boolean;
   memoryEnabled?: boolean;
   memoryRuntime?: MemoryRuntimeConfig;
+  searchRuntime?: SearchRuntimeConfig;
   enableThinking?: boolean;
   isConfigured: boolean;
 }

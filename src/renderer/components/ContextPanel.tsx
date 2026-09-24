@@ -54,10 +54,14 @@ export function ContextPanel() {
   const sessionMessages = useAppStore((s) =>
     activeSessionId ? s.sessionStates[activeSessionId]?.messages : undefined
   );
-  const contextWindow = useAppStore((s) =>
+  const liveContextWindow = useAppStore((s) =>
     activeSessionId ? s.sessionStates[activeSessionId]?.contextWindow : undefined
   );
   const appConfig = useAppStore((s) => s.appConfig);
+  // 旧会话没有 live 值（session.contextInfo 只在运行中下发）：
+  // 退到当前配置的窗口，再退到与主进程一致的 128000 默认值，保证切旧对话也有分母可算。
+  const contextWindow =
+    liveContextWindow ?? appConfig?.contextWindow ?? 128000;
   const contextPanelCollapsed = useAppStore((s) => s.contextPanelCollapsed);
   const toggleContextPanel = useAppStore((s) => s.toggleContextPanel);
   const workingDir = useAppStore((s) => s.workingDir);
