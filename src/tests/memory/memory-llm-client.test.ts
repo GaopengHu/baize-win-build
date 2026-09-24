@@ -58,6 +58,11 @@ function makeConfig(timeoutMs: number): AppConfig {
       evalArtifactsRoot: '',
       promptIterationRounds: 2,
     },
+    searchRuntime: {
+      engine: 'none',
+      apiKey: '',
+      timeoutMs: 10000,
+    },
     enableThinking: false,
     isConfigured: true,
   };

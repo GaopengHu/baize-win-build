@@ -29,8 +29,22 @@ export type RequestPermissionFn = (
   toolUseId: string,
   toolName: string,
   input: Record<string, unknown>,
-  kind?: 'advanced' | 'delete' | 'outside' | 'normal'
+  kind?: 'advanced' | 'delete' | 'outside' | 'normal',
+  /** Phase 7.1.2：权限弹窗来源标注（child dispatch description），渲染端展示用。 */
+  sourceLabel?: string
 ) => Promise<'allow' | 'deny' | 'allow_always'>;
+
+/**
+ * 内部编排工具白名单：宿主侧自建、无外部副作用的分发/编排入口，
+ * 不经过权限审批（用户点 10 次「允许」也拦不住真正的副作用——
+ * 副作用发生在工具内部，由各自的审批链覆盖）。
+ *
+ * 白名单 ≠ 免责：dispatch_agent 内部派生的 child 写操作，
+ * 仍走各自安装的 installPermissionHook（父 sessionId 作用域）。
+ */
+const ORCHESTRATION_TOOLS_ALLOWLIST = new Set([
+  'dispatch_agent',
+]);
 
 export interface PermissionHookDeps {
   /** 用户权限弹窗回调；缺省时跳过钩子安装（无 UI 场景）。 */
@@ -39,6 +53,11 @@ export interface PermissionHookDeps {
   sessionAllowAll?: (sessionId: string) => boolean;
   /** 工具显示名解析（MCP sanitized 名 → 原始名），由 runner 注入以复用其缓存。 */
   getToolDisplayName: (toolName: string) => string;
+  /**
+   * Phase 7.1.2：来源标注。child 会话安装钩子时传入 dispatch description，
+   * 经 requestPermission 送达 PermissionDialog「来自：…」行。主会话不传。
+   */
+  sourceLabel?: string;
 }
 
 /**
@@ -52,7 +71,7 @@ export function installPermissionHook(
   sessionCwd: string | null,
   deps: PermissionHookDeps
 ): void {
-  const { requestPermission, sessionAllowAll, getToolDisplayName } = deps;
+  const { requestPermission, sessionAllowAll, getToolDisplayName, sourceLabel } = deps;
 
   if (!requestPermission) {
     log('[ClaudeAgentRunner] No requestPermission callback — skipping permission hook');
@@ -89,6 +108,13 @@ export function installPermissionHook(
       // `toolName` so allow-once decisions stay stable across calls.
       const displayName = getToolDisplayName(toolName);
 
+      // 内部编排工具（dispatch_agent）：无外部副作用，直接放行，
+      // 仍委托 SDK 原始钩子保事件链不断。
+      if (ORCHESTRATION_TOOLS_ALLOWLIST.has(toolName.toLowerCase())) {
+        log(`[ClaudeAgentRunner] Orchestration tool '${toolName}' allowed without approval`);
+        return sdkBeforeToolCall ? sdkBeforeToolCall(ctx, signal) : undefined;
+      }
+
       const allowAll = sessionAllowAll?.(sessionId) ?? false;
       const { kind, reason } = classifyPermission(sessionCwd, toolName, input);
       const decision = decidePermission(sessionId, toolName, input);
@@ -106,7 +132,7 @@ export function installPermissionHook(
         const toolUseId = `${ctx.toolCall?.id ?? 'unknown'}-perm-${uuidv4().slice(0, 8)}`;
         let result: 'allow' | 'deny' | 'allow_always';
         try {
-          result = await requestPermission(sessionId, toolUseId, displayName, input, kind);
+          result = await requestPermission(sessionId, toolUseId, displayName, input, kind, sourceLabel);
         } catch (permErr) {
           logError(
             `[ClaudeAgentRunner] Permission request failed for '${toolName}' — failing closed`,

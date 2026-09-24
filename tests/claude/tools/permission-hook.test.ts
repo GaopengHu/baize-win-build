@@ -168,4 +168,26 @@ describe('installPermissionHook (Phase 3, tools/permission-hook.ts)', () => {
 
     await expect(hook(baseCtx)).resolves.toBeUndefined();
   });
+
+  it('allows orchestration tools (dispatch_agent) without approval or rule lookup', async () => {
+    const { piSession, agent } = createFakeSession();
+    const sdkResult = { ok: true };
+    agent._beforeToolCall = vi.fn(async () => sdkResult);
+    const requestPermission = vi.fn(async () => 'allow' as const);
+    decidePermissionMock.mockReturnValue('ask');
+    resolvePermissionGateMock.mockReturnValue('ask');
+    installPermissionHook(piSession as never, 'session-1', null, deps({ requestPermission }));
+    const hook = captureHook(agent);
+
+    const ctx = {
+      toolCall: { id: 'call-d', name: 'dispatch_agent' },
+      args: { description: 'd', prompt: 'p', subagent_type: 'research' },
+    };
+    const result = await hook(ctx);
+
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(decidePermissionMock).not.toHaveBeenCalled();
+    expect(classifyPermissionMock).not.toHaveBeenCalled();
+    expect(result).toBe(sdkResult);
+  });
 });
