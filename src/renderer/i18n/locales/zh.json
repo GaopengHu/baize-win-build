@@ -646,6 +646,11 @@
     "switchModel": "切换方案",
     "connectorCount_one": "{{count}} 个连接器",
     "connectorCount_other": "{{count}} 个连接器",
+    "slashMenu": {
+      "empty": "没有匹配的技能",
+      "ariaLabel": "技能命令列表",
+      "hint": "按 Enter 插入"
+    },
     "lowMemoryAsrWarning": "检测到设备内存较低（总计 {{totalGB}} GB，可用 {{freeGB}} GB）。本地语音转写非常吃内存，运行中可能出现界面白屏或卡死。建议：1) 先关闭其他大内存程序；2) 长录音先剪短再转写。"
   },
   "context": {

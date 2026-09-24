@@ -646,6 +646,11 @@
     "switchModel": "Switch scheme",
     "connectorCount_one": "{{count}} connector",
     "connectorCount_other": "{{count}} connectors",
+    "slashMenu": {
+      "empty": "No matching skills",
+      "ariaLabel": "Skill commands",
+      "hint": "Enter to insert"
+    },
     "lowMemoryAsrWarning": "Low memory detected ({{totalGB}} GB total, {{freeGB}} GB free). Local ASR transcription is memory-intensive and may cause white screen or freeze. Suggestions: 1) Close other memory-heavy apps; 2) Split long audio beforehand."
   },
   "context": {

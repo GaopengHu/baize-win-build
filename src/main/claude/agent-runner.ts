@@ -111,6 +111,7 @@ import {
   buildColdStartContextualPrompt,
   serializeMessageContentForHistory,
 } from './pipeline/cold-start-history';
+import { expandSkillCommand } from './pipeline/skill-command';
 import { PiSessionFactory } from './pipeline/session-factory';
 import { buildMcpCustomTools } from './tools/mcp-tool-bridge';
 // bash 工具包装链（timeout/sudo）已迁至 pipeline/tool-strategy.ts（Phase 4）。
@@ -1098,23 +1099,9 @@ export class ClaudeAgentRunner {
           })
         : { promptPrefix: undefined, customTools: [] };
 
-      let contextualPrompt = prompt;
-      if (isColdStart) {
-        // Cold start: inject recent history into prompt if available
-        // （Phase 5：组装逻辑迁至 pipeline/cold-start-history.ts，行为不变）
-        contextualPrompt = buildColdStartContextualPrompt(
-          prompt,
-          existingMessages,
-          provider,
-          piModel.contextWindow || 128000
-        );
-      } else {
-        // Reusing session — SDK already has the full conversation context
-        logCtx('[ClaudeAgentRunner] Reusing existing SDK session for:', session.id);
-      }
-      if (extensionResult.promptPrefix?.trim()) {
-        contextualPrompt = `${extensionResult.promptPrefix.trim()}\n\n${contextualPrompt}`;
-      }
+      // contextualPrompt 组装已下移至 resolveOrCreate 之后（见下方 Stage 3b）——
+      // /skill:<name> 展开需要 piSession.resourceLoader（SDK 公开 getter）的
+      // 权威技能列表，且必须先展开、再拼接冷启动 preamble / promptPrefix。
 
       // Stage 3a（Phase 6）：MCP servers 配置构建提取为私有方法（行为不变），
       // 日志/缓存指纹语义与内联实现完全一致。返回值仅用于日志与缓存——
@@ -1197,6 +1184,41 @@ export class ClaudeAgentRunner {
         },
       });
       logTiming(isReused ? 'agent session reused' : 'agent session created', runStartTime);
+
+      // ── Stage 3b：contextualPrompt 组装（原 :1101 处逻辑下移至此）──
+      // 下移原因：/skill:<name> 显式展开必须在拼接任何前缀之前完成，而权威的
+      // 技能列表只有 piSession 就绪后才能拿到（SDK 公开 getter resourceLoader，
+      // 与 _expandSkillCommand 内部同源）。SDK 自身只在文本以 "/skill:" **开头**
+      // 时展开，而冷启动 <conversation_history> preamble / extension promptPrefix
+      // 会破坏这个开头条件 → 必须由我们先展开。展开成功后文本以 "<skill" 开头，
+      // SDK 的展开天然 no-op（不存在双重展开）。
+      let expandedPrompt = prompt;
+      if (prompt.startsWith('/skill:')) {
+        expandedPrompt = expandSkillCommand(prompt, piSession.resourceLoader.getSkills().skills);
+        if (expandedPrompt !== prompt) {
+          logCtx(
+            '[ClaudeAgentRunner] Expanded /skill: command before prompt assembly for:',
+            session.id
+          );
+        }
+      }
+      let contextualPrompt = expandedPrompt;
+      if (isColdStart) {
+        // Cold start: inject recent history into prompt if available
+        // （Phase 5：组装逻辑迁至 pipeline/cold-start-history.ts，行为不变）
+        contextualPrompt = buildColdStartContextualPrompt(
+          contextualPrompt,
+          existingMessages,
+          provider,
+          piModel.contextWindow || 128000
+        );
+      } else {
+        // Reusing session — SDK already has the full conversation context
+        logCtx('[ClaudeAgentRunner] Reusing existing SDK session for:', session.id);
+      }
+      if (extensionResult.promptPrefix?.trim()) {
+        contextualPrompt = `${extensionResult.promptPrefix.trim()}\n\n${contextualPrompt}`;
+      }
 
       // ══════════════ Stage 4：执行（事件流桥接） ══════════════
       // ── 4.1 bridge state: SDK 事件 → ServerEvent 协议的桥接状态 ──
