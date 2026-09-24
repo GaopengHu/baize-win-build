@@ -44,6 +44,15 @@ export interface MarketplaceApp {
   download_count: number;
   updated_time: number;
   packages: MarketplacePackage[];
+  /** 服务端下发的平均分（0~5，保留一位小数）；缺失时为 null。 */
+  avg_score: number | null;
+  /** 服务端下发的评价次数。 */
+  rating_count: number;
+}
+
+export interface MarketplaceRatingResult {
+  avg_score: number;
+  rating_count: number;
 }
 
 interface MarketplaceEnvelope {
@@ -190,6 +199,79 @@ export class CompanyMarketplaceService {
     }
   }
 
+  /**
+   * 端侧匿名评分：POST {base}/api/apps/public/rating/:id
+   * body { score: 0.5~5（0.5 步进）, device_id?, key_fp? }，Content-Type 必须 application/json。
+   * 成功返回服务端合并后的最新 { avg_score, rating_count }。
+   * 服务端不去重，“半年一次”由端侧（渲染层 localStorage）负责。
+   *
+   * key_fp 是当前模型 API Key 的 SHA-256 指纹（前 16 位 hex），绝不传原文：
+   * 用户删库重装也换不掉自己的 Key，服务端将来可用 (key_fp, app_id) 做
+   * 去重/限频；现阶段至少可审计。Go 侧 ShouldBindJSON 会忽略未知字段，
+   * 老版本服务端收到多一个字段不会报错。
+   */
+  async submitRating(
+    appId: number,
+    score: number,
+    deviceId?: string,
+    keyFingerprint?: string
+  ): Promise<MarketplaceRatingResult> {
+    if (!Number.isFinite(appId)) {
+      throw new Error('应用 ID 无效');
+    }
+    if (!Number.isFinite(score) || score < 0.5 || score > 5) {
+      throw new Error('评分超出范围');
+    }
+    // 0.5 步进校验（浮点安全写法）
+    if (Math.abs(score * 2 - Math.round(score * 2)) > 1e-9) {
+      throw new Error('评分步长必须为 0.5');
+    }
+    const url = `${this.baseUrl}/api/apps/public/rating/${encodeURIComponent(appId)}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const body: Record<string, unknown> = {
+        score,
+        device_id: (deviceId || '').slice(0, 128),
+      };
+      if (keyFingerprint) {
+        body.key_fp = keyFingerprint;
+      }
+      const response = await fetch(url, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { ...this.buildHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      let payload: MarketplaceEnvelope;
+      try {
+        payload = (await response.json()) as MarketplaceEnvelope;
+      } catch {
+        throw new MarketplaceHttpError(response.status, '评分参数无效');
+      }
+      if (!response.ok || !payload?.success) {
+        throw new MarketplaceHttpError(
+          response.status,
+          payload?.message || `评分提交失败 (${response.status})`
+        );
+      }
+      const data = (payload.data || {}) as Record<string, unknown>;
+      const avg = Number(data.avg_score ?? data.avgScore);
+      const count = Number(data.rating_count ?? data.ratingCount);
+      if (!Number.isFinite(avg) || !Number.isFinite(count)) {
+        throw new Error('评分接口返回数据异常');
+      }
+      return { avg_score: avg, rating_count: count };
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new MarketplaceHttpError(0, `评分请求超时: ${url}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private parseApp(raw: unknown): MarketplaceApp | null {
     if (typeof raw !== 'object' || raw === null) {
       return null;
@@ -220,8 +302,23 @@ export class CompanyMarketplaceService {
         : [],
       download_count: Number(record.download_count) || 0,
       updated_time: Number(record.updated_time) || 0,
+      // 评分字段服务端可能用 avg_score / avgScore / score 等不同拼写，全部兼容；
+      // 缺失时给 null，UI 显示"暂无评分"而不是伪造的 0 分。
+      avg_score: this.parseScore(record.avg_score ?? record.avgScore ?? record.score),
+      rating_count: Number(record.rating_count ?? record.ratingCount ?? record.rate_count) || 0,
       packages,
     };
+  }
+
+  private parseScore(value: unknown): number | null {
+    if (value === null || value === undefined || value === '') {
+      return null;
+    }
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) {
+      return null;
+    }
+    return Math.min(5, Math.max(0, num));
   }
 
   private parsePackage(raw: unknown): MarketplacePackage | null {

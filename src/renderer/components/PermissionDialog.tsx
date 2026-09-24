@@ -54,6 +54,11 @@ export function PermissionDialog({ permission }: PermissionDialogProps) {
               {t('permission.permissionRequired')}
             </h2>
             <p className="text-sm text-text-secondary mt-1">{summary}</p>
+            {permission.source?.label && (
+              <p className="text-xs text-text-muted mt-1">
+                {t('permission.fromSource', '来自：{{label}}', { label: permission.source.label })}
+              </p>
+            )}
           </div>
         </div>
 

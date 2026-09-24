@@ -275,6 +275,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
       skillName?: string;
     }): Promise<MarketplaceSkillInstallResult> =>
       ipcRenderer.invoke('marketplace.installSkill', input),
+    submitRating: (input: {
+      appId: number;
+      score: number;
+      deviceId?: string;
+    }): Promise<{ avg_score: number; rating_count: number }> =>
+      ipcRenderer.invoke('marketplace.submitRating', input),
+    getRatingState: (): Promise<{
+      deviceId: string;
+      downloaded: Record<string, number>;
+      ratings: Record<string, number>;
+      keyFp: string;
+    }> => ipcRenderer.invoke('marketplace.getRatingState'),
+    markDownloaded: (input: { appId: number }) =>
+      ipcRenderer.invoke('marketplace.markDownloaded', input),
+    recordRating: (input: { appId: number }) =>
+      ipcRenderer.invoke('marketplace.recordRating', input),
   },
 
   // Sandbox methods
@@ -574,6 +590,19 @@ declare global {
           packageId: number;
           skillName?: string;
         }) => Promise<MarketplaceSkillInstallResult>;
+        submitRating: (input: {
+          appId: number;
+          score: number;
+          deviceId?: string;
+        }) => Promise<{ avg_score: number; rating_count: number }>;
+        getRatingState: () => Promise<{
+          deviceId: string;
+          downloaded: Record<string, number>;
+          ratings: Record<string, number>;
+          keyFp: string;
+        }>;
+        markDownloaded: (input: { appId: number }) => Promise<unknown>;
+        recordRating: (input: { appId: number }) => Promise<unknown>;
       };
       sandbox: {
         getStatus: (forceFresh?: boolean) => Promise<{

@@ -20,6 +20,18 @@ import type {
 import { useAppStore } from '../../store';
 import { SettingsContentSection } from './shared';
 import type { LocalizedBanner } from './shared';
+import { StarDisplay, StarRatingInput } from './MarketplaceRating';
+import {
+  loadDownloadedMap,
+  markSkillDownloaded,
+  isSkillDownloaded,
+  getRateEligibility,
+  recordRating,
+  getDeviceId,
+  isValidRatingStep,
+  formatCooldownDays,
+  applyPersistedRatingState,
+} from '../../utils/marketplace-rating';
 
 const isElectron = typeof window !== 'undefined' && window.electronAPI !== undefined;
 
@@ -46,6 +58,23 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
   const [error, setError] = useState<LocalizedBanner | null>(null);
   const [success, setSuccess] = useState<LocalizedBanner | null>(null);
   const pluginToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 评分相关状态
+  const [downloadedMap, setDownloadedMap] = useState<Record<number, number>>(() =>
+    loadDownloadedMap()
+  );
+  // 本机刚评完的本地覆盖：{ appId: { avgScore, ratingCount } }，优先于服务端旧值展示
+  const [ratingOverrides, setRatingOverrides] = useState<
+    Record<number, { avgScore: number; ratingCount: number }>
+  >({});
+  const [ratingModalApp, setRatingModalApp] = useState<MarketplaceSkillApp | null>(null);
+  const [ratingValue, setRatingValue] = useState(0);
+  const [ratingHover, setRatingHover] = useState<number | null>(null);
+  const [isSubmittingRating, setIsSubmittingRating] = useState(false);
+  const [ratingError, setRatingError] = useState('');
+  // 当前模型 API Key 指纹（主进程计算，原文不出配置）：评分冷却按 Key 隔离，
+  // 同一机器换 Key = 换用户，各自独立的半年额度。
+  const [ratingKeyFp, setRatingKeyFp] = useState('');
 
   useEffect(() => {
     if (!skillsStorageChangeEvent) {
@@ -162,6 +191,18 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
         window.electronAPI.marketplace.getBaseUrl().catch(() => ''),
       ]);
       setMarketplaceApps(apps || []);
+      // 用主进程备份校准本地门控：单删 Local Storage 文件夹后，
+      // 下载记录与评分冷却从这里恢复，半年限制继续生效。
+      try {
+        const persisted = await window.electronAPI.marketplace.getRatingState();
+        if (persisted) {
+          applyPersistedRatingState(persisted);
+          setDownloadedMap(loadDownloadedMap());
+          setRatingKeyFp(typeof persisted.keyFp === 'string' ? persisted.keyFp : '');
+        }
+      } catch {
+        // 校准失败不阻塞列表展示
+      }
       setMarketplaceBaseUrl(baseUrl || '');
       setMarketplaceBaseUrlDraft(baseUrl || '');
       setError(null);
@@ -178,10 +219,17 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
       setMarketplaceIconCache(iconMap);
     } catch (err) {
       setMarketplaceApps([]);
+      const rawMessage = err instanceof Error && err.message ? err.message : '';
+      // 主进程缺 handler = 客户端版本早于市场 IPC（2026-09-18 落码）：
+      // 直说升级，别把 IPC 原文甩给办公用户。
+      const outdated =
+        rawMessage.includes('No handler registered') &&
+        rawMessage.includes('marketplace.');
       setError({
-        text:
-          err instanceof Error && err.message
-            ? `${t('skills.marketplaceLoadFailed')}: ${err.message}`
+        text: outdated
+          ? t('skills.marketplaceClientOutdated')
+          : rawMessage
+            ? `${t('skills.marketplaceLoadFailed')}: ${rawMessage}`
             : t('skills.marketplaceLoadFailed'),
       });
     } finally {
@@ -240,6 +288,13 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
         skillName: app.name,
       });
       await loadSkills();
+      // 下载成功即登记：本地 + 主进程各记一份，只有下载过的 skill 才允许评分
+      setDownloadedMap(markSkillDownloaded(app.appId));
+      try {
+        await window.electronAPI.marketplace.markDownloaded({ appId: app.appId });
+      } catch {
+        // 主进程备份失败不影响本次流程，下次打开商店时以本地为准
+      }
       const message = t('skills.marketplaceInstallSuccess', {
         name: result.skillName || app.name,
       });
@@ -258,8 +313,77 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
     }
   }
 
-  function pickPreferredPackage(app: MarketplaceSkillApp) {
-    if (app.packages.length === 0) {
+  function openRatingModal(app: MarketplaceSkillApp) {
+    // 没下载过：只看分，不给评
+    if (!isSkillDownloaded(app.appId) && downloadedMap[app.appId] === undefined) {
+      return;
+    }
+    setRatingModalApp(app);
+    setRatingValue(0);
+    setRatingHover(null);
+    setRatingError('');
+  }
+
+  async function handleSubmitRating() {
+    const app = ratingModalApp;
+    if (!app || isSubmittingRating) return;
+    if (!isValidRatingStep(ratingValue)) {
+      setRatingError(t('skills.marketplaceRatingInvalid'));
+      return;
+    }
+    // 端侧硬门槛：该 Key 半年内评过同一 skill，直接拒绝提交
+    const eligibility = getRateEligibility(app.appId, ratingKeyFp);
+    if (!eligibility.allowed) {
+      setRatingError(
+        t('skills.marketplaceRatingCooldown', {
+          days: formatCooldownDays(eligibility.remainingMs),
+        })
+      );
+      return;
+    }
+    setIsSubmittingRating(true);
+    setRatingError('');
+    try {
+      const result = await window.electronAPI.marketplace.submitRating({
+        appId: app.appId,
+        score: ratingValue,
+        deviceId: getDeviceId(),
+      });
+      // 服务端返回合并后的最新平均分与总次数，直接覆盖展示
+      setMarketplaceApps((prev) =>
+        prev.map((item) =>
+          item.appId === app.appId
+            ? { ...item, avgScore: result.avg_score, ratingCount: result.rating_count }
+            : item
+        )
+      );
+      setRatingOverrides((prev) => ({
+        ...prev,
+        [app.appId]: { avgScore: result.avg_score, ratingCount: result.rating_count },
+      }));
+      recordRating(app.appId, ratingKeyFp);
+      try {
+        await window.electronAPI.marketplace.recordRating({ appId: app.appId });
+      } catch {
+        // 主进程备份失败不影响本次评分，本地冷却已生效
+      }
+      setRatingModalApp(null);
+      const message = t('skills.marketplaceRatingSuccess', { name: app.name });
+      setSuccess({ text: message });
+      showPluginInstallToast(message);
+      setTimeout(() => setSuccess(null), 4000);
+    } catch (err) {
+      setRatingError(
+        err instanceof Error && err.message
+          ? `${t('skills.marketplaceRatingFailed')}: ${err.message}`
+          : t('skills.marketplaceRatingFailed')
+      );
+    } finally {
+      setIsSubmittingRating(false);
+    }
+  }
+
+  function pickPreferredPackage(app: MarketplaceSkillApp) {    if (app.packages.length === 0) {
       return null;
     }
     // Prefer x64, then the first package by server sort order (already sorted).
@@ -609,6 +733,42 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
                                 ''
                               )}
                             </p>
+                            {(() => {
+                              const override = ratingOverrides[app.appId];
+                              const avg =
+                                override?.avgScore ?? app.avgScore ?? null;
+                              const count =
+                                override?.ratingCount ?? app.ratingCount ?? 0;
+                              const downloaded =
+                                downloadedMap[app.appId] !== undefined ||
+                                isSkillDownloaded(app.appId);
+                              return (
+                                <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                                  <StarDisplay score={avg} />
+                                  {avg === null ? (
+                                    <span className="text-xs text-text-muted">
+                                      {t('skills.marketplaceNoRating')}
+                                    </span>
+                                  ) : (
+                                    <span className="text-xs text-text-muted">
+                                      {avg.toFixed(1)}
+                                      {t('skills.marketplaceRatingUnit', {
+                                        count,
+                                      })}
+                                    </span>
+                                  )}
+                                  {downloaded && (
+                                    <button
+                                      type="button"
+                                      onClick={() => openRatingModal(app)}
+                                      className="text-xs text-accent hover:text-accent-hover hover:underline transition-colors"
+                                    >
+                                      {t('skills.marketplaceRateAction')}
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })()}
                           </div>
                         </div>
                         <button
@@ -637,6 +797,105 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
           </div>
         </div>
       )}
+
+      {ratingModalApp &&
+        (() => {
+          const eligibility = getRateEligibility(ratingModalApp.appId, ratingKeyFp);
+          const override = ratingOverrides[ratingModalApp.appId];
+          const avg =
+            override?.avgScore ?? ratingModalApp.avgScore ?? null;
+          const count =
+            override?.ratingCount ?? ratingModalApp.ratingCount ?? 0;
+          const shown = ratingHover ?? ratingValue;
+          return (
+            <div className="fixed inset-0 z-[70] bg-black/50 flex items-center justify-center p-4">
+              <div className="w-full max-w-md rounded-lg border border-border bg-surface shadow-elevated">
+                <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-2">
+                  <h3 className="text-base font-semibold text-text-primary truncate">
+                    {t('skills.marketplaceRatingTitle', {
+                      name: ratingModalApp.name,
+                    })}
+                  </h3>
+                  <button
+                    onClick={() => setRatingModalApp(null)}
+                    className="p-2 rounded-lg hover:bg-surface-hover transition-colors shrink-0"
+                  >
+                    <X className="w-5 h-5 text-text-secondary" />
+                  </button>
+                </div>
+                <div className="px-5 py-4 space-y-4">
+                  <div className="flex items-center gap-2">
+                    <StarDisplay score={avg} />
+                    {avg === null ? (
+                      <span className="text-sm text-text-muted">
+                        {t('skills.marketplaceNoRating')}
+                      </span>
+                    ) : (
+                      <span className="text-sm text-text-muted">
+                        {avg.toFixed(1)}
+                        {t('skills.marketplaceRatingUnit', { count })}
+                      </span>
+                    )}
+                  </div>
+                  {!eligibility.allowed ? (
+                    <div className="flex items-start gap-2 px-4 py-3 rounded-lg bg-warning/10 text-warning text-sm">
+                      <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                      <span>
+                        {t('skills.marketplaceRatingCooldown', {
+                          days: formatCooldownDays(eligibility.remainingMs),
+                        })}
+                      </span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-3">
+                        <StarRatingInput
+                          value={ratingValue}
+                          hoverValue={ratingHover}
+                          disabled={isSubmittingRating}
+                          onChange={setRatingValue}
+                          onHover={setRatingHover}
+                        />
+                        <span className="text-sm text-text-secondary min-w-10">
+                          {shown > 0
+                            ? t('skills.marketplaceRatingPicked', {
+                                score: shown.toFixed(1),
+                              })
+                            : ''}
+                        </span>
+                      </div>
+                      {ratingError && (
+                        <div className="flex items-start gap-2 px-4 py-3 rounded-lg bg-error/10 text-error text-sm">
+                          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                          <span className="break-all">{ratingError}</span>
+                        </div>
+                      )}
+                      <div className="flex justify-end gap-2">
+                        <button
+                          onClick={() => setRatingModalApp(null)}
+                          disabled={isSubmittingRating}
+                          className="px-4 py-2 rounded-lg border border-border text-text-secondary hover:border-accent hover:text-accent transition-all text-sm disabled:opacity-50"
+                        >
+                          {t('common.cancel')}
+                        </button>
+                        <button
+                          onClick={() => void handleSubmitRating()}
+                          disabled={isSubmittingRating || ratingValue <= 0}
+                          className="px-4 py-2 rounded-lg bg-accent text-white hover:bg-accent-hover transition-all text-sm disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1"
+                        >
+                          {isSubmittingRating && (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          )}
+                          {t('skills.marketplaceRatingSubmit')}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
       {pluginToastMessage && (
         <div className="fixed right-6 bottom-6 z-[80] max-w-md rounded-lg border border-success/30 bg-surface px-4 py-3 shadow-elevated">
