@@ -83,7 +83,7 @@ export const SUBAGENT_TYPES: SubagentProfileName[] = ['research', 'document', 'g
 
 const DISPATCH_AGENT_DESCRIPTION = [
   '把一个可并行分解的子任务委派给子 agent（独立上下文，结果以聚焦报告返回）。',
-  'research（只读调研）：同时查多个来源/多份资料对比、通读长网页或大文档并提炼；简单一问一答不要委派。',
+  'research（只读调研）：读本地文件与长文档提炼；联网检索默认关闭（用户需在设置里显式开启），离线时只能靠本地文件与已有知识。简单一问一答不要委派。',
   'document（文档生成）：做 PPT/写 Word/出表格等办公产物，子任务需自带完整内容要求；写文件/跑命令会弹权限确认。',
   'general（通用执行）：可独立执行的其他子任务兜底，有完整工具集；写操作同样会弹权限确认。',
   'prompt 必须自带子任务所需的全部上下文（子 agent 看不到主会话）。',

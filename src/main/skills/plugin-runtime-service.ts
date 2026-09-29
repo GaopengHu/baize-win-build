@@ -334,10 +334,21 @@ export class PluginRuntimeService {
         }
 
         const installedNames: string[] = [];
+        // 显示名与内部名分离：内部名保持包内英文（模型 Skill 工具可稳定调用），
+        // 市场中文展示名写 sidecar，列表页优先显示中文（见 displayName）。
+        // 多 skill 包每个都写（展示名相同也无妨，显示层本来就允许重名）。
+        const displayName = (input.skillName || '').trim();
         for (const skillDir of skillDirs) {
           const manager = this.skillsManager;
           if (!manager) {
             throw new Error('Skills manager not initialized');
+          }
+          if (displayName) {
+            fs.writeFileSync(
+              path.join(skillDir, '.nowlink-marketplace.json'),
+              JSON.stringify({ appId, displayName }),
+              'utf-8'
+            );
           }
           // Marketplace installs start DISABLED — the user explicitly opts in
           // via the toggle in settings before the skill takes effect.
@@ -349,7 +360,8 @@ export class PluginRuntimeService {
         );
         return {
           success: true,
-          skillName: installedNames[0] || input.skillName || String(appId),
+          // toast 与列表展示一致：优先市场展示名（中文），内部名只兜底
+          skillName: input.skillName || installedNames[0] || String(appId),
           appId,
           packageId,
         };

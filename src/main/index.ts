@@ -2063,6 +2063,29 @@ function getMarketplaceService(): CompanyMarketplaceService {
   return new CompanyMarketplaceService();
 }
 
+/**
+ * 当前活跃配置集的模型 API Key（模型设置里用户填的那个，各用户唯一）。
+ * 注意 get('apiKey') 读的是遗留顶层键，配置集用户必须走 getAll() 投影。
+ * 用途：技能市场下载/评分/目录的 Authorization: Bearer 身份头。
+ * 原文只进请求头、不进日志（各调用处只记有无）。
+ */
+function getMarketplaceAuthToken(): string {
+  try {
+    return configStore.getAll().apiKey?.trim() || '';
+  } catch (error) {
+    logWarn('[Marketplace] Failed to read active apiKey:', error);
+    return '';
+  }
+}
+
+/** 带身份头的市场服务（目录/评分/下载；无 key 时退化为匿名，老行为不变）。 */
+function getAuthedMarketplaceService(): CompanyMarketplaceService {
+  return new CompanyMarketplaceService(
+    getMarketplaceService().getBaseUrl(),
+    getMarketplaceAuthToken()
+  );
+}
+
 // 当前模型 API Key 的指纹（SHA-256 前 16 位 hex），原文绝不离开本机。
 // 同一用户删库重装也换不掉自己的 Key：随评分上报后，服务端可用它做
 // (key_fp, app_id) 去重；端侧同时用它隔离“每位用户”的半年度额。
@@ -2099,7 +2122,8 @@ ipcMain.handle('marketplace.getBaseUrl', () => {
 
 ipcMain.handle('marketplace.listSkillApps', async () => {
   try {
-    const marketplace = getMarketplaceService();
+    // 目录接口同样带身份头：限流按员工计数（不带则全公司共享出口 IP 额度）。
+    const marketplace = getAuthedMarketplaceService();
     const apps = await marketplace.listSkillApps('Skill');
     return apps.map((app) => ({
       appId: app.id,
@@ -2153,6 +2177,10 @@ ipcMain.handle(
       const result = await pluginRuntimeService.installFromMarketplace({
         ...input,
         baseUrl: getMarketplaceService().getBaseUrl(),
+        // 下载身份识别：透传当前活跃配置集的模型 API Key（截图里用户填的那个）。
+        // 传递方式为 Authorization: Bearer 头（不拼进 URL，避免进服务端访问日志）；
+        // Key 原文只在此次下载请求的头里出现，日志里只记有无、不记原文。
+        accessToken: getMarketplaceAuthToken(),
       });
       sessionManager?.invalidateSkillsSetup();
       return result;
@@ -2167,7 +2195,9 @@ ipcMain.handle(
   'marketplace.submitRating',
   async (_event, input: { appId: number; score: number; deviceId?: string }) => {
     try {
-      const marketplace = getMarketplaceService();
+      // 评分同样带身份头：限流按员工计数、落库记令牌审计列。
+      // 不带则按出口 IP 计数（办公区共用出口 IP = 全公司共享额度）。
+      const marketplace = getAuthedMarketplaceService();
       return await marketplace.submitRating(
         Number(input?.appId),
         Number(input?.score),

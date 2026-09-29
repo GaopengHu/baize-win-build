@@ -93,9 +93,9 @@ describe('search cache', () => {
 });
 
 describe('resolveSearchEndpoint', () => {
-  it('defaults to bing-cn with 10s timeout', () => {
-    expect(resolveSearchEndpoint(undefined)).toEqual({ engine: 'bing-cn', apiKey: '', timeoutMs: 10000 });
-    expect(resolveSearchEndpoint({})).toEqual({ engine: 'bing-cn', apiKey: '', timeoutMs: 10000 });
+  it('defaults to none with 10s timeout (fail-closed)', () => {
+    expect(resolveSearchEndpoint(undefined)).toEqual({ engine: 'none', apiKey: '', timeoutMs: 10000 });
+    expect(resolveSearchEndpoint({})).toEqual({ engine: 'none', apiKey: '', timeoutMs: 10000 });
   });
 
   it('forces engine none for intranet model endpoints (fail-closed, no manual step)', () => {
@@ -114,10 +114,23 @@ describe('resolveSearchEndpoint', () => {
         resolveSearchEndpoint({ baseUrl, searchRuntime: { engine: 'bing-cn' } }).engine
       ).toBe('none');
     }
-    // 公网地址不受影响
+    // 公网地址不受影响（默认仍为 none，需用户显式开启）
     expect(resolveSearchEndpoint({ baseUrl: 'https://openrouter.ai/api/v1' }).engine).toBe(
-      'bing-cn'
+      'none'
     );
+    // 用户显式选择的引擎在公网地址下生效
+    expect(
+      resolveSearchEndpoint({
+        baseUrl: 'https://openrouter.ai/api/v1',
+        searchRuntime: { engine: 'bing-cn' },
+      }).engine
+    ).toBe('bing-cn');
+    // 非法引擎值回落到 none（fail-closed）
+    expect(
+      resolveSearchEndpoint({
+        searchRuntime: { engine: 'not-a-engine' as never },
+      }).engine
+    ).toBe('none');
     expect(
       resolveSearchEndpoint({
         baseUrl: 'https://openrouter.ai/api/v1',

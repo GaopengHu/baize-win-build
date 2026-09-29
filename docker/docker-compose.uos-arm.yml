@@ -42,6 +42,8 @@ services:
       - ~/.cache/electron:/home/builder/.cache/electron
       # electron-builder 缓存 (linux 工具链)
       - ~/.cache/electron-builder:/home/builder/.cache/electron-builder
+      # node-gyp headers 缓存（Electron headers 与架构无关，失败重试/重复构建不再重复下载）
+      - zhinengti-uos-arm-node-gyp-cache:/home/builder/.cache/node-gyp
       # vite 构建缓存（renderer/main bundle 增量）
       - zhinengti-uos-arm-vite-cache:/app/node_modules/.vite-build
     # 使用宿主网络，解决容器内 DNS 解析慢的问题（同 mac 方案）
@@ -75,3 +77,4 @@ volumes:
   zhinengti-uos-arm-node-modules:
   zhinengti-uos-arm-node-resources:
   zhinengti-uos-arm-vite-cache:
+  zhinengti-uos-arm-node-gyp-cache:
