@@ -24,7 +24,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
 
 const ELECTRON_VERSION = '22.3.27';
-const HEADERS_DISTURL = 'https://electronjs.org/headers';
+// 国内直连 electronjs.org 常被 RST（TLS 建连前断开），headers 走 npmmirror。
+// 优先级：显式 ELECTRON_HEADERS_DISTURL > 容器已配的 ELECTRON_MIRROR > 默认 npmmirror。
+const HEADERS_DISTURL =
+  process.env.ELECTRON_HEADERS_DISTURL?.trim() ||
+  process.env.ELECTRON_MIRROR?.trim() ||
+  'https://npmmirror.com/mirrors/electron/';
+// headers 仅 ~260KB 但网络抖动常见，失败自动重试，避免整次打包作废。
+const NODE_GYP_MAX_ATTEMPTS = 3;
 const OUT_FILE = resolve(ROOT, 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
 
 function log(msg) {
@@ -68,10 +75,27 @@ function main() {
     CROSS_COMPILE: '1',
   };
   try {
-    execSync(
-      `npx node-gyp rebuild --runtime=electron --target=${ELECTRON_VERSION} --arch=arm64 --disturl=${HEADERS_DISTURL} --jobs=4`,
-      { env, cwd: resolve(ROOT, 'node_modules', 'better-sqlite3'), stdio: 'inherit', timeout: 1800000 },
-    );
+    let lastError = null;
+    for (let attempt = 1; attempt <= NODE_GYP_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        if (attempt > 1) log(`重试交叉编译（第 ${attempt}/${NODE_GYP_MAX_ATTEMPTS} 次）...`);
+        execSync(
+          `npx node-gyp rebuild --runtime=electron --target=${ELECTRON_VERSION} --arch=arm64 --disturl=${HEADERS_DISTURL} --jobs=4`,
+          { env, cwd: resolve(ROOT, 'node_modules', 'better-sqlite3'), stdio: 'inherit', timeout: 1800000 },
+        );
+        lastError = null;
+        break;
+      } catch (e) {
+        lastError = e;
+        // headers 下载失败多为瞬时网络问题，重试前清理半截产物
+        try {
+          execSync(`rm -rf ${resolve(ROOT, 'node_modules', 'better-sqlite3', 'build')}`, { stdio: 'ignore' });
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+    }
+    if (lastError) throw lastError;
   } catch (e) {
     error(`交叉编译失败: ${e.message}`);
     process.exit(1);

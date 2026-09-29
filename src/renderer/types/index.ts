@@ -205,6 +205,11 @@ export interface ScheduleUpdateInput {
 export interface Skill {
   id: string;
   name: string;
+  /**
+   * 市场中文展示名（仅市场安装的 skill 有）。
+   * 显示层优先用它；内部名（英文）保持不变，供模型 Skill 工具调用。
+   */
+  displayName?: string;
   description?: string;
   type: SkillType;
   enabled: boolean;

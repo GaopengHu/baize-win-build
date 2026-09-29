@@ -40,6 +40,25 @@ const DEFAULT_ENABLED_BUILTIN_SKILLS = new Set([
  * Validate that a skill name is safe for use as a directory name.
  * Rejects names containing path separators or parent directory references.
  */
+/**
+ * 市场安装 sidecar（`.nowlink-marketplace.json`）读取：{ appId, displayName }。
+ * 显示层用 displayName（中文），内部名/目录名保持包内英文，模型调用不受影响。
+ * 无文件或解析失败返回 null，调用方回退显示内部名。
+ */
+export function readMarketplaceDisplayName(skillDir: string): string | null {
+  try {
+    const sidecar = path.join(skillDir, '.nowlink-marketplace.json');
+    if (!fs.existsSync(sidecar)) return null;
+    const raw = JSON.parse(fs.readFileSync(sidecar, 'utf-8')) as {
+      displayName?: unknown;
+    };
+    const name = typeof raw.displayName === 'string' ? raw.displayName.trim() : '';
+    return name || null;
+  } catch {
+    return null;
+  }
+}
+
 function validateSkillName(name: string): void {
   if (!name || /[/\\]|\.\./.test(name)) {
     throw new Error(`Invalid skill name: ${name}`);
@@ -625,6 +644,8 @@ export class SkillsManager implements SkillsAdapter {
             const skill: Skill = {
               id: `${source}-${entry}`,
               name: metadata.name,
+              // 市场安装时写入的中文展示名（内部名保持包内英文，模型调用不受影响）
+              displayName: readMarketplaceDisplayName(entryPath) ?? undefined,
               description: metadata.description,
               type: 'custom',
               enabled: this.getPersistedEnabled(`${source}-${entry}`, true),

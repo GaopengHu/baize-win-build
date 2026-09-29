@@ -16,8 +16,9 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { log } from '../utils/logger';
 
-const DEFAULT_BASE_URL = 'http://172.26.110.88:3000';
+const DEFAULT_BASE_URL = 'http://172.31.30.155:3000';
 const REQUEST_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 const MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
@@ -95,6 +96,11 @@ export class CompanyMarketplaceService {
     return this.baseUrl;
   }
 
+  /** 是否携带身份头（日志只用此判断，绝不输出 token 原文）。 */
+  hasAccessToken(): boolean {
+    return this.accessToken.length > 0;
+  }
+
   async listSkillApps(category = 'Skill'): Promise<MarketplaceApp[]> {
     const query = `category=${encodeURIComponent(category)}`;
     // `/api/apps/public` is the catalog endpoint that includes packages[].
@@ -139,7 +145,14 @@ export class CompanyMarketplaceService {
    */
   async downloadPackage(appId: number, packageId: number): Promise<string> {
     const url = `${this.baseUrl}/api/apps/download/${encodeURIComponent(appId)}?package_id=${encodeURIComponent(packageId)}`;
+    // 身份头由调用方经 accessToken 传入（当前为下载时透传的用户模型 API Key）。
+    // 日志只记有无、不记原文；Key 本身只出现在本请求的 Authorization 头里。
+    log(`[Marketplace] downloading package appId=${appId} packageId=${packageId} authed=${this.hasAccessToken()}`);
     const response = await this.requestRaw(url, DOWNLOAD_TIMEOUT_MS);
+    // 429 限流 body 可能为空，先看状态码（与评分接口同理）
+    if (response.status === 429) {
+      throw new MarketplaceHttpError(429, '下载过于频繁，请稍后再试（可能与评分共用员工额度）');
+    }
     if (!response.ok) {
       const message = await this.extractErrorMessage(response);
       throw new MarketplaceHttpError(
@@ -201,6 +214,7 @@ export class CompanyMarketplaceService {
 
   /**
    * 端侧匿名评分：POST {base}/api/apps/public/rating/:id
+   * Header Authorization: Bearer sk-<key>（用户模型 Key；不带则按出口 IP 限流）。
    * body { score: 0.5~5（0.5 步进）, device_id?, key_fp? }，Content-Type 必须 application/json。
    * 成功返回服务端合并后的最新 { avg_score, rating_count }。
    * 服务端不去重，“半年一次”由端侧（渲染层 localStorage）负责。
@@ -209,6 +223,10 @@ export class CompanyMarketplaceService {
    * 用户删库重装也换不掉自己的 Key，服务端将来可用 (key_fp, app_id) 做
    * 去重/限频；现阶段至少可审计。Go 侧 ShouldBindJSON 会忽略未知字段，
    * 老版本服务端收到多一个字段不会报错。
+   *
+   * 状态码语义（对照服务端 app-rating-curl.md）：
+   * 业务失败一律 HTTP 200 + success:false（必须读 body.success，不能只看状态码）；
+   * 429 限流 body 为空、只能看状态码；403 模块开关；404 旧版本二进制。
    */
   async submitRating(
     appId: number,
@@ -243,6 +261,18 @@ export class CompanyMarketplaceService {
         headers: { ...this.buildHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+      // 状态码优先（对照服务端 app-rating-curl.md §5/§6）：
+      // 429 限流 body 为空，只能看状态码；403 模块开关；404 是旧版本二进制。
+      // 业务失败是 HTTP 200 + success:false，走 body 的 message。
+      if (response.status === 429) {
+        throw new MarketplaceHttpError(429, '评分过于频繁，请稍后再试');
+      }
+      if (response.status === 403) {
+        throw new MarketplaceHttpError(403, '技能市场模块已关闭 (apps is disabled)');
+      }
+      if (response.status === 404) {
+        throw new MarketplaceHttpError(404, '服务端版本过旧，不支持评分接口');
+      }
       let payload: MarketplaceEnvelope;
       try {
         payload = (await response.json()) as MarketplaceEnvelope;
@@ -285,6 +315,8 @@ export class CompanyMarketplaceService {
       ? record.packages
           .map((pkg) => this.parsePackage(pkg))
           .filter((pkg): pkg is MarketplacePackage => pkg !== null)
+          // 服务端按 sort 升序返回，端侧再排一次兜底（越小越靠前，选择器与文档一致）
+          .sort((a, b) => a.sort - b.sort)
       : [];
 
     return {

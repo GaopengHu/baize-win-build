@@ -24,17 +24,17 @@ function formatScale(scale: number): string {
 }
 
 const SEARCH_ENGINES: SearchEngine[] = [
+  'none',
   'bing-cn',
   'sogou',
   'chrome-mcp',
   'bing-api',
   'serper',
   'duckduckgo',
-  'none',
 ];
 
 const DEFAULT_SEARCH_RUNTIME: SearchRuntimeConfig = {
-  engine: 'bing-cn',
+  engine: 'none',
   apiKey: '',
   timeoutMs: 10000,
 };
@@ -245,8 +245,8 @@ export function SettingsGeneral() {
 }
 /**
  * Phase 7.1.2：搜索引擎切换（子 agent 联网检索端点）。
- * 默认 bing-cn 免 key 零配置；付费引擎（bing-api/serper）的 key 由企业部署预置，
- * 此处仅提供输入口，不要求办公用户自行申请。
+ * 默认禁用（fail-closed，涉密优先）；用户显式开启后 research 子任务才可联网。
+ * 付费引擎（bing-api/serper）的 key 由企业部署预置，此处仅提供输入口。
  */
 function SearchEngineSection() {
   const { t } = useTranslation();

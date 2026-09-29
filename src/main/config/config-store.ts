@@ -124,7 +124,7 @@ export interface AppConfig {
   // Dedicated memory runtime config
   memoryRuntime: MemoryRuntimeConfig;
 
-  // 子 agent 联网检索端点（Phase 7.1 research profile 用；MVP 默认 bing-cn）
+  // 子 agent 联网检索端点（Phase 7.1 research profile 用；默认禁用，fail-closed）
   searchRuntime: SearchRuntimeConfig;
 
   // Enable thinking mode (show thinking steps)
@@ -169,8 +169,8 @@ export interface MemoryRuntimeConfig {
 /**
  * 子 agent 联网检索端点配置（Phase 7.1）。
  * 独立配置段，不嵌套进 memoryRuntime——搜索与记忆运行时无语义关系。
- * MVP 默认 'bing-cn'（国内可达 + 免费 + 免 key，零配置开箱即用）；
- * Settings UI 切换界面不进 MVP（7.1.2+），企业部署如需付费端点可直接写 config 文件。
+ * 默认 'none'（fail-closed：涉密优先，联网需用户在设置里显式开启）；
+ * 企业部署如需开放检索可在 config 文件预置引擎。
  */
 export type SearchEngine =
   | 'bing-cn'
@@ -315,7 +315,7 @@ const defaultConfig: AppConfig = {
     promptIterationRounds: 2,
   },
   searchRuntime: {
-    engine: 'bing-cn',
+    engine: 'none',
     apiKey: '',
     timeoutMs: 10000,
   },

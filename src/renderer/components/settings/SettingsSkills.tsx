@@ -35,6 +35,9 @@ import {
 
 const isElectron = typeof window !== 'undefined' && window.electronAPI !== undefined;
 
+// 网格渐进渲染步长（见 visibleCount 注释）
+const MARKETPLACE_PAGE_SIZE = 12;
+
 export function SettingsSkills({ isActive }: { isActive: boolean }) {
   const { t } = useTranslation();
   const tRef = useRef(t);
@@ -53,6 +56,10 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
   const [isMarketplaceLoading, setIsMarketplaceLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isPluginModalOpen, setIsPluginModalOpen] = useState(false);
+  // 网格分页展示：服务端目录接口一次性返回全量（无分页参数），
+  // 端侧按 PAGE_SIZE 渐进渲染，滚动到底自动追加，视觉上等同无限滚动。
+  const [visibleCount, setVisibleCount] = useState(MARKETPLACE_PAGE_SIZE);
+  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
   const [pluginActionKey, setPluginActionKey] = useState<string | null>(null);
   const [pluginToastMessage, setPluginToastMessage] = useState('');
   const [error, setError] = useState<LocalizedBanner | null>(null);
@@ -177,8 +184,33 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
 
   async function handleBrowsePlugins() {
     setIsPluginModalOpen(true);
+    // 每次打开弹窗都从第一页看起
+    setVisibleCount(MARKETPLACE_PAGE_SIZE);
     await loadMarketplaceApps();
   }
+
+  // 滚动到底自动追加：哨兵 div 进入视口即 +PAGE_SIZE
+  useEffect(() => {
+    if (!isPluginModalOpen) {
+      return;
+    }
+    const sentinel = loadMoreSentinelRef.current;
+    if (!sentinel) {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisibleCount((prev) =>
+            Math.min(prev + MARKETPLACE_PAGE_SIZE, marketplaceApps.length)
+          );
+        }
+      },
+      { root: sentinel.parentElement, rootMargin: '200px' }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [isPluginModalOpen, marketplaceApps.length, visibleCount]);
 
   async function loadMarketplaceApps() {
     if (!isElectron || !window.electronAPI.marketplace) {
@@ -191,6 +223,8 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
         window.electronAPI.marketplace.getBaseUrl().catch(() => ''),
       ]);
       setMarketplaceApps(apps || []);
+      // 新数据到达即重置可见数，避免旧 visibleCount 越界或直接全量
+      setVisibleCount(MARKETPLACE_PAGE_SIZE);
       // 用主进程备份校准本地门控：单删 Local Storage 文件夹后，
       // 下载记录与评分冷却从这里恢复，半年限制继续生效。
       try {
@@ -601,7 +635,7 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
 
       {isPluginModalOpen && (
         <div className="fixed inset-0 z-[60] bg-black/50 flex items-center justify-center p-4">
-          <div className="w-full max-w-3xl max-h-[80vh] overflow-hidden rounded-lg border border-border bg-surface shadow-elevated">
+          <div className="w-full max-w-6xl max-h-[80vh] overflow-hidden rounded-lg border border-border bg-surface shadow-elevated">
             <div className="px-5 py-4 border-b border-border">
               <div className="flex items-center justify-between gap-2">
                 <h3 className="text-lg font-semibold text-text-primary whitespace-nowrap">
@@ -669,7 +703,8 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
                   {t('skills.marketplaceEmpty')}
                 </div>
               ) : (
-                marketplaceApps.map((app) => {
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                  {marketplaceApps.slice(0, visibleCount).map((app) => {
                   const iconSrc = marketplaceIconCache[app.appId] || null;
                   const pkg = pickPreferredPackage(app);
                   const installTarget = `marketplace:${app.appId}`;
@@ -679,119 +714,135 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
                   return (
                     <div
                       key={app.appId}
-                      className="rounded-lg border border-border bg-surface-hover p-4"
+                      className="rounded-lg border border-border bg-surface-hover p-4 flex flex-col"
                     >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-start gap-3 flex-1 min-w-0">
-                          {iconSrc ? (
-                            <img
-                              src={iconSrc}
-                              alt=""
-                              className="w-11 h-11 rounded-lg object-cover flex-shrink-0"
-                            />
-                          ) : (
-                            <div className="w-11 h-11 rounded-lg bg-surface flex items-center justify-center flex-shrink-0">
-                              <Package className="w-5 h-5 text-text-muted" />
-                            </div>
-                          )}
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 mb-1 flex-wrap">
-                              <h4 className="font-medium text-text-primary truncate">
-                                {app.name}
-                              </h4>
-                              {app.version && (
-                                <span className="text-xs px-2 py-0.5 rounded bg-surface text-text-muted">
-                                  v{app.version}
-                                </span>
-                              )}
-                              {app.tags.map((tag) => (
-                                <span
-                                  key={tag}
-                                  className="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent"
-                                >
-                                  {tag}
-                                </span>
-                              ))}
-                            </div>
-                            {app.description && (
-                              <p className="text-sm text-text-muted line-clamp-2">
-                                {app.description}
-                              </p>
-                            )}
-                            <p className="text-xs text-text-muted mt-2">
-                              {t('skills.marketplaceDownloadCount', {
-                                count: app.downloadCount,
-                              })}
-                              {sizeLabel ? ` · ${sizeLabel}` : ''}
-                              {pkg && pkg.arch ? ` · ${pkg.arch}` : ''}
-                              {noPackage ? (
-                                <span className="text-warning">
-                                  {' '}
-                                  · {t('skills.marketplaceNoPackage')}
-                                </span>
-                              ) : (
-                                ''
-                              )}
-                            </p>
-                            {(() => {
-                              const override = ratingOverrides[app.appId];
-                              const avg =
-                                override?.avgScore ?? app.avgScore ?? null;
-                              const count =
-                                override?.ratingCount ?? app.ratingCount ?? 0;
-                              const downloaded =
-                                downloadedMap[app.appId] !== undefined ||
-                                isSkillDownloaded(app.appId);
-                              return (
-                                <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-                                  <StarDisplay score={avg} />
-                                  {avg === null ? (
-                                    <span className="text-xs text-text-muted">
-                                      {t('skills.marketplaceNoRating')}
-                                    </span>
-                                  ) : (
-                                    <span className="text-xs text-text-muted">
-                                      {avg.toFixed(1)}
-                                      {t('skills.marketplaceRatingUnit', {
-                                        count,
-                                      })}
-                                    </span>
-                                  )}
-                                  {downloaded && (
-                                    <button
-                                      type="button"
-                                      onClick={() => openRatingModal(app)}
-                                      className="text-xs text-accent hover:text-accent-hover hover:underline transition-colors"
-                                    >
-                                      {t('skills.marketplaceRateAction')}
-                                    </button>
-                                  )}
-                                </div>
-                              );
-                            })()}
+                      <div className="flex items-start gap-3 flex-1 min-w-0">
+                        {iconSrc ? (
+                          <img
+                            src={iconSrc}
+                            alt=""
+                            className="w-11 h-11 rounded-lg object-cover flex-shrink-0"
+                          />
+                        ) : (
+                          <div className="w-11 h-11 rounded-lg bg-surface flex items-center justify-center flex-shrink-0">
+                            <Package className="w-5 h-5 text-text-muted" />
                           </div>
-                        </div>
-                        <button
-                          onClick={() => handleInstallMarketplaceSkill(app)}
-                          disabled={noPackage || pluginActionKey !== null}
-                          title={
-                            noPackage ? t('skills.marketplaceNoPackage') : undefined
-                          }
-                          className="px-3 py-2 rounded-lg bg-accent text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-sm flex-shrink-0"
-                        >
-                          {isInstalling ? (
-                            <span className="inline-flex items-center gap-1">
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                              {t('skills.marketplaceInstalling')}
-                            </span>
-                          ) : (
-                            t('skills.marketplaceInstall')
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1 flex-wrap">
+                            <h4 className="font-medium text-text-primary truncate">
+                              {app.name}
+                            </h4>
+                            {app.version && (
+                              <span className="text-xs px-2 py-0.5 rounded bg-surface text-text-muted">
+                                v{app.version}
+                              </span>
+                            )}
+                            {app.tags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="text-xs px-2 py-0.5 rounded bg-accent/10 text-accent"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                          {app.description && (
+                            <p className="text-sm text-text-muted line-clamp-2">
+                              {app.description}
+                            </p>
                           )}
-                        </button>
+                          <p className="text-xs text-text-muted mt-2">
+                            {t('skills.marketplaceDownloadCount', {
+                              count: app.downloadCount,
+                            })}
+                            {sizeLabel ? ` · ${sizeLabel}` : ''}
+                            {pkg && pkg.arch ? ` · ${pkg.arch}` : ''}
+                            {noPackage ? (
+                              <span className="text-warning">
+                                {' '}
+                                · {t('skills.marketplaceNoPackage')}
+                              </span>
+                            ) : (
+                              ''
+                            )}
+                          </p>
+                          {(() => {
+                            const override = ratingOverrides[app.appId];
+                            const avg =
+                              override?.avgScore ?? app.avgScore ?? null;
+                            const count =
+                              override?.ratingCount ?? app.ratingCount ?? 0;
+                            const downloaded =
+                              downloadedMap[app.appId] !== undefined ||
+                              isSkillDownloaded(app.appId);
+                            return (
+                              <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                                <StarDisplay score={avg} />
+                                {avg === null ? (
+                                  <span className="text-xs text-text-muted">
+                                    {t('skills.marketplaceNoRating')}
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-text-muted">
+                                    {avg.toFixed(1)}
+                                    {t('skills.marketplaceRatingUnit', {
+                                      count,
+                                    })}
+                                  </span>
+                                )}
+                                {downloaded && (
+                                  <button
+                                    type="button"
+                                    onClick={() => openRatingModal(app)}
+                                    className="text-xs text-accent hover:text-accent-hover hover:underline transition-colors"
+                                  >
+                                    {t('skills.marketplaceRateAction')}
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })()}
+                        </div>
                       </div>
+                      <button
+                        onClick={() => handleInstallMarketplaceSkill(app)}
+                        disabled={noPackage || pluginActionKey !== null}
+                        title={
+                          noPackage ? t('skills.marketplaceNoPackage') : undefined
+                        }
+                        className="mt-3 w-full px-3 py-2 rounded-lg bg-accent text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-sm flex-shrink-0"
+                      >
+                        {isInstalling ? (
+                          <span className="inline-flex items-center justify-center gap-1">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            {t('skills.marketplaceInstalling')}
+                          </span>
+                        ) : (
+                          t('skills.marketplaceInstall')
+                        )}
+                      </button>
                     </div>
                   );
-                })
+                  })}
+                </div>
+              )}
+              {/* 无限滚动哨兵：进入视口自动追加下一页；到底时显示收尾行 */}
+              {isPluginModalOpen && !isMarketplaceLoading && marketplaceApps.length > 0 && (
+                <div ref={loadMoreSentinelRef} className="py-3 text-center text-xs text-text-muted">
+                  {visibleCount < marketplaceApps.length ? (
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      {t('skills.marketplaceLoadingMore', {
+                        shown: Math.min(visibleCount, marketplaceApps.length),
+                        total: marketplaceApps.length,
+                      })}
+                    </span>
+                  ) : (
+                    marketplaceApps.length > MARKETPLACE_PAGE_SIZE &&
+                    t('skills.marketplaceAllShown', { total: marketplaceApps.length })
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -931,7 +982,12 @@ function SkillCard({
             <div
               className={`w-3 h-3 rounded-full ${skill.enabled ? 'bg-success' : 'bg-text-muted'}`}
             />
-            <h3 className="font-medium text-text-primary">{skill.name}</h3>
+            <h3 className="font-medium text-text-primary">
+              {skill.displayName || skill.name}
+            </h3>
+            {skill.displayName && skill.displayName !== skill.name && (
+              <span className="text-xs text-text-muted font-mono">{skill.name}</span>
+            )}
             <span
               className={`px-2 py-0.5 text-xs rounded ${
                 isBuiltin

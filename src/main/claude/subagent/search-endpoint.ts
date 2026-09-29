@@ -3,9 +3,12 @@
  *
  * research 子 agent 的 `web_search` 后端：endpoint 可配置的多引擎检索。
  *
- * 引擎选择（2026-09-21 本机实测结论）：
- * - `bing-cn`（默认）：cn.bing.com/search 结果页爬取，国内可达 + 免费 + 免 key，
- *   零配置开箱即用。非官方接口：页面改版需维护解析器，高频访问可能触发风控。
+ * 默认 fail-closed：未配置 / 非法值 / 内网模型地址一律 engine='none'，
+ * 用户需在设置 → 通用 → 子 agent 联网检索中显式开启。
+ *
+ * 引擎选择（默认禁用 fail-closed；用户在设置 → 通用 → 子 agent 联网检索中显式开启）：
+ * - `bing-cn`：cn.bing.com/search 结果页爬取，国内可达 + 免费 + 免 key。
+ *   非官方接口：页面改版需维护解析器，高频访问可能触发风控。
  * - `sogou`：备用爬取，实测 7s 偏慢，逼近超时上限。
  * - `chrome-mcp`：不注册 web_search，由 Chrome MCP 浏览工具充当联网入口
  *   （本文件不实现，由 profile 工具集层处理）。
@@ -108,8 +111,21 @@ export function resolveSearchEndpoint(appConfig?: {
   baseUrl?: string;
 }): ResolvedSearchEndpoint {
   const raw = appConfig?.searchRuntime;
+  // fail-closed 默认：未配置/非法值一律 'none'（与 config-store normalize 一致，
+  // 此处兜底仅防绕开 normalize 的直接调用）。
+  const VALID_ENGINES: SearchEngine[] = [
+    'bing-cn',
+    'sogou',
+    'chrome-mcp',
+    'bing-api',
+    'serper',
+    'duckduckgo',
+    'none',
+  ];
+  const engine: SearchEngine =
+    raw?.engine && VALID_ENGINES.includes(raw.engine) ? raw.engine : 'none';
   const configured: ResolvedSearchEndpoint = {
-    engine: raw?.engine ?? 'bing-cn',
+    engine,
     apiKey: typeof raw?.apiKey === 'string' ? raw.apiKey : '',
     timeoutMs:
       typeof raw?.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs)
