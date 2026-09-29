@@ -1,58 +1,70 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
-// SettingsPanel was split — skills/plugin content lives in settings/SettingsSkills.tsx
-const settingsPanelPath = path.resolve(process.cwd(), 'src/renderer/components/SettingsPanel.tsx');
-const settingsDir = path.resolve(process.cwd(), 'src/renderer/components/settings');
-const settingsPanelContent = [
-  readFileSync(settingsPanelPath, 'utf8'),
-  ...readdirSync(settingsDir).map((f) => readFileSync(path.join(settingsDir, f), 'utf8')),
-].join('\n');
+// SettingsPanel was split — skills content lives in settings/SettingsSkills.tsx,
+// marketplace content lives in settings/SettingsMarketplace.tsx (peer-level tab).
+const root = process.cwd();
+const settingsPanelPath = path.resolve(root, 'src/renderer/components/SettingsPanel.tsx');
+const settingsDir = path.resolve(root, 'src/renderer/components/settings');
+const marketplacePath = path.join(settingsDir, 'SettingsMarketplace.tsx');
+const skillsPath = path.join(settingsDir, 'SettingsSkills.tsx');
+const settingsPanelContent = readFileSync(settingsPanelPath, 'utf8');
+const settingsDirContent = readdirSync(settingsDir)
+  .map((f) => readFileSync(path.join(settingsDir, f), 'utf8'))
+  .join('\n');
+const marketplaceContent = existsSync(marketplacePath)
+  ? readFileSync(marketplacePath, 'utf8')
+  : '';
+const skillsContent = existsSync(skillsPath) ? readFileSync(skillsPath, 'utf8') : '';
 
 describe('SettingsPanel skills plugin browse entry', () => {
-  it('unit: renders browse plugins action', () => {
-    expect(settingsPanelContent).toContain("t('skills.browsePlugins')");
+  it('registers a peer-level marketplace tab next to skills', () => {
+    expect(settingsPanelContent).toContain("'marketplace'");
+    expect(settingsPanelContent).toContain('SettingsMarketplace');
+    expect(settingsPanelContent).toContain("t('settings.marketplace')");
+    expect(settingsPanelContent).toContain("t('settings.marketplaceDesc')");
   });
 
-  it('smoke: includes plugin list modal title i18n key', () => {
-    expect(settingsPanelContent).toContain("t('skills.pluginListTitle')");
+  it('unit: renders marketplace list page content', () => {
+    expect(marketplaceContent).toContain("t('skills.marketplaceTitle')");
+    expect(marketplaceContent).toContain("t('skills.marketplaceEmpty')");
+    expect(marketplaceContent).toContain("t('skills.marketplaceInstall')");
   });
 
-  it('functional: includes plugin install action i18n key', () => {
-    expect(settingsPanelContent).toContain("t('skills.pluginInstall')");
+  it('functional: uses marketplace IPC API for catalog, install and rating', () => {
+    expect(marketplaceContent).toContain('window.electronAPI.marketplace.listSkillApps');
+    expect(marketplaceContent).toContain('window.electronAPI.marketplace.installSkill');
+    expect(marketplaceContent).toContain('window.electronAPI.marketplace.getBaseUrl');
+    expect(marketplaceContent).toContain('window.electronAPI.marketplace.submitRating');
+    expect(marketplaceContent).toContain('window.electronAPI.marketplace.getIcon');
+  });
+
+  it('functional: marketplace install relies on skills storage watcher, not cross-component calls', () => {
+    // 安装后不调用技能页 loadSkills：主进程 watcher 广播 skills.storageChanged，
+    // 技能页通过 store.skillsStorageChangedAt 自动刷新。
+    expect(marketplaceContent).not.toContain('await loadSkills(');
+    expect(marketplaceContent).not.toContain("from './SettingsSkills'");
   });
 
   it('functional: includes skills storage controls', () => {
-    expect(settingsPanelContent).toContain("t('skills.storagePathTitle')");
-    expect(settingsPanelContent).toContain("t('skills.selectStoragePath')");
-    expect(settingsPanelContent).toContain("t('skills.openStoragePath')");
-    expect(settingsPanelContent).toContain("t('skills.refreshSkills')");
-    expect(settingsPanelContent).toContain('window.electronAPI.skills.getStoragePath()');
-    expect(settingsPanelContent).toContain('window.electronAPI.skills.setStoragePath(folderPath, true)');
-    expect(settingsPanelContent).toContain('window.electronAPI.skills.openStoragePath()');
-    expect(settingsPanelContent).toContain('Promise.allSettled([');
-    expect(settingsPanelContent).toContain("throw new Error(errors.join(' | '));");
-    expect(settingsPanelContent).toContain("`${tRef.current('skills.failedToLoad')}: ${err.message}`");
-    expect(settingsPanelContent).toContain('await loadSkills();');
+    expect(settingsDirContent).toContain("t('skills.storagePathTitle')");
+    expect(settingsDirContent).toContain("t('skills.openStoragePath')");
+    expect(settingsDirContent).toContain("t('skills.refreshSkills')");
+    expect(settingsDirContent).toContain('window.electronAPI.skills.getStoragePath()');
+    expect(settingsDirContent).toContain('window.electronAPI.skills.openStoragePath()');
+    expect(settingsDirContent).toContain('Promise.allSettled([');
+    expect(settingsDirContent).toContain("throw new Error(errors.join(' | '));");
+    expect(settingsDirContent).toContain(
+      "`${tRef.current('skills.failedToLoad')}: ${err.message}`"
+    );
+    expect(settingsDirContent).toContain('await loadSkills();');
   });
 
-  it('functional: uses plugins API for catalog and management', () => {
-    expect(settingsPanelContent).toContain('window.electronAPI.plugins.listCatalog');
-    expect(settingsPanelContent).toContain('window.electronAPI.plugins.listInstalled');
-    expect(settingsPanelContent).toContain('window.electronAPI.plugins.install(installTarget)');
-    expect(settingsPanelContent).toContain('window.electronAPI.plugins.setComponentEnabled');
-    expect(settingsPanelContent).toContain("t('skills.pluginManageUninstall')");
-  });
-
-  it('functional: handles marketplace catalog items with unknown component counts', () => {
-    expect(settingsPanelContent).toContain("plugin.catalogSource === 'claude-marketplace'");
-    expect(settingsPanelContent).toContain("t('skills.pluginComponentsAvailableAfterInstall')");
-  });
-
-  it('functional: matches installed plugins using normalized lookup keys', () => {
-    expect(settingsPanelContent).toContain('normalizePluginLookupKey');
-    expect(settingsPanelContent).toContain('getCatalogLookupKeys');
-    expect(settingsPanelContent).toContain('installedPluginsByKey');
+  it('functional: skills page keeps folder install as a full-width single action', () => {
+    expect(skillsContent).toContain("t('skills.installSkillFromFolder')");
+    expect(skillsContent).not.toContain("t('skills.browsePlugins')");
+    expect(skillsContent).not.toContain('isPluginModalOpen');
+    expect(skillsContent).not.toContain('grid-cols-2');
   });
 });
