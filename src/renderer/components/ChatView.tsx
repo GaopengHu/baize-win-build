@@ -16,8 +16,10 @@ import {
 } from '../store/selectors';
 import { useAppStore } from '../store';
 import { useComposerDraft } from '../hooks/useComposerDraft';
+import { useSlashSkillMenu } from '../hooks/useSlashSkillMenu';
 import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
+import { SlashSkillMenu } from './SlashSkillMenu';
 import { ProcessPanel } from './message/ProcessPanel';
 import { ContentBlockView } from './message/ContentBlockView';
 import { buildRoundRenderPlans } from '../utils/round-render-plan';
@@ -525,6 +527,16 @@ export function ChatView() {
     [activeSessionId]
   );
 
+  // "/" 斜杠技能选择器：单实例服务 welcome / 主聊天两个 textarea
+  // （二者共享 prompt state / textareaRef / isComposingRef，同时只挂载一个）。
+  // 经 handlePromptChange 保留 memory-prefetch 行为。
+  const slashMenu = useSlashSkillMenu({
+    prompt,
+    setPrompt: handlePromptChange,
+    textareaRef,
+    isComposingRef,
+  });
+
   useEffect(() => {
     return () => {
       if (memoryPrefetchTimerRef.current) clearTimeout(memoryPrefetchTimerRef.current);
@@ -887,6 +899,8 @@ export function ChatView() {
 
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    // 提交即收起斜杠菜单（prompt 清空后派生状态也会关闭，这里是双保险）
+    slashMenu.close();
 
     // Get value from ref to handle both controlled and uncontrolled cases
     const currentPrompt = textareaRef.current?.value || prompt;
@@ -1088,6 +1102,16 @@ export function ChatView() {
                     <Plus className="w-5 h-5" />
                   </button>
 
+                  {/* "/" 斜杠技能选择器（向上弹出，容器已 relative） */}
+                  {slashMenu.open && (
+                    <SlashSkillMenu
+                      items={slashMenu.items}
+                      activeIndex={slashMenu.activeIndex}
+                      onSelect={slashMenu.select}
+                      onActiveChange={slashMenu.setActiveIndex}
+                    />
+                  )}
+
                   <textarea
                     ref={textareaRef}
                     value={prompt}
@@ -1101,6 +1125,7 @@ export function ChatView() {
                     }}
                     onPaste={handlePaste}
                     onKeyDown={(e) => {
+                      if (slashMenu.handleKeyDown(e)) return;
                       if (e.key === 'Enter' && !e.shiftKey) {
                         if (e.nativeEvent.isComposing || isComposingRef.current) return;
                         e.preventDefault();
@@ -1495,6 +1520,16 @@ export function ChatView() {
                 <Plus className="w-5 h-5" />
               </button>
 
+              {/* "/" 斜杠技能选择器（向上弹出，容器已 relative） */}
+              {slashMenu.open && (
+                <SlashSkillMenu
+                  items={slashMenu.items}
+                  activeIndex={slashMenu.activeIndex}
+                  onSelect={slashMenu.select}
+                  onActiveChange={slashMenu.setActiveIndex}
+                />
+              )}
+
               <textarea
                 ref={textareaRef}
                 value={prompt}
@@ -1508,6 +1543,7 @@ export function ChatView() {
                 }}
                 onPaste={handlePaste}
                 onKeyDown={(e) => {
+                  if (slashMenu.handleKeyDown(e)) return;
                   // Enter to send, Shift+Enter for new line
                   if (e.key === 'Enter' && !e.shiftKey) {
                     if (e.nativeEvent.isComposing || isComposingRef.current) {
