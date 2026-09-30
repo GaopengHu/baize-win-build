@@ -5,6 +5,7 @@ import {
   Plug,
   Shield,
   Package,
+  Store,
   Clock3,
   Wifi,
   AlertCircle,
@@ -20,6 +21,7 @@ import { SettingsAPI } from './settings/SettingsAPI';
 import { SettingsSandbox } from './settings/SettingsSandbox';
 import { SettingsConnectors } from './settings/SettingsConnectors';
 import { SettingsSkills } from './settings/SettingsSkills';
+import { SettingsMarketplace } from './settings/SettingsMarketplace';
 import { SettingsSchedule } from './settings/SettingsSchedule';
 import { SettingsGeneral } from './settings/SettingsGeneral';
 import { SettingsLogs } from './settings/SettingsLogs';
@@ -32,6 +34,7 @@ interface SettingsPanelProps {
     | 'sandbox'
     | 'connectors'
     | 'skills'
+    | 'marketplace'
     | 'memory'
     | 'schedule'
     | 'remote'
@@ -44,6 +47,7 @@ type TabId =
   | 'sandbox'
   | 'connectors'
   | 'skills'
+  | 'marketplace'
   | 'memory'
   | 'schedule'
   | 'remote'
@@ -59,6 +63,7 @@ const VALID_TABS = new Set<TabId>([
   'sandbox',
   'connectors',
   'skills',
+  'marketplace',
   'memory',
   'schedule',
   'remote',
@@ -120,6 +125,12 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
       label: t('settings.skills'),
       icon: Package,
       description: t('settings.skillsDesc'),
+    },
+    {
+      id: 'marketplace' as TabId,
+      label: t('settings.marketplace'),
+      icon: Store,
+      description: t('settings.marketplaceDesc'),
     },
     {
       id: 'memory' as TabId,
@@ -258,6 +269,11 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
               </div>
               <div className={activeTab === 'skills' ? '' : 'hidden'}>
                 {viewedTabs.has('skills') && <SettingsSkills isActive={activeTab === 'skills'} />}
+              </div>
+              <div className={activeTab === 'marketplace' ? '' : 'hidden'}>
+                {viewedTabs.has('marketplace') && (
+                  <SettingsMarketplace isActive={activeTab === 'marketplace'} />
+                )}
               </div>
               <div className={activeTab === 'memory' ? '' : 'hidden'}>
                 {viewedTabs.has('memory') && <SettingsMemory />}
