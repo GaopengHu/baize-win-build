@@ -253,6 +253,9 @@ const defaultProfiles: Record<ProviderProfileKey, ProviderProfile> = {
   },
 };
 
+const LEGACY_MARKETPLACE_BASE_URL = 'http://172.26.110.88:3000';
+const DEFAULT_MARKETPLACE_BASE_URL = 'http://172.31.30.155:3000';
+
 const defaultConfigSet: ApiConfigSet = {
   id: DEFAULT_CONFIG_SET_ID,
   name: '默认方案',
@@ -278,7 +281,7 @@ const defaultConfig: AppConfig = {
   claudeCodePath: '',
   defaultWorkdir: '',
   globalSkillsPath: '',
-  marketplaceBaseUrl: 'http://172.26.110.88:3000',
+  marketplaceBaseUrl: DEFAULT_MARKETPLACE_BASE_URL,
   enableDevLogs: false,
   theme: 'light',
   sandboxEnabled: true,
@@ -433,6 +436,18 @@ function normalizeMemoryModelRuntimeConfig(
         ? Math.max(5000, Math.round(value.timeoutMs))
         : fallback.timeoutMs,
   };
+}
+
+/**
+ * 市场地址归一化：空值回默认；存量旧测试机地址（172.26.110.88）自动迁移到新默认。
+ * 用户手动填过的其他地址原样保留（输入框可改，blur 即保存）。
+ */
+function normalizeMarketplaceBaseUrl(raw: unknown): string {
+  const trimmed = typeof raw === 'string' ? raw.trim().replace(/\/+$/, '') : '';
+  if (!trimmed || trimmed === LEGACY_MARKETPLACE_BASE_URL) {
+    return defaultConfig.marketplaceBaseUrl || DEFAULT_MARKETPLACE_BASE_URL;
+  }
+  return trimmed;
 }
 
 function normalizeMemoryRuntimeConfig(raw: unknown): MemoryRuntimeConfig {
@@ -1059,10 +1074,7 @@ export class ConfigStore {
         typeof raw.globalSkillsPath === 'string'
           ? raw.globalSkillsPath
           : defaultConfig.globalSkillsPath,
-      marketplaceBaseUrl:
-        typeof raw.marketplaceBaseUrl === 'string' && raw.marketplaceBaseUrl.trim()
-          ? raw.marketplaceBaseUrl.trim()
-          : defaultConfig.marketplaceBaseUrl,
+      marketplaceBaseUrl: normalizeMarketplaceBaseUrl(raw.marketplaceBaseUrl),
       enableDevLogs: toBoolean(raw.enableDevLogs, defaultConfig.enableDevLogs),
       theme: isAppTheme(raw.theme) ? raw.theme : defaultConfig.theme,
       sandboxEnabled: toBoolean(raw.sandboxEnabled, defaultConfig.sandboxEnabled),
