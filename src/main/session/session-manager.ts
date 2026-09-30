@@ -69,6 +69,53 @@ interface AgentRunner {
 
 const WORKSPACE_MOUNT_VIRTUAL_PATH = '/mnt/workspace';
 const TITLE_GENERATION_TIMEOUT_MS = 20000;
+// Internal continuation prompt for silent resume (never persisted as a user
+// message, never displayed). Carries the intent to keep generating from the
+// existing context, which already holds the rescued partial reply.
+const RESUME_PROMPT =
+  '请从上次中断的地方继续输出，不要重复已经输出过的内容，不要解释，直接继续.';
+
+/**
+ * Windows 下同名附件反复上传时，<cwd>\.tmp\<原名> 经常被占用（上次拷贝句柄 /
+ * 杀软扫描 / 资源管理器预览锁），直接 copyFileSync 会抛 EPERM 导致整条附件
+ * 被跳过（"Failed to process file attachment: EPERM..."）。
+ * 遇到 EPERM/EBUSY/EACCES 时改用 -1、-2… 后缀找空位，保证附件不丢失。
+ */
+function copyAttachmentWithRetry(
+  tmpDir: string,
+  baseFilename: string,
+  write: (target: string) => void
+): string {
+  const firstPath = path.join(tmpDir, baseFilename);
+  try {
+    write(firstPath);
+    return firstPath;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code ?? '';
+    if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') {
+      throw err;
+    }
+    let lastErr: unknown = err;
+    for (let i = 1; i < 1000; i++) {
+      const ext = path.extname(baseFilename);
+      const stem = baseFilename.slice(0, baseFilename.length - ext.length);
+      const retryPath = path.join(tmpDir, `${stem}-${i}${ext}`);
+      if (fs.existsSync(retryPath)) continue;
+      try {
+        write(retryPath);
+        log('[SessionManager] Destination locked, used fallback name:', retryPath);
+        return retryPath;
+      } catch (retryErr) {
+        const retryCode = (retryErr as NodeJS.ErrnoException)?.code ?? '';
+        if (retryCode !== 'EPERM' && retryCode !== 'EBUSY' && retryCode !== 'EACCES') {
+          throw retryErr;
+        }
+        lastErr = retryErr;
+      }
+    }
+    throw lastErr;
+  }
+}
 
 export class SessionManager {
   private db: DatabaseInstance;
@@ -81,12 +128,32 @@ export class SessionManager {
   private extensionManager?: AgentRuntimeExtensionManager;
   private skillsAdapter?: SkillsAdapter;
   private activeSessions: Map<string, AbortController> = new Map();
-  private promptQueues: Map<string, Array<{ prompt: string; content?: ContentBlock[] }>> =
+  private promptQueues: Map<string, Array<{ prompt: string; content?: ContentBlock[]; silent?: boolean }>> =
     new Map();
   private pendingPermissions: Map<
     string,
-    { sessionId: string; resolve: (result: PermissionResult) => void }
+    {
+      sessionId: string;
+      resolve: (result: PermissionResult) => void;
+      /** 串行派发时暂存，轮到时才下发 permission.request IPC。 */
+      payload: {
+        toolUseId: string;
+        toolName: string;
+        input: Record<string, unknown>;
+        sessionId: string;
+        kind?: 'advanced' | 'delete' | 'outside' | 'normal';
+        source?: { label: string };
+      };
+    }
   > = new Map();
+  /**
+   * Phase 7.1.2（修 §1.10 P0 单槽覆盖）：权限请求主进程串行派发。
+   * 同一时刻只向 renderer 派发一个 permission.request，其余在队列中等待，
+   * 前一个 resolve/超时后才发下一个。renderer 仍是单弹窗，但保证
+   * 「看到的都能答、答了的都算数」。并行 child 场景下审批天然逐个确认。
+   */
+  private permissionQueue: string[] = [];
+  private activePermissionId: string | null = null;
   /** Session-scoped "allow all non-elevated operations" flag (renderer button). */
   private sessionAllowAll = new Set<string>();
   private pendingSudoPasswords: Map<
@@ -452,6 +519,23 @@ export class SessionManager {
     this.enqueuePrompt(session, prompt, content);
   }
 
+  /**
+   * Resume generation after a user pause WITHOUT creating a user message.
+   * No user bubble is persisted or displayed — the model simply continues
+   * from the existing context (which already contains the rescued partial
+   * reply saved at stop time).
+   */
+  async resumeSession(sessionId: string): Promise<void> {
+    log('[SessionManager] Resuming session (no user message):', sessionId);
+
+    const session = this.loadSession(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    this.enqueuePrompt(session, RESUME_PROMPT, undefined, { silent: true });
+  }
+
   async generateSessionTitleFromPrompt(prompt: string): Promise<string> {
     const normalizedPrompt = prompt.trim();
     if (!normalizedPrompt) {
@@ -544,14 +628,16 @@ export class SessionManager {
           const sourcePath = (fileBlock.relativePath || '').trim(); // This is the full path from Electron
           // IMPORTANT: Use path.basename() to extract only the filename, not the full path
           const fallbackFilename = fileBlock.filename || sourcePath || `attachment-${Date.now()}`;
-          const destFilename = path.basename(fallbackFilename);
-          if (!destFilename) continue;
-          const destPath = path.join(tmpDir, destFilename);
+          const baseFilename = path.basename(fallbackFilename);
+          if (!baseFilename) continue;
           let actualSize = 0;
+          let destPath: string;
 
-          // Copy file to .tmp directory
+          // Copy file to .tmp directory (locked same-name destination falls back to -1/-2… suffix)
           if (sourcePath && fs.existsSync(sourcePath)) {
-            fs.copyFileSync(sourcePath, destPath);
+            destPath = copyAttachmentWithRetry(tmpDir, baseFilename, (target) =>
+              fs.copyFileSync(sourcePath, target)
+            );
 
             // Get actual file size
             const stats = fs.statSync(destPath);
@@ -566,7 +652,9 @@ export class SessionManager {
             );
           } else if (fileBlock.inlineDataBase64) {
             const buffer = Buffer.from(fileBlock.inlineDataBase64, 'base64');
-            fs.writeFileSync(destPath, buffer);
+            destPath = copyAttachmentWithRetry(tmpDir, baseFilename, (target) =>
+              fs.writeFileSync(target, buffer)
+            );
             actualSize = buffer.length;
             log('[SessionManager] Wrote file from inline data:', destPath, `(${actualSize} bytes)`);
           } else {
@@ -580,6 +668,7 @@ export class SessionManager {
 
           // If sandbox is already initialized, sync the file to sandbox as well
           // This handles the case where user attaches files in subsequent messages
+          const destFilename = path.basename(destPath);
           const sandboxPath = SandboxSync.getSandboxPath(session.id);
           if (sandboxPath) {
             const sandboxRelativePath = `.tmp/${destFilename}`;
@@ -648,11 +737,15 @@ export class SessionManager {
   private async processPrompt(
     session: Session,
     prompt: string,
-    content?: ContentBlock[]
+    content?: ContentBlock[],
+    options?: { silent?: boolean }
   ): Promise<void> {
     const traceId = generateTraceId();
     return runWithLogContext({ sessionId: session.id, traceId }, async () => {
       logCtx('[SessionManager] Processing prompt for session:', session.id, 'traceId:', traceId);
+      if (options?.silent) {
+        logCtx('[SessionManager] Silent resume — skipping user message persistence');
+      }
       logCtx(
         '[SessionManager] Received content:',
         content
@@ -696,24 +789,30 @@ export class SessionManager {
           logCtx('[SessionManager] Enhanced prompt with file info:', enhancedPrompt);
         }
 
-        // Save user message to database for persistence
+        // Save user message to database for persistence — skipped for
+        // silent resume (no user bubble, no DB row).
         const existingMessages = this.getMessages(session.id);
-        const userMessage: Message = {
-          id: uuidv4(),
-          sessionId: session.id,
-          role: 'user',
-          content: messageContent, // Save full content including images and files
-          timestamp: Date.now(),
-        };
-        this.saveMessage(userMessage);
-        logCtx(
-          '[SessionManager] User message saved:',
-          userMessage.id,
-          'with',
-          messageContent.length,
-          'content blocks'
-        );
-        const messagesForContext = [...existingMessages, userMessage];
+        let messagesForContext: Message[];
+        if (options?.silent) {
+          messagesForContext = existingMessages;
+        } else {
+          const userMessage: Message = {
+            id: uuidv4(),
+            sessionId: session.id,
+            role: 'user',
+            content: messageContent, // Save full content including images and files
+            timestamp: Date.now(),
+          };
+          this.saveMessage(userMessage);
+          logCtx(
+            '[SessionManager] User message saved:',
+            userMessage.id,
+            'with',
+            messageContent.length,
+            'content blocks'
+          );
+          messagesForContext = [...existingMessages, userMessage];
+        }
 
         // Update session model to match current config (may have changed since session creation)
         const currentModel = configStore.get('model');
@@ -743,9 +842,12 @@ export class SessionManager {
         }
 
         // 标题生成不再与首轮对话并发，避免与主请求竞争同一上游配额/通道导致体感变慢。
-        this.runSessionTitleGeneration(session, prompt, existingMessages).catch((err) =>
-          logCtxError('[SessionManager] Title generation failed:', err)
-        );
+        // 静默续写不触发标题生成（内部指令不适合做标题）。
+        if (!options?.silent) {
+          this.runSessionTitleGeneration(session, prompt, existingMessages).catch((err) =>
+            logCtxError('[SessionManager] Title generation failed:', err)
+          );
+        }
       } catch (error) {
         logCtxError('[SessionManager] Error processing prompt:', error);
         const errorText = error instanceof Error ? error.message : 'Unknown error';
@@ -866,9 +968,14 @@ export class SessionManager {
     );
   }
 
-  private enqueuePrompt(session: Session, prompt: string, content?: ContentBlock[]): void {
+  private enqueuePrompt(
+    session: Session,
+    prompt: string,
+    content?: ContentBlock[],
+    options?: { silent?: boolean }
+  ): void {
     const queue = this.promptQueues.get(session.id) || [];
-    queue.push({ prompt, content });
+    queue.push({ prompt, content, silent: options?.silent });
     this.promptQueues.set(session.id, queue);
 
     if (!this.activeSessions.has(session.id)) {
@@ -914,7 +1021,9 @@ export class SessionManager {
             return; // finally handles cleanup
           }
 
-          await this.processPrompt(latestSession, item.prompt, item.content);
+          await this.processPrompt(latestSession, item.prompt, item.content, {
+            silent: item.silent,
+          });
 
           if (controller.signal.aborted) return; // finally handles cleanup
         }
@@ -966,6 +1075,17 @@ export class SessionManager {
         entry.resolve(null);
         this.pendingSudoPasswords.delete(toolUseId);
         this.sendToRenderer({ type: 'sudo.password.dismiss', payload: { toolUseId } });
+      }
+    }
+    // Phase 7.1.2（§1.10 第 4 点）：父 run cancel → child abort 时，
+    // 属于该会话的在途权限请求逐个 dismiss + resolve('deny')，
+    // 避免「取消后弹窗仍挂着、点了也没人收」的孤儿弹窗。
+    for (const [toolUseId, entry] of this.pendingPermissions) {
+      if (entry.sessionId === sessionId) {
+        entry.resolve('deny');
+        this.pendingPermissions.delete(toolUseId);
+        this.dequeuePermission(toolUseId);
+        this.sendToRenderer({ type: 'permission.dismiss', payload: { toolUseId } });
       }
     }
     // Also abort any pending controller we tracked
@@ -1434,8 +1554,40 @@ export class SessionManager {
         log('[SessionManager] Session allow-all enabled:', pending.sessionId);
       }
       this.pendingPermissions.delete(toolUseId);
+      this.dequeuePermission(toolUseId);
       pending.resolve(result);
     }
+  }
+
+  /** 串行派发：当前无在途弹窗且队列非空时，发出队首请求的 IPC。 */
+  private dispatchNextPermission(): void {
+    if (this.activePermissionId !== null || this.permissionQueue.length === 0) {
+      return;
+    }
+    const nextId = this.permissionQueue.shift();
+    if (!nextId) {
+      return;
+    }
+    const pending = this.pendingPermissions.get(nextId);
+    if (!pending) {
+      // 已被取消/超时清理，继续尝试下一个
+      this.dispatchNextPermission();
+      return;
+    }
+    this.activePermissionId = nextId;
+    this.sendToRenderer({
+      type: 'permission.request',
+      payload: pending.payload,
+    });
+  }
+
+  /** 完成/超时/取消后出队并触发下一个。 */
+  private dequeuePermission(toolUseId: string): void {
+    this.permissionQueue = this.permissionQueue.filter((id) => id !== toolUseId);
+    if (this.activePermissionId === toolUseId) {
+      this.activePermissionId = null;
+    }
+    this.dispatchNextPermission();
   }
 
   setSessionAllowAll(sessionId: string, enabled: boolean): void {
@@ -1456,11 +1608,14 @@ export class SessionManager {
     toolUseId: string,
     toolName: string,
     input: Record<string, unknown>,
-    kind?: 'advanced' | 'delete' | 'outside' | 'normal'
+    kind?: 'advanced' | 'delete' | 'outside' | 'normal',
+    /** Phase 7.1.2：来源标注（child dispatch description），渲染端展示。 */
+    sourceLabel?: string
   ): Promise<PermissionResult> {
     return new Promise((resolve) => {
       const timeoutId = setTimeout(() => {
         this.pendingPermissions.delete(toolUseId);
+        this.dequeuePermission(toolUseId);
         resolve('deny');
         this.sendToRenderer({ type: 'permission.dismiss', payload: { toolUseId } });
       }, 60_000);
@@ -1470,11 +1625,18 @@ export class SessionManager {
           clearTimeout(timeoutId);
           resolve(result);
         },
+        payload: {
+          toolUseId,
+          toolName,
+          input,
+          sessionId,
+          kind,
+          ...(sourceLabel ? { source: { label: sourceLabel } } : {}),
+        },
       });
-      this.sendToRenderer({
-        type: 'permission.request',
-        payload: { toolUseId, toolName, input, sessionId, kind },
-      });
+      // 串行派发：排队，有空闲槽位时才下发 IPC（修 P0 单槽覆盖）
+      this.permissionQueue.push(toolUseId);
+      this.dispatchNextPermission();
     });
   }
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""环境自检：优先探测应用内置 ffmpeg，再探测系统 ffmpeg。"""
+"""环境自检：本地 FunASR 栈（ONNX / 完整版 / CAM++）+ 内置 ffmpeg + 云兜底 + 模型缓存。"""
 from __future__ import annotations
 
+import glob
 import os
-import platform
 import shutil
 from pathlib import Path
 
@@ -44,43 +44,60 @@ def bundled_ffmpeg_path() -> Path | None:
     return None
 
 
+def resolve_model_dir() -> str:
+    if os.environ.get("ASR_MODEL_DIR", "").strip():
+        return os.environ["ASR_MODEL_DIR"].strip()
+    legacy = os.environ.get("ASR_WHISPER_MODEL_DIR", "").strip()
+    if legacy and os.path.isdir(legacy):
+        return legacy
+    return os.path.join(os.path.expanduser("~"), ".cache", "funasr")
+
+
+def cached_models(model_dir: str) -> list[str]:
+    if not os.path.isdir(model_dir):
+        return []
+    found = []
+    for p in Path(model_dir).iterdir():
+        if not p.is_dir():
+            continue
+        if (glob.glob(str(p / "*.onnx")) or glob.glob(str(p / "*.pt"))
+                or (p / "model.pt").exists() or (p / "model.onnx").exists()):
+            found.append(p.name)
+    return sorted(found)
+
+
 def main() -> None:
     bundled = bundled_ffmpeg_path()
     ff = bundled is not None or has("ffmpeg")
-    wx = has("whisperx") or mod("whisperx")
-    fw = mod("faster_whisper")
-    hf = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN"))
+    onnx = mod("funasr_onnx")
+    full = mod("funasr")
+    ms = mod("modelscope")
     oa = bool(os.environ.get("OPENAI_API_KEY"))
     ds = bool(os.environ.get("DASHSCOPE_API_KEY"))
-    model_dir = (
-        os.environ.get("ASR_WHISPER_MODEL_DIR", "").strip()
-        or os.path.join(os.path.expanduser("~"), ".cache", "whisper")
-    )
-    found_models = sorted(
-        p.name for p in Path(model_dir).glob("*") if p.is_dir() and list(p.glob("*.bin"))
-    ) if os.path.isdir(model_dir) else []
+    model_dir = resolve_model_dir()
+    found_models = cached_models(model_dir)
 
-    print("=== asr-transcribe 环境自检 ===")
+    print("=== asr-transcribe 环境自检（FunASR Paraformer-Large）===")
     if bundled:
-        print(f"内置 ffmpeg             : OK ({bundled})")
+        print(f"内置 ffmpeg                : OK ({bundled})")
     else:
-        print(f"内置 ffmpeg             : 未找到")
-    print(f"系统 ffmpeg             : {'OK' if has('ffmpeg') else '缺失'}")
-    print(f"whisperX(转写+说话人分离): {'OK' if wx else '缺失'}")
-    print(f"faster-whisper(轻量兜底) : {'OK' if fw else '缺失'}")
-    print(f"模型缓存目录            : {model_dir}")
-    print(f"已缓存模型              : {', '.join(found_models) if found_models else '无'}")
-    print(f"HF_TOKEN(说话人分离需要) : {'已设' if hf else '未设'}")
-    print(f"OPENAI_API_KEY(云兜底)   : {'已设' if oa else '未设'}")
-    print(f"DASHSCOPE_API_KEY(国产云): {'已设' if ds else '未设'}")
-    print("-" * 34)
+        print("内置 ffmpeg                : 未找到")
+    print(f"系统 ffmpeg                : {'OK' if has('ffmpeg') else '缺失'}")
+    print(f"funasr-onnx(默认/INT8/离线): {'OK' if onnx else '缺失'}")
+    print(f"完整版 funasr(标点/分离)   : {'OK' if full else '缺失'}")
+    print(f"modelscope(模型下载)       : {'OK' if ms else '缺失'}")
+    print(f"模型缓存目录               : {model_dir}")
+    print(f"已缓存模型                 : {', '.join(found_models) if found_models else '无'}")
+    print(f"OPENAI_API_KEY(云兜底)      : {'已设' if oa else '未设'}")
+    print(f"DASHSCOPE_API_KEY(国产云)   : {'已设' if ds else '未设'}")
+    print("-" * 38)
 
-    if ff and wx and hf:
-        print("结论：可走【本地 + 说话人分离】，最优。数据不出域。")
-    elif ff and wx:
-        print("结论：可走【本地 whisperX】（无说话人分离需设 HF_TOKEN）。数据不出域。")
-    elif ff and fw:
-        print("结论：可走【本地 faster-whisper】（无说话人分离）。数据不出域。")
+    if ff and onnx and full and found_models:
+        print("结论：可走【本地完整版 FunASR + CAM++ 说话人分离】，最优。数据不出域。")
+    elif ff and onnx and found_models:
+        print("结论：可走【本地 FunASR-ONNX INT8】（无说话人分离；要分离请装完整版 funasr）。数据不出域。")
+    elif ff and (onnx or full):
+        print("结论：引擎已装但模型未缓存；跑 scripts/download_model.py 预下载后即可离线。")
     elif oa or ds:
         prov = "阿里云 DashScope(国产合规)" if ds else "OpenAI"
         print(f"结论：本地未就绪；可走云端({prov})。上云前须征得用户同意（涉密录音回避）。")

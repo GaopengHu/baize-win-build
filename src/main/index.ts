@@ -72,6 +72,9 @@ import {
   buildScheduledTaskFallbackTitle,
   buildScheduledTaskTitle,
 } from '../shared/schedule/task-title';
+import { CompanyMarketplaceService } from './skills/company-marketplace-service';
+import { MarketplaceRatingStore } from './skills/marketplace-rating-store';
+import { createHash } from 'node:crypto';
 import {
   isUncPath,
   isWindowsDrivePath,
@@ -893,6 +896,7 @@ app
         payload: event,
       });
     });
+    pluginRuntimeService.setSkillsManager(skillsManager);
     sessionManager = new SessionManager(
       db,
       sendToRenderer,
@@ -1333,6 +1337,40 @@ async function saveFileToDownloads(
   }
 }
 
+/**
+ * 产物路径归一化（reveal + checkPaths 共用）：
+ * 相对路径按 cwd 拼；模型手拼的 "default_working_dir/..." 嵌套直接回收锚定到
+ * 真实 default_working_dir；/workspace/... 虚拟前缀按 cwd 拼。
+ */
+function resolveArtifactCandidate(rawPath: string, cwd?: string): string {
+  let normalized = decodePathSafely(rawPath.trim());
+  if (normalized.startsWith('file://')) {
+    normalized = localPathFromFileUrl(normalized) ?? normalized;
+  }
+  const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
+  if (!isAbsolute(normalized) && !isWindowsDrivePath(normalized) && !isUncPath(normalized)) {
+    normalized = resolve(baseDir, normalized);
+  }
+  const defaultDir = getWorkingDir();
+  const defaultName = defaultDir ? basename(defaultDir).toLowerCase() : '';
+  if (defaultDir && defaultName) {
+    const parts = normalized.split(/[\\/]+/);
+    const index = parts.findIndex((part) => part.toLowerCase() === defaultName);
+    if (index >= 0 && index < parts.length - 1) {
+      normalized = resolve(defaultDir, ...parts.slice(index + 1));
+    }
+  }
+  if (normalized.startsWith('/workspace/') || /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalized)) {
+    const relative = normalized.startsWith('/workspace/')
+      ? normalized.slice('/workspace/'.length)
+      : normalized.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
+    normalized = resolve(baseDir, relative);
+  }
+  const resolved = isUncPath(normalized) ? normalized : resolve(normalized);
+  log('[artifacts] resolve candidate:', { rawPath, cwd, resolved });
+  return resolved;
+}
+
 async function revealFileInFolder(filePath: string, cwd?: string): Promise<boolean> {
   if (!filePath) {
     return false;
@@ -1354,29 +1392,7 @@ async function revealFileInFolder(filePath: string, cwd?: string): Promise<boole
     normalizedPath = localPath;
   }
 
-  const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
-  if (
-    !isAbsolute(normalizedPath) &&
-    !isWindowsDrivePath(normalizedPath) &&
-    !isUncPath(normalizedPath)
-  ) {
-    normalizedPath = resolve(baseDir, normalizedPath);
-  }
-
-  if (
-    normalizedPath.startsWith('/workspace/') ||
-    /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalizedPath)
-  ) {
-    const relativePart = normalizedPath.startsWith('/workspace/')
-      ? normalizedPath.slice('/workspace/'.length)
-      : normalizedPath.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
-    normalizedPath = resolve(baseDir, relativePart);
-  }
-
-  if (!isUncPath(normalizedPath)) {
-    normalizedPath = resolve(normalizedPath);
-  }
-  log('[shell.showItemInFolder] request:', { filePath, cwd, resolved: normalizedPath });
+  normalizedPath = resolveArtifactCandidate(normalizedPath, cwd);
 
   const findFileByName = (fileName: string, roots: string[]): string | null => {
     if (!fileName) {
@@ -1515,28 +1531,13 @@ ipcMain.handle('artifacts.checkPaths', async (_event, paths: string[], cwd?: str
   if (!Array.isArray(paths) || paths.length === 0) {
     return [];
   }
-  const baseDir = cwd && isAbsolute(cwd) ? cwd : getWorkingDir() || app.getPath('home');
 
   const checks = paths.map(async (raw): Promise<string | null> => {
     if (typeof raw !== 'string' || !raw.trim()) {
       return null;
     }
-    let normalized = raw.trim();
-
-    if (!isAbsolute(normalized) && !isWindowsDrivePath(normalized) && !isUncPath(normalized)) {
-      normalized = resolve(baseDir, normalized);
-    }
-
-    if (normalized.startsWith('/workspace/') || /^[A-Za-z]:[/\\]workspace[/\\]/i.test(normalized)) {
-      const relativePart = normalized.startsWith('/workspace/')
-        ? normalized.slice('/workspace/'.length)
-        : normalized.replace(/^[A-Za-z]:[/\\]workspace[/\\]/i, '');
-      normalized = resolve(baseDir, relativePart);
-    }
-
-    if (!isUncPath(normalized)) {
-      normalized = resolve(normalized);
-    }
+    // 与 revealFileInFolder 同一套归一化（嵌套默认目录回收 + /workspace 映射）。
+    const normalized = resolveArtifactCandidate(raw, cwd);
 
     try {
       // Async stat: this handler is called on every finalized message and the
@@ -2042,6 +2043,200 @@ ipcMain.handle('plugins.uninstall', async (_event, pluginId: string) => {
     return result;
   } catch (error) {
     logError('[Plugins] Error uninstalling plugin:', error);
+    throw error;
+  }
+});
+
+// ─── Company marketplace (今点通应用市场) IPC ───
+// Base URL is configurable via AppConfig.marketplaceBaseUrl so the bundled
+// default can be overridden without rebuilding.
+
+function getMarketplaceService(): CompanyMarketplaceService {
+  try {
+    const baseUrl = configStore.get('marketplaceBaseUrl') || '';
+    if (baseUrl.trim()) {
+      return new CompanyMarketplaceService(baseUrl);
+    }
+  } catch (error) {
+    logWarn('[Marketplace] Failed to read marketplaceBaseUrl, using default:', error);
+  }
+  return new CompanyMarketplaceService();
+}
+
+/**
+ * 当前活跃配置集的模型 API Key（模型设置里用户填的那个，各用户唯一）。
+ * 注意 get('apiKey') 读的是遗留顶层键，配置集用户必须走 getAll() 投影。
+ * 用途：技能市场下载/评分/目录的 Authorization: Bearer 身份头。
+ * 原文只进请求头、不进日志（各调用处只记有无）。
+ */
+function getMarketplaceAuthToken(): string {
+  try {
+    return configStore.getAll().apiKey?.trim() || '';
+  } catch (error) {
+    logWarn('[Marketplace] Failed to read active apiKey:', error);
+    return '';
+  }
+}
+
+/** 带身份头的市场服务（目录/评分/下载；无 key 时退化为匿名，老行为不变）。 */
+function getAuthedMarketplaceService(): CompanyMarketplaceService {
+  return new CompanyMarketplaceService(
+    getMarketplaceService().getBaseUrl(),
+    getMarketplaceAuthToken()
+  );
+}
+
+// 当前模型 API Key 的指纹（SHA-256 前 16 位 hex），原文绝不离开本机。
+// 同一用户删库重装也换不掉自己的 Key：随评分上报后，服务端可用它做
+// (key_fp, app_id) 去重；端侧同时用它隔离“每位用户”的半年度额。
+function getApiKeyFingerprint(): string {
+  try {
+    const apiKey = (configStore.get('apiKey') || '').trim();
+    if (!apiKey) return '';
+    return createHash('sha256').update(apiKey, 'utf8').digest('hex').slice(0, 16);
+  } catch {
+    return '';
+  }
+}
+
+// 评分凭证主进程备份：与 Chromium Local Storage 物理隔离（独立 JSON 文件），
+// 用户单删 Local Storage 文件夹或清浏览器数据时，冷却与下载记录可恢复。
+// 惰性初始化：app ready 之前拿不到 userData 路径，首次调用时再建。
+let marketplaceRatingStore: MarketplaceRatingStore | null = null;
+
+function getMarketplaceRatingStore(): MarketplaceRatingStore {
+  if (!marketplaceRatingStore) {
+    marketplaceRatingStore = new MarketplaceRatingStore(app.getPath('userData'));
+  }
+  return marketplaceRatingStore;
+}
+
+ipcMain.handle('marketplace.getBaseUrl', () => {
+  try {
+    return getMarketplaceService().getBaseUrl();
+  } catch (error) {
+    logError('[Marketplace] Error getting base URL:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.listSkillApps', async () => {
+  try {
+    // 目录接口同样带身份头：限流按员工计数（不带则全公司共享出口 IP 额度）。
+    const marketplace = getAuthedMarketplaceService();
+    const apps = await marketplace.listSkillApps('Skill');
+    return apps.map((app) => ({
+      appId: app.id,
+      name: app.name,
+      description: app.description,
+      version: app.version,
+      tags: app.tags,
+      downloadCount: app.download_count,
+      updatedTime: app.updated_time,
+      hasIcon: Boolean(app.icon),
+      avgScore: app.avg_score,
+      ratingCount: app.rating_count,
+      packages: app.packages.map((pkg) => ({
+        packageId: pkg.id,
+        appId: pkg.app_id || app.id,
+        name: pkg.name,
+        arch: pkg.arch,
+        fileSize: pkg.file_size,
+        updatedTime: pkg.created,
+      })),
+    }));
+  } catch (error) {
+    logError('[Marketplace] Error listing skill apps:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.getIcon', async (_event, appId: number) => {
+  try {
+    const marketplace = getMarketplaceService();
+    const icon = await marketplace.fetchIconBytes(Number(appId));
+    if (!icon) {
+      return null;
+    }
+    return `data:${icon.contentType};base64,${icon.bytes.toString('base64')}`;
+  } catch (error) {
+    logWarn('[Marketplace] Icon fetch failed:', error);
+    return null;
+  }
+});
+
+ipcMain.handle(
+  'marketplace.installSkill',  async (
+    _event,
+    input: { appId: number; packageId: number; skillName?: string }
+  ) => {
+    try {
+      if (!pluginRuntimeService) {
+        throw new Error('PluginRuntimeService not initialized');
+      }
+      const result = await pluginRuntimeService.installFromMarketplace({
+        ...input,
+        baseUrl: getMarketplaceService().getBaseUrl(),
+        // 下载身份识别：透传当前活跃配置集的模型 API Key（截图里用户填的那个）。
+        // 传递方式为 Authorization: Bearer 头（不拼进 URL，避免进服务端访问日志）；
+        // Key 原文只在此次下载请求的头里出现，日志里只记有无、不记原文。
+        accessToken: getMarketplaceAuthToken(),
+      });
+      sessionManager?.invalidateSkillsSetup();
+      return result;
+    } catch (error) {
+      logError('[Marketplace] Error installing skill:', error);
+      throw error;
+    }
+  }
+);
+
+ipcMain.handle(
+  'marketplace.submitRating',
+  async (_event, input: { appId: number; score: number; deviceId?: string }) => {
+    try {
+      // 评分同样带身份头：限流按员工计数、落库记令牌审计列。
+      // 不带则按出口 IP 计数（办公区共用出口 IP = 全公司共享额度）。
+      const marketplace = getAuthedMarketplaceService();
+      return await marketplace.submitRating(
+        Number(input?.appId),
+        Number(input?.score),
+        typeof input?.deviceId === 'string' ? input.deviceId : undefined,
+        getApiKeyFingerprint() || undefined
+      );
+    } catch (error) {
+      logError('[Marketplace] Error submitting rating:', error);
+      throw error;
+    }
+  }
+);
+
+ipcMain.handle('marketplace.getRatingState', () => {
+  try {
+    return { ...getMarketplaceRatingStore().getState(), keyFp: getApiKeyFingerprint() };
+  } catch (error) {
+    logError('[Marketplace] Error reading rating state:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.markDownloaded', (_event, input: { appId: number }) => {
+  try {
+    return getMarketplaceRatingStore().markDownloaded(Number(input?.appId));
+  } catch (error) {
+    logError('[Marketplace] Error recording download:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('marketplace.recordRating', (_event, input: { appId: number }) => {
+  try {
+    return getMarketplaceRatingStore().recordRating(
+      Number(input?.appId),
+      getApiKeyFingerprint()
+    );
+  } catch (error) {
+    logError('[Marketplace] Error recording rating:', error);
     throw error;
   }
 });
@@ -2912,6 +3107,9 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
         event.payload.prompt,
         event.payload.content
       );
+
+    case 'session.resume':
+      return sm.resumeSession(event.payload.sessionId);
 
     case 'session.stop':
       return sm.stopSession(event.payload.sessionId);

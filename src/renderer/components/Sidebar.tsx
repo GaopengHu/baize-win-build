@@ -89,7 +89,10 @@ export function Sidebar() {
   //   新一轮 running 到达时清 null——详见 store 里的 lastTurnOutcome 注释。
   const sessionVisuals = useAppStore(
     useShallow((s) => {
-      const map: Record<string, { localRunning: boolean; lastTurnOutcome: 'completed' | 'stopped' | null }> = {};
+      const map: Record<
+        string,
+        { localRunning: boolean; lastTurnOutcome: 'completed' | 'stopped' | null }
+      > = {};
       for (const session of s.sessions) {
         const ss = s.sessionStates[session.id];
         const messages = ss?.messages ?? [];
@@ -134,6 +137,7 @@ export function Sidebar() {
     getSessionTraceSteps,
     isElectron,
   } = useIPC();
+  const setLoadingSessionId = useAppStore((s) => s.setLoadingSessionId);
   const [hoveredSession, setHoveredSession] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [isSelectMode, setIsSelectMode] = useState(false);
@@ -246,8 +250,6 @@ export function Sidebar() {
 
       if (activeSessionId === sessionId) return;
 
-      setActiveSession(sessionId);
-
       // Read sessionStates at call-time from the store rather than closing over
       // the selector value. The selector returns a new object reference every
       // time any session's state changes (patchSession spreads the whole map),
@@ -257,25 +259,54 @@ export function Sidebar() {
       const currentSessionStates = useAppStore.getState().sessionStates;
 
       const existingMessages = currentSessionStates[sessionId]?.messages;
-      if ((!existingMessages || existingMessages.length === 0) && isElectron) {
-        try {
-          const result = await getSessionMessagesPaginated(sessionId, 50, 0);
-          if (result.messages && result.messages.length > 0) {
-            setMessages(sessionId, result.messages);
-          }
-          setHasMoreMessages(sessionId, result.hasMore);
-        } catch (error) {
-          console.error('[Sidebar] Failed to load messages:', error);
-        }
-      }
-
       const existingSteps = currentSessionStates[sessionId]?.traceSteps;
-      if ((!existingSteps || existingSteps.length === 0) && isElectron) {
+      const needMessages = (!existingMessages || existingMessages.length === 0) && isElectron;
+      const needTrace = (!existingSteps || existingSteps.length === 0) && isElectron;
+
+      // Switch active session immediately so header/sidebar highlight updates
+      setActiveSession(sessionId);
+
+      if (needMessages || needTrace) {
+        // Signal loading state so the UI can show a skeleton/spinner
+        setLoadingSessionId(sessionId);
+
+        // Parallelize IPC calls — messages and trace steps are independent
         try {
-          const steps = await getSessionTraceSteps(sessionId);
-          setTraceSteps(sessionId, steps || []);
+          const [messagesResult, traceStepsResult] = await Promise.all([
+            needMessages
+              ? getSessionMessagesPaginated(sessionId, 50, 0).catch((error) => {
+                  console.error('[Sidebar] Failed to load messages:', error);
+                  return null;
+                })
+              : Promise.resolve(null),
+            needTrace
+              ? getSessionTraceSteps(sessionId).catch((error) => {
+                  console.error('[Sidebar] Failed to load trace steps:', error);
+                  return null;
+                })
+              : Promise.resolve(null),
+          ]);
+
+          if (messagesResult?.messages?.length) {
+            setMessages(sessionId, messagesResult.messages);
+          }
+          if (messagesResult) {
+            setHasMoreMessages(sessionId, messagesResult.hasMore);
+          }
+          if (traceStepsResult) {
+            setTraceSteps(sessionId, traceStepsResult);
+          }
         } catch (error) {
-          console.error('[Sidebar] Failed to load trace steps:', error);
+          console.error('[Sidebar] Failed to load session data:', error);
+        } finally {
+          // Guard: only clear loading if this session is still the one being
+          // loaded. A newer click may have already replaced loadingSessionId
+          // with a different session — clearing it here would hide the
+          // spinner for that session and leave the user staring at an empty
+          // "start conversation" placeholder.
+          if (useAppStore.getState().loadingSessionId === sessionId) {
+            setLoadingSessionId(null);
+          }
         }
       }
     },
@@ -285,6 +316,7 @@ export function Sidebar() {
       getSessionTraceSteps,
       isElectron,
       setActiveSession,
+      setLoadingSessionId,
       setMessages,
       setHasMoreMessages,
       setShowSettings,
@@ -514,139 +546,135 @@ export function Sidebar() {
           )}
         </div>
 
-      <div className="flex-1 overflow-y-auto px-3 py-4">
-        {groupedSessions.length === 0 ? (
-          <div className="px-3 py-6">
-            <p className="text-sm text-text-secondary">{t('sidebar.noTasks')}</p>
-            <p className="mt-1 text-xs leading-5 text-text-muted">{t('sidebar.noTasksHint')}</p>
-          </div>
-        ) : (
-          <div className="space-y-3">
-            {groupedSessions.map((group) => (
-              <section key={group.key}>
-                <div className="px-3 pb-2 text-[11px] font-medium tracking-[0.04em] text-text-muted">
-                  {group.label}
-                </div>
-                <div className="space-y-0.5">
-                  {group.sessions.map((session) => {
-                    const isActive = activeSessionId === session.id;
-                    const isSelected = selectedIds.has(session.id);
-                    const visual =
-                      sessionVisuals[session.id] ?? { localRunning: false, lastTurnOutcome: null };
-                    const visualStatus = getSessionStatusVisual(session.status, visual);
-                    const isRunning = visualStatus === 'running';
-                    const isCompleted = visualStatus === 'completed';
-                    // 方案B：整行高亮 — 运行中淡黄、已完成淡绿；选中态优先
-                    const statusBgClass =
-                      !isSelectMode && isRunning
-                        ? 'bg-warning/12 border border-warning/30 !border-l-2 !border-l-warning/70'
-                        : !isSelectMode && isCompleted
-                          ? 'bg-success/10 border border-success/20 !border-l-2 !border-l-success/60'
-                          : 'border border-transparent';
-                    return (
-                      <div
-                        key={session.id}
-                        onClick={() => {
-                          if (isSelectMode) {
-                            toggleSelectSession(session.id);
-                          } else {
-                            handleSessionClick(session.id);
-                          }
-                        }}
-                        onContextMenu={(e) => handleContextMenu(e, session.id)}
-                        onMouseEnter={() => setHoveredSession(session.id)}
-                        onMouseLeave={() => setHoveredSession(null)}
-                        title={
-                          isRunning
-                            ? '任务运行中'
-                            : isCompleted
-                              ? '任务已完成'
-                              : undefined
-                        }
-                        className={`group relative cursor-pointer rounded-lg px-2.5 py-1.5 transition-colors ${statusBgClass} ${
-                          isSelectMode && isSelected
-                            ? '!bg-accent-muted/20 !border-accent/30'
-                            : isActive && !isSelectMode
-                              ? isRunning
-                                ? 'bg-warning/20'
-                                : isCompleted
-                                  ? 'bg-success/15'
-                                  : 'bg-surface-hover/80'
-                              : !isRunning && !isCompleted
-                                ? 'hover:bg-surface-hover/60'
-                                : ''
-                        }`}
-                      >
-                        <div className={`flex items-center gap-2 ${!isSelectMode ? 'pr-6' : ''}`}>
-                          {!isSelectMode && isRunning && (
-                            <span
-                              className="w-5 h-5 rounded-full bg-warning/15 border border-warning/30 flex items-center justify-center flex-shrink-0"
-                              aria-label="任务运行中"
-                            >
-                              <MoreHorizontal className="w-3 h-3 text-warning animate-pulse" />
-                            </span>
-                          )}
-                          {!isSelectMode && isCompleted && (
-                            <span
-                              className="w-5 h-5 rounded-full bg-success/15 border border-success/25 flex items-center justify-center flex-shrink-0"
-                              aria-label="任务已完成"
-                            >
-                              <CheckCircle2 className="w-3 h-3 text-success" />
-                            </span>
-                          )}
-                          {isSelectMode && (
-                            <div
-                              className={`w-4 h-4 rounded flex items-center justify-center flex-shrink-0 transition-colors ${
-                                isSelected
-                                  ? 'bg-accent text-white'
-                                  : 'border border-border-muted bg-background'
-                              }`}
-                            >
-                              {isSelected && <Check className="w-2.5 h-2.5" />}
-                            </div>
-                          )}
-                          <div className="min-w-0 flex-1">
-                            {renameSessionId === session.id ? (
-                              <input
-                                ref={renameInputRef}
-                                type="text"
-                                value={renameTitle}
-                                onChange={(e) => setRenameTitle(e.target.value)}
-                                onBlur={() => {
-                                  cancelRename();
-                                  closeContextMenu();
-                                }}
-                                onKeyDown={handleRenameKeyDown}
-                                onClick={(e) => e.stopPropagation()}
-                                className="w-full text-[13px] font-medium leading-5 text-text-primary bg-surface-active border border-accent rounded px-1.5 py-0.5 outline-none focus:ring-1 focus:ring-accent"
-                                autoFocus
-                              />
-                            ) : (
-                              <div className="text-[13px] font-medium leading-5 text-text-primary truncate">
-                                {session.title}
+        <div className="flex-1 overflow-y-auto px-3 py-4">
+          {groupedSessions.length === 0 ? (
+            <div className="px-3 py-6">
+              <p className="text-sm text-text-secondary">{t('sidebar.noTasks')}</p>
+              <p className="mt-1 text-xs leading-5 text-text-muted">{t('sidebar.noTasksHint')}</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {groupedSessions.map((group) => (
+                <section key={group.key}>
+                  <div className="px-3 pb-2 text-[11px] font-medium tracking-[0.04em] text-text-muted">
+                    {group.label}
+                  </div>
+                  <div className="space-y-0.5">
+                    {group.sessions.map((session) => {
+                      const isActive = activeSessionId === session.id;
+                      const isSelected = selectedIds.has(session.id);
+                      const visual = sessionVisuals[session.id] ?? {
+                        localRunning: false,
+                        lastTurnOutcome: null,
+                      };
+                      const visualStatus = getSessionStatusVisual(session.status, visual);
+                      const isRunning = visualStatus === 'running';
+                      const isCompleted = visualStatus === 'completed';
+                      // 方案B：整行高亮 — 运行中淡黄、已完成淡绿；选中态优先
+                      const statusBgClass =
+                        !isSelectMode && isRunning
+                          ? 'bg-warning/12 border border-warning/30 !border-l-2 !border-l-warning/70'
+                          : !isSelectMode && isCompleted
+                            ? 'bg-success/10 border border-success/20 !border-l-2 !border-l-success/60'
+                            : 'border border-transparent';
+                      return (
+                        <div
+                          key={session.id}
+                          onClick={() => {
+                            if (isSelectMode) {
+                              toggleSelectSession(session.id);
+                            } else {
+                              handleSessionClick(session.id);
+                            }
+                          }}
+                          onContextMenu={(e) => handleContextMenu(e, session.id)}
+                          onMouseEnter={() => setHoveredSession(session.id)}
+                          onMouseLeave={() => setHoveredSession(null)}
+                          title={isRunning ? '任务运行中' : isCompleted ? '任务已完成' : undefined}
+                          className={`group relative cursor-pointer rounded-lg px-2.5 py-1.5 transition-colors ${statusBgClass} ${
+                            isSelectMode && isSelected
+                              ? '!bg-accent-muted/20 !border-accent/30'
+                              : isActive && !isSelectMode
+                                ? isRunning
+                                  ? 'bg-warning/20'
+                                  : isCompleted
+                                    ? 'bg-success/15'
+                                    : 'bg-surface-hover/80'
+                                : !isRunning && !isCompleted
+                                  ? 'hover:bg-surface-hover/60'
+                                  : ''
+                          }`}
+                        >
+                          <div className={`flex items-center gap-2 ${!isSelectMode ? 'pr-6' : ''}`}>
+                            {!isSelectMode && isRunning && (
+                              <span
+                                className="w-5 h-5 rounded-full bg-warning/15 border border-warning/30 flex items-center justify-center flex-shrink-0"
+                                aria-label="任务运行中"
+                              >
+                                <MoreHorizontal className="w-3 h-3 text-warning animate-pulse" />
+                              </span>
+                            )}
+                            {!isSelectMode && isCompleted && (
+                              <span
+                                className="w-5 h-5 rounded-full bg-success/15 border border-success/25 flex items-center justify-center flex-shrink-0"
+                                aria-label="任务已完成"
+                              >
+                                <CheckCircle2 className="w-3 h-3 text-success" />
+                              </span>
+                            )}
+                            {isSelectMode && (
+                              <div
+                                className={`w-4 h-4 rounded flex items-center justify-center flex-shrink-0 transition-colors ${
+                                  isSelected
+                                    ? 'bg-accent text-white'
+                                    : 'border border-border-muted bg-background'
+                                }`}
+                              >
+                                {isSelected && <Check className="w-2.5 h-2.5" />}
                               </div>
                             )}
+                            <div className="min-w-0 flex-1">
+                              {renameSessionId === session.id ? (
+                                <input
+                                  ref={renameInputRef}
+                                  type="text"
+                                  value={renameTitle}
+                                  onChange={(e) => setRenameTitle(e.target.value)}
+                                  onBlur={() => {
+                                    cancelRename();
+                                    closeContextMenu();
+                                  }}
+                                  onKeyDown={handleRenameKeyDown}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="w-full text-[13px] font-medium leading-5 text-text-primary bg-surface-active border border-accent rounded px-1.5 py-0.5 outline-none focus:ring-1 focus:ring-accent"
+                                  autoFocus
+                                />
+                              ) : (
+                                <div className="text-[13px] font-medium leading-5 text-text-primary truncate">
+                                  {session.title}
+                                </div>
+                              )}
+                            </div>
                           </div>
-                        </div>
 
-                        {!isSelectMode && hoveredSession === session.id && (
-                          <button
-                            onClick={(e) => handleDeleteSession(e, session.id)}
-                            className="absolute right-1.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-lg flex items-center justify-center text-text-muted hover:text-error hover:bg-surface-active transition-colors"
-                            title={t('common.delete')}
-                          >
-                            <Trash2 className="w-3 h-3" />
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </section>
-            ))}
-          </div>
-        )}
-      </div>
+                          {!isSelectMode && hoveredSession === session.id && (
+                            <button
+                              onClick={(e) => handleDeleteSession(e, session.id)}
+                              className="absolute right-1.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-lg flex items-center justify-center text-text-muted hover:text-error hover:bg-surface-active transition-colors"
+                              title={t('common.delete')}
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              ))}
+            </div>
+          )}
+        </div>
 
         {isSelectMode ? (
           <div className="px-3 py-3 border-t border-border-muted">

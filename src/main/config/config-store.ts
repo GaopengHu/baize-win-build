@@ -106,6 +106,9 @@ export interface AppConfig {
   // Optional: Global skills storage directory
   globalSkillsPath?: string;
 
+  // Company skill marketplace (今点通应用市场) base URL, e.g. http://172.26.110.88:3000
+  marketplaceBaseUrl?: string;
+
   // Developer logs
   enableDevLogs: boolean;
 
@@ -120,6 +123,9 @@ export interface AppConfig {
 
   // Dedicated memory runtime config
   memoryRuntime: MemoryRuntimeConfig;
+
+  // 子 agent 联网检索端点（Phase 7.1 research profile 用；默认禁用，fail-closed）
+  searchRuntime: SearchRuntimeConfig;
 
   // Enable thinking mode (show thinking steps)
   enableThinking: boolean;
@@ -160,6 +166,28 @@ export interface MemoryRuntimeConfig {
   promptIterationRounds?: number;
 }
 
+/**
+ * 子 agent 联网检索端点配置（Phase 7.1）。
+ * 独立配置段，不嵌套进 memoryRuntime——搜索与记忆运行时无语义关系。
+ * 默认 'none'（fail-closed：涉密优先，联网需用户在设置里显式开启）；
+ * 企业部署如需开放检索可在 config 文件预置引擎。
+ */
+export type SearchEngine =
+  | 'bing-cn'
+  | 'sogou'
+  | 'chrome-mcp'
+  | 'bing-api'
+  | 'serper'
+  | 'duckduckgo'
+  | 'none';
+
+export interface SearchRuntimeConfig {
+  engine: SearchEngine;
+  /** 仅 bing-api/serper 需要（企业部署在 config 文件预置，不要求终端用户申请）。 */
+  apiKey: string;
+  timeoutMs: number;
+}
+
 const DEFAULT_CONFIG_SET_ID = 'default';
 const MAX_CONFIG_SET_COUNT = 20;
 const LOCAL_ANTHROPIC_PLACEHOLDER_KEY = 'sk-ant-local-proxy';
@@ -173,6 +201,7 @@ const DIRECT_READ_KEYS = new Set<keyof AppConfig>([
   'claudeCodePath',
   'defaultWorkdir',
   'globalSkillsPath',
+  'marketplaceBaseUrl',
   'enableDevLogs',
   'theme',
   'sandboxEnabled',
@@ -249,6 +278,7 @@ const defaultConfig: AppConfig = {
   claudeCodePath: '',
   defaultWorkdir: '',
   globalSkillsPath: '',
+  marketplaceBaseUrl: 'http://172.26.110.88:3000',
   enableDevLogs: false,
   theme: 'light',
   sandboxEnabled: true,
@@ -283,6 +313,11 @@ const defaultConfig: AppConfig = {
     evalMaxRounds: 12,
     evalArtifactsRoot: '',
     promptIterationRounds: 2,
+  },
+  searchRuntime: {
+    engine: 'none',
+    apiKey: '',
+    timeoutMs: 10000,
   },
   enableThinking: false,
   isConfigured: false,
@@ -447,6 +482,31 @@ function normalizeMemoryRuntimeConfig(raw: unknown): MemoryRuntimeConfig {
       Number.isFinite(value.promptIterationRounds)
         ? Math.max(0, Math.min(10, Math.round(value.promptIterationRounds)))
         : defaultConfig.memoryRuntime.promptIterationRounds,
+  };
+}
+
+const SEARCH_ENGINES: SearchEngine[] = [
+  'bing-cn',
+  'sogou',
+  'chrome-mcp',
+  'bing-api',
+  'serper',
+  'duckduckgo',
+  'none',
+];
+
+function normalizeSearchRuntimeConfig(raw: unknown): SearchRuntimeConfig {
+  const value =
+    typeof raw === 'object' && raw !== null ? (raw as Partial<SearchRuntimeConfig>) : {};
+  return {
+    engine: SEARCH_ENGINES.includes(value.engine as SearchEngine)
+      ? (value.engine as SearchEngine)
+      : defaultConfig.searchRuntime.engine,
+    apiKey: typeof value.apiKey === 'string' ? value.apiKey : defaultConfig.searchRuntime.apiKey,
+    timeoutMs:
+      typeof value.timeoutMs === 'number' && Number.isFinite(value.timeoutMs)
+        ? Math.max(3000, Math.min(60000, Math.round(value.timeoutMs)))
+        : defaultConfig.searchRuntime.timeoutMs,
   };
 }
 
@@ -999,11 +1059,16 @@ export class ConfigStore {
         typeof raw.globalSkillsPath === 'string'
           ? raw.globalSkillsPath
           : defaultConfig.globalSkillsPath,
+      marketplaceBaseUrl:
+        typeof raw.marketplaceBaseUrl === 'string' && raw.marketplaceBaseUrl.trim()
+          ? raw.marketplaceBaseUrl.trim()
+          : defaultConfig.marketplaceBaseUrl,
       enableDevLogs: toBoolean(raw.enableDevLogs, defaultConfig.enableDevLogs),
       theme: isAppTheme(raw.theme) ? raw.theme : defaultConfig.theme,
       sandboxEnabled: toBoolean(raw.sandboxEnabled, defaultConfig.sandboxEnabled),
       memoryEnabled: toBoolean(raw.memoryEnabled, defaultConfig.memoryEnabled),
       memoryRuntime: normalizeMemoryRuntimeConfig(raw.memoryRuntime),
+      searchRuntime: normalizeSearchRuntimeConfig(raw.searchRuntime),
       enableThinking: projected.enableThinking,
       isConfigured: toBoolean(raw.isConfigured, defaultConfig.isConfigured),
     };
@@ -1406,6 +1471,10 @@ export class ConfigStore {
         updates.globalSkillsPath !== undefined
           ? updates.globalSkillsPath
           : current.globalSkillsPath,
+      marketplaceBaseUrl:
+        updates.marketplaceBaseUrl !== undefined
+          ? updates.marketplaceBaseUrl
+          : current.marketplaceBaseUrl,
       enableDevLogs:
         updates.enableDevLogs !== undefined ? updates.enableDevLogs : current.enableDevLogs,
       theme: updates.theme !== undefined ? updates.theme : current.theme,
@@ -1417,6 +1486,10 @@ export class ConfigStore {
         updates.memoryRuntime !== undefined
           ? normalizeMemoryRuntimeConfig(updates.memoryRuntime)
           : current.memoryRuntime,
+      searchRuntime:
+        updates.searchRuntime !== undefined
+          ? normalizeSearchRuntimeConfig(updates.searchRuntime)
+          : current.searchRuntime,
       isConfigured:
         updates.isConfigured !== undefined ? updates.isConfigured : current.isConfigured,
     });

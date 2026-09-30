@@ -233,9 +233,13 @@ export class SandboxSync {
       const excludeArgs = SYNC_EXCLUDES.map((e) => `--exclude="${e}"`).join(' ');
 
       // Sync back to Windows (via /mnt/)
-      // NOTE: We use --delete to ensure files deleted/moved in sandbox are also deleted locally
-      // This is important for file organization tasks where files are moved to new locations
-      const rsyncCmd = `rsync -av --delete ${excludeArgs} '${this.shellEscapePath(session.sandboxPath)}/' '${this.shellEscapePath(wslDestPath)}/'`;
+      // NOTE: intentionally NO --delete here. Files created directly on the
+      // host during the turn (e.g. transcribe.py writing to an absolute
+      // Windows --output-dir, bypassing the sandbox) must survive. With
+      // --delete, rsync treated "not in sandbox" as "deleted in sandbox" and
+      // wiped host-side deliverables (outputs/*.pdf/*.srt/*.txt) on every
+      // turn-end sync — the "产物点击提示无法定位文件" bug.
+      const rsyncCmd = `rsync -av ${excludeArgs} '${this.shellEscapePath(session.sandboxPath)}/' '${this.shellEscapePath(wslDestPath)}/'`;
       log(`[SandboxSync] Running: ${rsyncCmd}`);
 
       await this.wslExec(session.distro, rsyncCmd, 300000); // 5 min timeout

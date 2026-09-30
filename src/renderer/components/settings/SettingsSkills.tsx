@@ -8,12 +8,10 @@ import {
   PowerOff,
   Trash2,
   Plus,
-  Loader2,
   Globe,
   RefreshCw,
-  X,
 } from 'lucide-react';
-import type { Skill, PluginCatalogItemV2, InstalledPlugin, PluginComponentKind } from '../../types';
+import type { Skill } from '../../types';
 import { useAppStore } from '../../store';
 import { SettingsContentSection } from './shared';
 import type { LocalizedBanner } from './shared';
@@ -30,56 +28,9 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
   const skillsStorageChangeEvent = useAppStore((state) => state.skillsStorageChangeEvent);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [storagePath, setStoragePath] = useState('');
-  const [plugins, setPlugins] = useState<PluginCatalogItemV2[]>([]);
-  const [installedPluginsByKey, setInstalledPluginsByKey] = useState<
-    Record<string, InstalledPlugin>
-  >({});
   const [isLoading, setIsLoading] = useState(false);
-  const [isPluginLoading, setIsPluginLoading] = useState(false);
-  const [isPluginModalOpen, setIsPluginModalOpen] = useState(false);
-  const [pluginActionKey, setPluginActionKey] = useState<string | null>(null);
-  const [pluginToastMessage, setPluginToastMessage] = useState('');
   const [error, setError] = useState<LocalizedBanner | null>(null);
   const [success, setSuccess] = useState<LocalizedBanner | null>(null);
-  const pluginToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const componentOrder: PluginComponentKind[] = ['skills', 'commands', 'agents', 'hooks', 'mcp'];
-
-  function normalizePluginLookupKey(value: string | undefined): string {
-    if (!value) {
-      return '';
-    }
-    return value
-      .toLowerCase()
-      .replace(/[^a-z0-9-]+/g, '-')
-      .replace(/^-+|-+$/g, '');
-  }
-
-  function getCatalogLookupKeys(plugin: PluginCatalogItemV2): string[] {
-    const keys = new Set<string>();
-    const addKey = (value: string | undefined) => {
-      if (!value) {
-        return;
-      }
-      const trimmed = value.trim();
-      if (!trimmed) {
-        return;
-      }
-      keys.add(trimmed);
-      keys.add(trimmed.toLowerCase());
-      const normalized = normalizePluginLookupKey(trimmed);
-      if (normalized) {
-        keys.add(normalized);
-      }
-    };
-
-    addKey(plugin.name);
-    addKey(plugin.pluginId);
-
-    const marketplaceId = plugin.pluginId?.split('@')[0];
-    addKey(marketplaceId);
-
-    return [...keys];
-  }
 
   useEffect(() => {
     if (!skillsStorageChangeEvent) {
@@ -97,17 +48,6 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
       });
     }
   }, [skillsStorageChangeEvent, t]);
-
-  function showPluginInstallToast(message: string) {
-    setPluginToastMessage(message);
-    if (pluginToastTimerRef.current) {
-      clearTimeout(pluginToastTimerRef.current);
-    }
-    pluginToastTimerRef.current = setTimeout(() => {
-      setPluginToastMessage('');
-      pluginToastTimerRef.current = null;
-    }, 5000);
-  }
 
   const loadSkills = useCallback(async (silent = false) => {
     try {
@@ -158,20 +98,10 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
 
   useEffect(() => {
     if (!isElectron || !isActive) {
-      return () => {
-        if (pluginToastTimerRef.current) {
-          clearTimeout(pluginToastTimerRef.current);
-        }
-      };
+      return;
     }
 
     void loadSkills();
-
-    return () => {
-      if (pluginToastTimerRef.current) {
-        clearTimeout(pluginToastTimerRef.current);
-      }
-    };
   }, [isActive, loadSkills]);
 
   useEffect(() => {
@@ -179,48 +109,6 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
       void loadSkills(true);
     }
   }, [isActive, loadSkills, skillsStorageChangedAt]);
-
-  async function loadPlugins() {
-    try {
-      setIsPluginLoading(true);
-      const [catalog, installed] = await Promise.all([
-        window.electronAPI.plugins.listCatalog({ installableOnly: false }),
-        window.electronAPI.plugins.listInstalled(),
-      ]);
-      setPlugins(catalog || []);
-      const nextInstalledByKey: Record<string, InstalledPlugin> = {};
-      const addLookupKey = (key: string, plugin: InstalledPlugin) => {
-        if (!key || nextInstalledByKey[key]) {
-          return;
-        }
-        nextInstalledByKey[key] = plugin;
-      };
-      for (const plugin of installed || []) {
-        const candidates = [
-          plugin.name,
-          plugin.name?.toLowerCase(),
-          normalizePluginLookupKey(plugin.name),
-          plugin.pluginId,
-          plugin.pluginId?.toLowerCase(),
-          normalizePluginLookupKey(plugin.pluginId),
-        ].filter((value): value is string => Boolean(value));
-        for (const key of candidates) {
-          addLookupKey(key, plugin);
-        }
-      }
-      setInstalledPluginsByKey(nextInstalledByKey);
-      setError(null);
-    } catch (err) {
-      setError({ text: err instanceof Error ? err.message : t('skills.pluginInstallFailed') });
-    } finally {
-      setIsPluginLoading(false);
-    }
-  }
-
-  async function handleBrowsePlugins() {
-    setIsPluginModalOpen(true);
-    await loadPlugins();
-  }
 
   async function handleInstall() {
     try {
@@ -300,74 +188,6 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
       setError({ text: err instanceof Error ? err.message : t('skills.failedToToggle') });
     } finally {
       setIsLoading(false);
-    }
-  }
-
-  async function handleInstallPlugin(plugin: PluginCatalogItemV2) {
-    const installTarget = plugin.pluginId ?? plugin.name;
-    setPluginActionKey(`install:${installTarget}`);
-    setError(null);
-    setSuccess(null);
-    try {
-      const result = await window.electronAPI.plugins.install(installTarget);
-      await loadSkills();
-      await loadPlugins();
-      const message = t('skills.pluginInstallSuccess', { name: result.plugin.name });
-      setSuccess({ text: message });
-      showPluginInstallToast(message);
-      setTimeout(() => setSuccess(null), 4000);
-    } catch (err) {
-      setError({ text: err instanceof Error ? err.message : t('skills.pluginInstallFailed') });
-    } finally {
-      setPluginActionKey(null);
-    }
-  }
-
-  async function handleSetPluginEnabled(plugin: InstalledPlugin, enabled: boolean) {
-    setPluginActionKey(`enabled:${plugin.pluginId}`);
-    setError(null);
-    try {
-      await window.electronAPI.plugins.setEnabled(plugin.pluginId, enabled);
-      await loadPlugins();
-    } catch (err) {
-      setError({ text: err instanceof Error ? err.message : t('skills.pluginInstallFailed') });
-    } finally {
-      setPluginActionKey(null);
-    }
-  }
-
-  async function handleSetComponentEnabled(
-    plugin: InstalledPlugin,
-    component: PluginComponentKind,
-    enabled: boolean
-  ) {
-    setPluginActionKey(`component:${plugin.pluginId}:${component}`);
-    setError(null);
-    try {
-      await window.electronAPI.plugins.setComponentEnabled(plugin.pluginId, component, enabled);
-      await loadPlugins();
-    } catch (err) {
-      setError({ text: err instanceof Error ? err.message : t('skills.pluginInstallFailed') });
-    } finally {
-      setPluginActionKey(null);
-    }
-  }
-
-  async function handleUninstallPlugin(plugin: InstalledPlugin) {
-    if (!confirm(t('skills.pluginUninstall', { name: plugin.name }))) {
-      return;
-    }
-
-    setPluginActionKey(`uninstall:${plugin.pluginId}`);
-    setError(null);
-    try {
-      await window.electronAPI.plugins.uninstall(plugin.pluginId);
-      await loadPlugins();
-      showPluginInstallToast(t('skills.pluginUninstalled', { name: plugin.name }));
-    } catch (err) {
-      setError({ text: err instanceof Error ? err.message : t('skills.pluginInstallFailed') });
-    } finally {
-      setPluginActionKey(null);
     }
   }
 
@@ -460,244 +280,15 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
         title={t('skills.pluginsTitle')}
         description={t('skills.pluginsDesc')}
       >
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-          <button
-            onClick={handleBrowsePlugins}
-            disabled={isLoading || isPluginLoading}
-            className="w-full py-3 px-4 rounded-lg border border-border-subtle hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
-          >
-            {isPluginLoading ? (
-              <Loader2 className="w-5 h-5 animate-spin" />
-            ) : (
-              <Package className="w-5 h-5" />
-            )}
-            {t('skills.browsePlugins')}
-          </button>
-          <button
-            onClick={handleInstall}
-            disabled={isLoading}
-            className="w-full py-3 px-4 rounded-lg border-2 border-dashed border-border-subtle hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
-          >
-            <Plus className="w-5 h-5" />
-            {t('skills.installSkillFromFolder')}
-          </button>
-        </div>
+        <button
+          onClick={handleInstall}
+          disabled={isLoading}
+          className="w-full py-3 px-4 rounded-lg border-2 border-dashed border-border-subtle hover:border-accent hover:bg-accent/5 transition-all flex items-center justify-center gap-2 text-text-secondary hover:text-accent disabled:opacity-50"
+        >
+          <Plus className="w-5 h-5" />
+          {t('skills.installSkillFromFolder')}
+        </button>
       </SettingsContentSection>
-
-      {isPluginModalOpen && (
-        <div className="fixed inset-0 z-[60] bg-black/50 flex items-center justify-center p-4">
-          <div className="w-full max-w-3xl max-h-[80vh] overflow-hidden rounded-lg border border-border bg-surface shadow-elevated">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-border">
-              <h3 className="text-lg font-semibold text-text-primary">
-                {t('skills.pluginListTitle')}
-              </h3>
-              <button
-                onClick={() => setIsPluginModalOpen(false)}
-                className="p-2 rounded-lg hover:bg-surface-hover transition-colors"
-              >
-                <X className="w-5 h-5 text-text-secondary" />
-              </button>
-            </div>
-            <div className="p-5 space-y-3 overflow-y-auto max-h-[65vh]">
-              {isPluginLoading ? (
-                <div className="py-8 flex items-center justify-center gap-2 text-text-secondary">
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  <span>{t('common.loading')}</span>
-                </div>
-              ) : plugins.length === 0 ? (
-                <div className="py-8 text-center text-text-muted">{t('skills.noPluginsFound')}</div>
-              ) : (
-                plugins.map((plugin) => (
-                  <div
-                    key={plugin.pluginId || plugin.name}
-                    className="rounded-lg border border-border bg-surface-hover p-4"
-                  >
-                    {(() => {
-                      const installedPlugin = getCatalogLookupKeys(plugin)
-                        .map((key) => installedPluginsByKey[key])
-                        .find((item): item is InstalledPlugin => Boolean(item));
-                      const installTarget = plugin.pluginId ?? plugin.name;
-                      const isInstalling = pluginActionKey === `install:${installTarget}`;
-                      const componentEntries = componentOrder.filter(
-                        (component) => plugin.componentCounts[component] > 0
-                      );
-                      const isMarketplaceCatalog = plugin.catalogSource === 'claude-marketplace';
-                      const hasKnownComponents = componentEntries.length > 0;
-                      const isInstallable = plugin.installable;
-                      return (
-                        <>
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-2 mb-1">
-                                <h4 className="font-medium text-text-primary truncate">
-                                  {plugin.name}
-                                </h4>
-                                {plugin.version && (
-                                  <span className="text-xs px-2 py-0.5 rounded bg-surface text-text-muted">
-                                    v{plugin.version}
-                                  </span>
-                                )}
-                              </div>
-                              {plugin.description && (
-                                <p className="text-sm text-text-muted line-clamp-2">
-                                  {plugin.description}
-                                </p>
-                              )}
-                              {hasKnownComponents ? (
-                                <p className="text-xs text-text-muted mt-2">
-                                  {t('skills.pluginComponents', {
-                                    skills: plugin.componentCounts.skills,
-                                    commands: plugin.componentCounts.commands,
-                                    agents: plugin.componentCounts.agents,
-                                    hooks: plugin.componentCounts.hooks,
-                                    mcp: plugin.componentCounts.mcp,
-                                  })}
-                                </p>
-                              ) : (
-                                isMarketplaceCatalog &&
-                                !installedPlugin && (
-                                  <p className="text-xs text-text-muted mt-2">
-                                    {t('skills.pluginComponentsAvailableAfterInstall')}
-                                  </p>
-                                )
-                              )}
-                              {hasKnownComponents &&
-                                plugin.componentCounts.hooks > 0 &&
-                                !installedPlugin && (
-                                  <p className="text-xs text-warning mt-1">
-                                    {t('skills.pluginComponentHooksDisabledByDefault')}
-                                  </p>
-                                )}
-                              {hasKnownComponents &&
-                                plugin.componentCounts.mcp > 0 &&
-                                !installedPlugin && (
-                                  <p className="text-xs text-warning mt-1">
-                                    {t('skills.pluginComponentMcpDisabledByDefault')}
-                                  </p>
-                                )}
-                              {!isInstallable && !isMarketplaceCatalog && (
-                                <p className="text-xs text-error mt-1">
-                                  {t('skills.pluginNoComponents')}
-                                </p>
-                              )}
-                            </div>
-                            {installedPlugin ? (
-                              <span className="inline-flex items-center gap-1 px-3 py-2 rounded-lg bg-success/10 text-success text-sm">
-                                <CheckCircle className="w-4 h-4" />
-                                {t('skills.pluginInstalled')}
-                              </span>
-                            ) : (
-                              <button
-                                onClick={() => handleInstallPlugin(plugin)}
-                                disabled={!isInstallable || pluginActionKey !== null}
-                                className="px-3 py-2 rounded-lg bg-accent text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                              >
-                                {isInstalling ? (
-                                  <span className="inline-flex items-center gap-1">
-                                    <Loader2 className="w-4 h-4 animate-spin" />
-                                    {t('common.install')}
-                                  </span>
-                                ) : (
-                                  t('skills.pluginInstall')
-                                )}
-                              </button>
-                            )}
-                          </div>
-                          {installedPlugin && (
-                            <div className="mt-3 pt-3 border-t border-border space-y-2">
-                              <div className="flex items-center justify-between gap-2">
-                                <div className="text-xs text-text-muted">
-                                  {installedPlugin.enabled
-                                    ? t('skills.pluginAppliedInRuntime')
-                                    : t('skills.pluginDisabled')}
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    onClick={() =>
-                                      handleSetPluginEnabled(
-                                        installedPlugin,
-                                        !installedPlugin.enabled
-                                      )
-                                    }
-                                    disabled={pluginActionKey !== null}
-                                    className={`px-3 py-1.5 rounded-md text-xs ${
-                                      installedPlugin.enabled
-                                        ? 'bg-warning/10 text-warning hover:bg-warning/20'
-                                        : 'bg-success/10 text-success hover:bg-success/20'
-                                    } disabled:opacity-50`}
-                                  >
-                                    {installedPlugin.enabled
-                                      ? t('skills.pluginDisable')
-                                      : t('skills.pluginEnable')}
-                                  </button>
-                                  <button
-                                    onClick={() => handleUninstallPlugin(installedPlugin)}
-                                    disabled={pluginActionKey !== null}
-                                    className="px-3 py-1.5 rounded-md text-xs bg-error/10 text-error hover:bg-error/20 disabled:opacity-50"
-                                  >
-                                    {t('skills.pluginManageUninstall')}
-                                  </button>
-                                </div>
-                              </div>
-                              <div className="space-y-1">
-                                {componentEntries.map((component) => {
-                                  const enabled = installedPlugin.componentsEnabled[component];
-                                  return (
-                                    <div
-                                      key={`${installedPlugin.pluginId}:${component}`}
-                                      className="flex items-center justify-between gap-2"
-                                    >
-                                      <div className="text-xs text-text-secondary">
-                                        <span className="font-medium">{component}</span>
-                                        <span className="text-text-muted">
-                                          {' '}
-                                          ({plugin.componentCounts[component]})
-                                        </span>
-                                      </div>
-                                      <button
-                                        onClick={() =>
-                                          handleSetComponentEnabled(
-                                            installedPlugin,
-                                            component,
-                                            !enabled
-                                          )
-                                        }
-                                        disabled={pluginActionKey !== null}
-                                        className={`px-2 py-1 rounded text-xs ${
-                                          enabled
-                                            ? 'bg-success/10 text-success hover:bg-success/20'
-                                            : 'bg-surface text-text-muted hover:bg-surface-active'
-                                        } disabled:opacity-50`}
-                                      >
-                                        {enabled
-                                          ? t('skills.pluginDisable')
-                                          : t('skills.pluginEnable')}
-                                      </button>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          )}
-                        </>
-                      );
-                    })()}
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {pluginToastMessage && (
-        <div className="fixed right-6 bottom-6 z-[80] max-w-md rounded-lg border border-success/30 bg-surface px-4 py-3 shadow-elevated">
-          <div className="flex items-start gap-2 text-success text-sm">
-            <CheckCircle className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{pluginToastMessage}</span>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -724,7 +315,12 @@ function SkillCard({
             <div
               className={`w-3 h-3 rounded-full ${skill.enabled ? 'bg-success' : 'bg-text-muted'}`}
             />
-            <h3 className="font-medium text-text-primary">{skill.name}</h3>
+            <h3 className="font-medium text-text-primary">
+              {skill.displayName || skill.name}
+            </h3>
+            {skill.displayName && skill.displayName !== skill.name && (
+              <span className="text-xs text-text-muted font-mono">{skill.name}</span>
+            )}
             <span
               className={`px-2 py-0.5 text-xs rounded ${
                 isBuiltin

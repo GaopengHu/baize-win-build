@@ -2,7 +2,9 @@ import { useState, useRef, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore, WELCOME_DRAFT_KEY } from '../store';
 import { useComposerDraft } from '../hooks/useComposerDraft';
+import { useSlashSkillMenu } from '../hooks/useSlashSkillMenu';
 import { useIPC } from '../hooks/useIPC';
+import { SlashSkillMenu } from './SlashSkillMenu';
 import type { ContentBlock } from '../types';
 import { getInitialSessionTitle } from '../../shared/session-title';
 import {
@@ -38,6 +40,7 @@ export function WelcomeView() {
   const isComposingRef = useRef(false);
   const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const slashMenu = useSlashSkillMenu({ prompt, setPrompt, textareaRef, isComposingRef });
   const { startSession, changeWorkingDir, isElectron } = useIPC();
   const appConfig = useAppStore((state) => state.appConfig);
   const setAppConfig = useAppStore((state) => state.setAppConfig);
@@ -348,6 +351,7 @@ export function WelcomeView() {
 
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    slashMenu.close();
 
     // Get value from ref to handle both controlled and uncontrolled cases
     const currentPrompt = textareaRef.current?.value || prompt;
@@ -510,9 +514,7 @@ export function WelcomeView() {
               key={tag.id}
               onClick={() => handleTagClick(tag.id, tag.prompt)}
               className={`inline-flex items-center gap-2.5 rounded-full border border-border-subtle bg-background/65 px-4 py-2.5 text-sm text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary ${
-                selectedTag === tag.id
-                  ? '!border-accent/30 !bg-accent-muted !text-accent'
-                  : ''
+                selectedTag === tag.id ? '!border-accent/30 !bg-accent-muted !text-accent' : ''
               }`}
             >
               <tag.icon
@@ -579,35 +581,46 @@ export function WelcomeView() {
           )}
 
           {/* Text Input - Auto-resizing */}
-          <textarea
-            ref={textareaRef}
-            value={prompt}
-            onChange={(e) => {
-              setPrompt(e.target.value);
-              adjustTextareaHeight();
-            }}
-            onCompositionStart={() => {
-              isComposingRef.current = true;
-            }}
-            onCompositionEnd={() => {
-              isComposingRef.current = false;
-            }}
-            onPaste={handlePaste}
-            placeholder={t('welcome.placeholder')}
-            rows={1}
-            style={{ minHeight: '72px', maxHeight: '200px' }}
-            className="w-full resize-none bg-transparent border-none outline-none text-text-primary placeholder:text-text-muted text-base leading-relaxed overflow-hidden"
-            onKeyDown={(e) => {
-              // Enter to send, Shift+Enter for new line
-              if (e.key === 'Enter' && !e.shiftKey) {
-                if (e.nativeEvent.isComposing || isComposingRef.current || e.keyCode === 229) {
-                  return;
+          <div className="relative">
+            {slashMenu.open && (
+              <SlashSkillMenu
+                items={slashMenu.items}
+                activeIndex={slashMenu.activeIndex}
+                onSelect={slashMenu.select}
+                onActiveChange={slashMenu.setActiveIndex}
+              />
+            )}
+            <textarea
+              ref={textareaRef}
+              value={prompt}
+              onChange={(e) => {
+                setPrompt(e.target.value);
+                adjustTextareaHeight();
+              }}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+              }}
+              onPaste={handlePaste}
+              placeholder={t('welcome.placeholder')}
+              rows={1}
+              style={{ minHeight: '72px', maxHeight: '200px' }}
+              className="w-full resize-none bg-transparent border-none outline-none text-text-primary placeholder:text-text-muted text-base leading-relaxed overflow-hidden"
+              onKeyDown={(e) => {
+                if (slashMenu.handleKeyDown(e)) return;
+                // Enter to send, Shift+Enter for new line
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  if (e.nativeEvent.isComposing || isComposingRef.current || e.keyCode === 229) {
+                    return;
+                  }
+                  e.preventDefault();
+                  handleSubmit();
                 }
-                e.preventDefault();
-                handleSubmit();
-              }
-            }}
-          />
+              }}
+            />
+          </div>
 
           {/* Bottom Actions */}
           <div className="flex items-center justify-between pt-3 border-t border-border-muted gap-3">

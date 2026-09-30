@@ -13,6 +13,8 @@ import type {
   PluginInstallResultV2,
   PluginToggleResult,
   PluginComponentKind,
+  MarketplaceSkillApp,
+  MarketplaceSkillInstallResult,
   ScheduleTask,
   ScheduleCreateInput,
   ScheduleUpdateInput,
@@ -48,6 +50,7 @@ let ipcListener: ((event: Electron.IpcRendererEvent, data: ServerEvent) => void)
 const ALLOWED_CLIENT_EVENTS: ReadonlySet<string> = new Set<ClientEvent['type']>([
   'session.start',
   'session.continue',
+  'session.resume',
   'session.stop',
   'session.delete',
   'session.batchDelete',
@@ -257,6 +260,37 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('plugins.setComponentEnabled', pluginId, component, enabled),
     uninstall: (pluginId: string): Promise<{ success: boolean }> =>
       ipcRenderer.invoke('plugins.uninstall', pluginId),
+  },
+
+  // Company marketplace (今点通应用市场)
+  marketplace: {
+    getBaseUrl: (): Promise<string> => ipcRenderer.invoke('marketplace.getBaseUrl'),
+    listSkillApps: (): Promise<MarketplaceSkillApp[]> =>
+      ipcRenderer.invoke('marketplace.listSkillApps'),
+    getIcon: (appId: number): Promise<string | null> =>
+      ipcRenderer.invoke('marketplace.getIcon', appId),
+    installSkill: (input: {
+      appId: number;
+      packageId: number;
+      skillName?: string;
+    }): Promise<MarketplaceSkillInstallResult> =>
+      ipcRenderer.invoke('marketplace.installSkill', input),
+    submitRating: (input: {
+      appId: number;
+      score: number;
+      deviceId?: string;
+    }): Promise<{ avg_score: number; rating_count: number }> =>
+      ipcRenderer.invoke('marketplace.submitRating', input),
+    getRatingState: (): Promise<{
+      deviceId: string;
+      downloaded: Record<string, number>;
+      ratings: Record<string, number>;
+      keyFp: string;
+    }> => ipcRenderer.invoke('marketplace.getRatingState'),
+    markDownloaded: (input: { appId: number }) =>
+      ipcRenderer.invoke('marketplace.markDownloaded', input),
+    recordRating: (input: { appId: number }) =>
+      ipcRenderer.invoke('marketplace.recordRating', input),
   },
 
   // Sandbox methods
@@ -546,6 +580,29 @@ declare global {
           enabled: boolean
         ) => Promise<PluginToggleResult>;
         uninstall: (pluginId: string) => Promise<{ success: boolean }>;
+      };
+      marketplace: {
+        getBaseUrl: () => Promise<string>;
+        listSkillApps: () => Promise<MarketplaceSkillApp[]>;
+        getIcon: (appId: number) => Promise<string | null>;
+        installSkill: (input: {
+          appId: number;
+          packageId: number;
+          skillName?: string;
+        }) => Promise<MarketplaceSkillInstallResult>;
+        submitRating: (input: {
+          appId: number;
+          score: number;
+          deviceId?: string;
+        }) => Promise<{ avg_score: number; rating_count: number }>;
+        getRatingState: () => Promise<{
+          deviceId: string;
+          downloaded: Record<string, number>;
+          ratings: Record<string, number>;
+          keyFp: string;
+        }>;
+        markDownloaded: (input: { appId: number }) => Promise<unknown>;
+        recordRating: (input: { appId: number }) => Promise<unknown>;
       };
       sandbox: {
         getStatus: (forceFresh?: boolean) => Promise<{

@@ -210,10 +210,10 @@ export class LimaSync {
       const excludeArgs = SYNC_EXCLUDES.map((e) => `--exclude="${e}"`).join(' ');
 
       // Sync back to macOS (Lima mounts /Users directly)
-      // NOTE: We use --delete to ensure files deleted/moved in sandbox are also deleted locally
-      // This is important for file organization tasks where files are moved to new locations
+      // NOTE: intentionally NO --delete here — same reason as SandboxSync.syncToWindows:
+      // files created directly on the host during the turn must survive the sync.
       // Paths are single-quote escaped to prevent shell injection
-      const rsyncCmd = `rsync -av --delete ${excludeArgs} '${LimaSync.shellEscapePath(session.sandboxPath)}/' '${LimaSync.shellEscapePath(limaDestPath)}/'`;
+      const rsyncCmd = `rsync -av ${excludeArgs} '${LimaSync.shellEscapePath(session.sandboxPath)}/' '${LimaSync.shellEscapePath(limaDestPath)}/'`;
       log(`[LimaSync] Running: ${rsyncCmd}`);
 
       await this.limaExec(rsyncCmd, 300000); // 5 min timeout

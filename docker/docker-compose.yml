@@ -3,7 +3,15 @@
 # 用法:
 #   docker compose -f docker/docker-compose.yml build
 #   docker compose -f docker/docker-compose.yml run --rm build
+#   # 只重打安装包（跳过 npm install / 补丁 / Node 下载 / MCP 打包，源码未变时最省时间）:
+#   docker compose -f docker/docker-compose.yml run --rm build sh -c "npm run build:win7"
 #
+# 缓存策略（首次构建仍然慢，属正常；从第二次构建开始生效提速）:
+#   - node_modules / npm 缓存 / Electron 缓存全部走命名卷（ext4），避开 Windows
+#     bind mount（9p/drvfs）写小文件慢 10~50 倍的问题
+#   - Node.js 运行时包下载到命名卷，跨构建复用（download-node.js 通过
+#     NODE_DIST_CACHE 指向该卷）
+#   - vite/tsc 构建缓存挂到命名卷，增量构建更快
 
 services:
   build:
@@ -29,26 +37,50 @@ services:
       - baize-electron-cache:/home/builder/.cache/electron
       # electron-builder 缓存
       - baize-builder-cache:/home/builder/.cache/electron-builder
+      # Node.js 运行时缓存（download-node.js 下载的各平台 node 包）
+      - baize-node-dist-cache:/app/.node-dist-cache
+      # vite 构建缓存（renderer/main bundle 增量）
+      - baize-vite-cache:/app/node_modules/.vite-build
     environment:
       - INSIDE_DOCKER=true
       - HOME=/home/builder
       - ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
       - ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
       - WINEDEBUG=-all
+      # download-node.js 缓存目录指向命名卷，二次构建不再重新下载 node 运行时
+      - NODE_DIST_CACHE=/app/.node-dist-cache
+      # npm ci 优先：有 lockfile 时跳过依赖树解析，安装更快更稳定
+      - NPM_INSTALL_ARGS=--ignore-scripts --no-fund --no-audit --legacy-peer-deps
+      # 跳过 GPG 校验（内网环境没有 keyservers）
+      - NODEJS_CHECK_SIGNATURES=0
+      # 下载全部平台的 Node 运行时（含 win32-x64），否则 win 打包会缺 resources/node
+      - OPEN_COWORK_DOWNLOAD_ALL_NODE_BINARIES=1
+      # 只打 Windows 包时，仅下载 win32-x64（逗号分隔可多选，如 win32-x64,linux-x64）；
+      # 该变量优先级高于上面的全量开关
+      - OPEN_COWORK_DOWNLOAD_NODE_TARGETS=win32-x64,linux-x64
     command: >
       sh -c "
         echo '--- 今点通 Win7 Build Container ---' &&
-        echo 'Step 1: npm install (skip postinstall)' &&
-        npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
-        echo 'Step 2: Apply patches' &&
-        npx patch-package &&
-        echo 'Step 3: Download Node.js binaries' &&
+        if [ -f node_modules/.install-stamp ] && cmp -s package-lock.json node_modules/.install-stamp; then
+          echo 'Step 1: npm install SKIPPED (package-lock.json unchanged)';
+        else
+          echo 'Step 1: npm install (lockfile changed or first run)' &&
+          npm install --ignore-scripts --no-fund --no-audit --legacy-peer-deps &&
+          npx patch-package &&
+          cp package-lock.json node_modules/.install-stamp;
+        fi &&
+        echo 'Step 2: Download Node.js binaries (cached)' &&
         node scripts/download-node.js &&
-        echo 'Step 4: Download Windows better-sqlite3' &&
+        echo 'Step 3: Download Windows better-sqlite3' &&
         npm run prebuild:win &&
-        echo 'Step 5: Build MCP bundles' &&
+        echo 'Step 3.5: Build WSL sandbox agent' &&
+        npm run build:wsl-agent &&
+        echo 'Step 3.6: Clean stale win-unpacked leftovers (avoids EnsureEmptyDir permission errors on bind mounts)' &&
+        (rm -rf release/win-unpacked || sudo rm -rf release/win-unpacked || true) &&
+        mkdir -p release/win-unpacked &&
+        echo 'Step 4: Build MCP bundles' &&
         npm run build:mcp &&
-        echo 'Step 6: Build installer' &&
+        echo 'Step 5: Build installer' &&
         npm run build:win7 &&
         echo 'Done! Installer at release/今点通-*-win-x64.exe'
       "
@@ -59,3 +91,5 @@ volumes:
   baize-npm-prebuilds:
   baize-electron-cache:
   baize-builder-cache:
+  baize-node-dist-cache:
+  baize-vite-cache:

@@ -205,6 +205,11 @@ export interface ScheduleUpdateInput {
 export interface Skill {
   id: string;
   name: string;
+  /**
+   * 市场中文展示名（仅市场安装的 skill 有）。
+   * 显示层优先用它；内部名（英文）保持不变，供模型 Skill 工具调用。
+   */
+  displayName?: string;
   description?: string;
   type: SkillType;
   enabled: boolean;
@@ -246,6 +251,34 @@ export interface PluginCatalogItemV2 {
   catalogSource?: 'claude-marketplace';
 }
 
+/** One installable package of a company-marketplace app (server "packages[]"). */
+export interface MarketplacePackageInfo {
+  packageId: number;
+  appId: number;
+  name: string;
+  arch: string;
+  fileSize: number;
+  updatedTime: number;
+}
+
+/** Company AI platform marketplace app (server GET /api/apps?category=Skill). */
+export interface MarketplaceSkillApp {
+  appId: number;
+  name: string;
+  description: string;
+  version: string;
+  tags: string[];
+  downloadCount: number;
+  updatedTime: number;
+  /** Icon is fetched separately via marketplace.icon; false hides the img. */
+  hasIcon: boolean;
+  /** 服务端平均分（0~5，保留一位小数）；null 表示暂无评分。 */
+  avgScore: number | null;
+  /** 服务端评价次数。 */
+  ratingCount: number;
+  packages: MarketplacePackageInfo[];
+}
+
 export interface PluginCatalogItem extends PluginCatalogItemV2 {
   skillCount: number;
   hasSkills: boolean;
@@ -270,6 +303,14 @@ export interface PluginInstallResultV2 {
   plugin: InstalledPlugin;
   installedSkills: string[];
   warnings: string[];
+}
+
+/** Result of installing a skill from the company marketplace. */
+export interface MarketplaceSkillInstallResult {
+  success: boolean;
+  skillName: string;
+  appId: number;
+  packageId: number;
 }
 
 export interface PluginToggleResult {
@@ -444,6 +485,8 @@ export interface PermissionRequest {
   input: Record<string, unknown>;
   sessionId: string;
   kind?: PermissionKind;
+  /** Phase 7.1.2：来源标注（child dispatch description），无则不渲染。 */
+  source?: { label: string };
 }
 
 export type PermissionResult = 'allow' | 'deny' | 'allow_always';
@@ -491,6 +534,7 @@ export type ClientEvent =
       type: 'session.continue';
       payload: { sessionId: string; prompt: string; content?: ContentBlock[] };
     }
+  | { type: 'session.resume'; payload: { sessionId: string } }
   | { type: 'session.stop'; payload: { sessionId: string } }
   | { type: 'session.delete'; payload: { sessionId: string } }
   | { type: 'session.batchDelete'; payload: { sessionIds: string[] } }
@@ -706,6 +750,21 @@ export interface MemoryRuntimeConfig {
   promptIterationRounds?: number;
 }
 
+export type SearchEngine =
+  | 'bing-cn'
+  | 'sogou'
+  | 'chrome-mcp'
+  | 'bing-api'
+  | 'serper'
+  | 'duckduckgo'
+  | 'none';
+
+export interface SearchRuntimeConfig {
+  engine: SearchEngine;
+  apiKey?: string;
+  timeoutMs?: number;
+}
+
 export interface AppConfig {
   provider: ProviderType;
   apiKey: string;
@@ -721,10 +780,12 @@ export interface AppConfig {
   claudeCodePath?: string;
   defaultWorkdir?: string;
   globalSkillsPath?: string;
+  marketplaceBaseUrl?: string;
   theme?: AppTheme;
   sandboxEnabled?: boolean;
   memoryEnabled?: boolean;
   memoryRuntime?: MemoryRuntimeConfig;
+  searchRuntime?: SearchRuntimeConfig;
   enableThinking?: boolean;
   isConfigured: boolean;
 }

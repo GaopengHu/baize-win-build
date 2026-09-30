@@ -15,6 +15,17 @@ import { describe, expect, it } from 'vitest';
 import { extractFilePathCandidatesFromText } from '../../renderer/utils/tool-output-path';
 
 describe('extractFilePathCandidatesFromText (artifact pipeline)', () => {
+  it('captures filenames with ASCII parentheses (real-world ASR case)', () => {
+    const got = extractFilePathCandidatesFromText(
+      '• 西直门外大街136号1(1).docx — 作文后 Word 版\n' +
+      '• 西直门外大街136号1(1).txt（字数约1.5万）\n' +
+      '• 西直门外大街136号1(1).srt（字幕文件）'
+    );
+    expect(got).toContain('西直门外大街136号1(1).docx');
+    expect(got).toContain('西直门外大街136号1(1).txt');
+    expect(got).toContain('西直门外大街136号1(1).srt');
+  });
+
   it('captures full multi-segment Windows absolute path (srt)', () => {
     const abs =
       'C:\\Users\\lenovo\\AppData\\Roaming\\今点通\\default_working_dir\\asr-output\\录音-20260805-1630.srt';
@@ -37,6 +48,16 @@ describe('extractFilePathCandidatesFromText (artifact pipeline)', () => {
     const abs = 'C:\\ws\\out\\字幕.vtt';
     const got = extractFilePathCandidatesFromText(`已生成：${abs}`);
     expect(got.map((g) => g.toLowerCase())).toContain(abs.toLowerCase());
+  });
+
+  it('does not treat 文件（…） prose as a file path', () => {
+    // 正文"交付文件（已收到…，见 C:\ws\out\会议.docx）"里"文件"后面跟的是全角括号，
+    // 不是分隔符，不能误命中；真正的 docx 路径仍要被掃出来，且不带"文件"二字。
+    const got = extractFilePathCandidatesFromText(
+      '交付文件（已收到你的工作目录，见 C:\\ws\\out\\会议.docx）'
+    );
+    expect(got.map((g) => g.toLowerCase())).toContain('c:\\ws\\out\\会议.docx'.toLowerCase());
+    expect(got.some((g) => /文件/.test(g))).toBe(false);
   });
 
   it('does not capture URLs', () => {

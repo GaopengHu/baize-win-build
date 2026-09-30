@@ -35,6 +35,7 @@ files:
   - node_modules/whatwg-url/**/*
   - node_modules/tr46/**/*
   - node_modules/webidl-conversions/**/*
+  - node_modules/adm-zip/**/*
   # Exclude non-essential files from node_modules to reduce bundle size
   - '!**/*.js.map'
   - '!**/*.mjs.map'
@@ -89,13 +90,13 @@ win:
       to: skills
     - from: resources/ffmpeg
       to: ffmpeg
-    # Whisper 模型（medium ≈1.5GB）故意不打包：安装体积会从 ~230MB 涨到 ~1.5GB。
-    # 运行时若 resourcesPath/whisper-models 不存在，主进程自动回退到
-    # userData/models/whisper，asr-transcribe 技能首次转写时经 hf-mirror 下载。
-    # 需要完全离线（内网/涉密交付）时，把模型放进 resources/whisper-models/
+    # FunASR 模型（ONNX INT8 约 238MB，完整版约 2GB）故意不打包：避免安装体积暴涨。
+    # 运行时若 resourcesPath/funasr-models 不存在，主进程自动回退到
+    # userData/models/funasr，asr-transcribe 技能首次转写时经 ModelScope 下载。
+    # 需要完全离线（内网/涉密交付）时，把模型放进 resources/funasr-models/
     # 并临时恢复下面这行即可：
-    # - from: resources/whisper-models
-    #   to: whisper-models
+    # - from: resources/funasr-models
+    #   to: funasr-models
 
 mac:
   icon: resources/icon.icns

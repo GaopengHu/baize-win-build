@@ -1,4 +1,4 @@
-import { useState, memo } from 'react';
+import { useState, useEffect, useRef, memo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   ChevronDown,
@@ -17,6 +17,8 @@ interface ProcessPanelProps {
   blocks: ContentBlock[];
   traceSteps?: TraceStep[];
   message?: Message;
+  /** 有新思考/trace 活动时自动展开（默认开；用户手动折叠后不再打扰） */
+  autoOpenOnActivity?: boolean;
 }
 
 function summarizeText(text?: string): string {
@@ -113,9 +115,39 @@ export const ProcessPanel = memo(function ProcessPanel({
   blocks,
   traceSteps = [],
   message,
+  autoOpenOnActivity = true,
 }: ProcessPanelProps) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const [userToggled, setUserToggled] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  // 新内容进来时自动展开（仅当用户没手动折叠过）：streaming 期间 traceSteps /
+  // thinking 逐帧追加，但 ProcessPanel 默认是收起的，用户根本看不到"当前输出"，
+  // 还误以为外层滚轴坏了。用户手动点过一次后就尊重他的选择，不再自动改。
+  const activityKey = traceSteps.length + blocks.length;
+  const lastBlockLen =
+    blocks.length > 0
+      ? String(
+          (blocks[blocks.length - 1] as { text?: string; thinking?: string }).text ??
+            (blocks[blocks.length - 1] as { thinking?: string }).thinking ??
+            ''
+        ).length
+      : 0;
+  const lastStepLen = traceSteps.length > 0 ? getStepDetailText(traceSteps[traceSteps.length - 1]).length : 0;
+  useEffect(() => {
+    if (!autoOpenOnActivity || userToggled) return;
+    if (activityKey > 0) setExpanded(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activityKey, autoOpenOnActivity, userToggled]);
+
+  // 展开状态下新输出进来时，面板内部滚到底（外层整页滚动只到消息锚点，
+  // 面板里 pre max-h-[300px] 的独立滚轴不会动 —— 这就是"要手动拉" 的根因）。
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el || !expanded) return;
+    el.scrollTop = el.scrollHeight;
+  }, [expanded, activityKey, lastBlockLen, lastStepLen]);
 
   const thinkingBlocks = blocks.filter((block) => block.type === 'thinking');
   const textBlocks = blocks.filter((block) => block.type === 'text');
@@ -138,7 +170,10 @@ export const ProcessPanel = memo(function ProcessPanel({
   return (
     <div className="rounded-2xl border border-border-subtle bg-background/40 overflow-hidden">
       <button
-        onClick={() => setExpanded((e) => !e)}
+        onClick={() => {
+          setExpanded((e) => !e);
+          setUserToggled(true);
+        }}
         className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-surface-hover/50 transition-colors"
       >
         <Terminal className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
@@ -151,8 +186,10 @@ export const ProcessPanel = memo(function ProcessPanel({
       </button>
 
       {expanded && (
-        <div className="border-t border-border/50 px-3 py-2 space-y-1.5 animate-fade-in">
-          {blocks.map((block, index) =>
+        <div
+          ref={bodyRef}
+          className="border-t border-border/50 px-3 py-2 space-y-1.5 animate-fade-in max-h-[50vh] overflow-y-auto"
+        >  {blocks.map((block, index) =>
             block.type === 'thinking' ? (
               <ThinkingBlock
                 key={'id' in block ? (block as { id: string }).id : `thinking-block-${index}`}

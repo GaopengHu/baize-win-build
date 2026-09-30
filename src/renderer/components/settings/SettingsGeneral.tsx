@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../../store';
+import type { SearchEngine, SearchRuntimeConfig } from '../../types';
 
 const FONT_SCALE_MIN = 0.85;
 const FONT_SCALE_MAX = 1.2;
@@ -20,6 +21,30 @@ function clampFontScale(value: number): number {
 
 function formatScale(scale: number): string {
   return `${Math.round(scale * 100)}%`;
+}
+
+const SEARCH_ENGINES: SearchEngine[] = [
+  'none',
+  'bing-cn',
+  'sogou',
+  'chrome-mcp',
+  'bing-api',
+  'serper',
+  'duckduckgo',
+];
+
+const DEFAULT_SEARCH_RUNTIME: SearchRuntimeConfig = {
+  engine: 'none',
+  apiKey: '',
+  timeoutMs: 10000,
+};
+
+function cloneSearchRuntime(runtime?: SearchRuntimeConfig): SearchRuntimeConfig {
+  return {
+    engine: runtime?.engine ?? DEFAULT_SEARCH_RUNTIME.engine,
+    apiKey: runtime?.apiKey ?? '',
+    timeoutMs: runtime?.timeoutMs ?? DEFAULT_SEARCH_RUNTIME.timeoutMs,
+  };
 }
 
 export function SettingsGeneral() {
@@ -207,12 +232,95 @@ export function SettingsGeneral() {
         </div>
       </div>
 
+      <SearchEngineSection />
+
       {/* About */}
       {appVer && (
         <div className="pt-4 border-t border-border">
           <p className="text-xs text-text-muted">今点通 v{appVer}</p>
         </div>
       )}
+    </div>
+  );
+}
+/**
+ * Phase 7.1.2：搜索引擎切换（子 agent 联网检索端点）。
+ * 默认禁用（fail-closed，涉密优先）；用户显式开启后 research 子任务才可联网。
+ * 付费引擎（bing-api/serper）的 key 由企业部署预置，此处仅提供输入口。
+ */
+function SearchEngineSection() {
+  const { t } = useTranslation();
+  const appConfig = useAppStore((s) => s.appConfig);
+  const [draft, setDraft] = useState<SearchRuntimeConfig>(() =>
+    cloneSearchRuntime(appConfig?.searchRuntime)
+  );
+  const [isBusy, setIsBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDraft(cloneSearchRuntime(appConfig?.searchRuntime));
+  }, [appConfig?.searchRuntime]);
+
+  const needsKey = draft.engine === 'bing-api' || draft.engine === 'serper';
+  const dirty =
+    draft.engine !== (appConfig?.searchRuntime?.engine ?? DEFAULT_SEARCH_RUNTIME.engine) ||
+    (draft.apiKey ?? '') !== (appConfig?.searchRuntime?.apiKey ?? '') ||
+    draft.timeoutMs !== (appConfig?.searchRuntime?.timeoutMs ?? DEFAULT_SEARCH_RUNTIME.timeoutMs);
+
+  const handleSave = async () => {
+    setIsBusy(true);
+    setStatus(null);
+    try {
+      await window.electronAPI.config.save({ searchRuntime: draft });
+      setStatus(t('general.searchSaved', '搜索引擎配置已保存'));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <h4 className="text-sm font-medium text-text-primary">
+        {t('general.searchEngine', '联网检索')}
+      </h4>
+      <p className="text-xs leading-5 text-text-muted">
+        {t(
+          'general.searchEngineDesc',
+          '子 agent 联网检索的搜索引擎。默认 Bing 国内版（免费、免配置）；企业部署如需付费端点可在此填入 Key。'
+        )}
+      </p>
+      <select
+        value={draft.engine}
+        onChange={(e) => setDraft((prev) => ({ ...prev, engine: e.target.value as SearchEngine }))}
+        className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-text-primary outline-none focus:border-accent"
+      >
+        {SEARCH_ENGINES.map((engine) => (
+          <option key={engine} value={engine}>
+            {t(`general.searchEngine_${engine.replace(/-/g, '_')}`, engine)}
+          </option>
+        ))}
+      </select>
+      {needsKey && (
+        <input
+          type="password"
+          value={draft.apiKey ?? ''}
+          onChange={(e) => setDraft((prev) => ({ ...prev, apiKey: e.target.value }))}
+          placeholder={t('general.searchApiKeyPlaceholder', 'API Key（企业部署预置）')}
+          className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-text-primary outline-none focus:border-accent"
+        />
+      )}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={handleSave}
+          disabled={isBusy || !dirty}
+          className="btn btn-secondary text-sm py-2 px-4 disabled:opacity-50"
+        >
+          {t('general.save', '保存')}
+        </button>
+        {status && <span className="text-xs text-text-muted">{status}</span>}
+      </div>
     </div>
   );
 }

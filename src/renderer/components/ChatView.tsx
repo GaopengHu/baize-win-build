@@ -9,14 +9,17 @@ import {
   useActiveTurn,
   usePendingTurns,
   useActiveExecutionClock,
+  useActiveLastTurnOutcome,
   useAppConfig,
   useActiveHasMoreMessages,
   useLoadingSessionId,
 } from '../store/selectors';
 import { useAppStore } from '../store';
 import { useComposerDraft } from '../hooks/useComposerDraft';
+import { useSlashSkillMenu } from '../hooks/useSlashSkillMenu';
 import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
+import { SlashSkillMenu } from './SlashSkillMenu';
 import { ProcessPanel } from './message/ProcessPanel';
 import { ContentBlockView } from './message/ContentBlockView';
 import { buildRoundRenderPlans } from '../utils/round-render-plan';
@@ -27,6 +30,7 @@ import {
   Plus,
   Loader2,
   Plug,
+  Play,
   X,
   Clock,
   ChevronDown,
@@ -165,6 +169,14 @@ export function ChatView() {
   const pendingCount = pendingTurns.length;
   const isSessionRunning = activeSession?.status === 'running';
   const canStop = isSessionRunning || hasActiveTurn || pendingCount > 0;
+  const lastTurnOutcome = useActiveLastTurnOutcome();
+  // 暂停后且有本轮内容可续写时，显示"继续"按钮。paused 状态在用户点击
+  // 继续或发起新提问时自然结束（新一轮 running 会清掉 outcome）。
+  const canResume =
+    !canStop &&
+    lastTurnOutcome !== null &&
+    messages.length > 0 &&
+    messages[messages.length - 1]?.role === 'assistant';
 
   const loadMoreMessages = useCallback(async () => {
     if (!activeSessionId || loadingMoreRef.current || !hasMoreMessages || !isElectron) return;
@@ -514,6 +526,16 @@ export function ChatView() {
     },
     [activeSessionId]
   );
+
+  // "/" 斜杠技能选择器：单实例服务 welcome / 主聊天两个 textarea
+  // （二者共享 prompt state / textareaRef / isComposingRef，同时只挂载一个）。
+  // 经 handlePromptChange 保留 memory-prefetch 行为。
+  const slashMenu = useSlashSkillMenu({
+    prompt,
+    setPrompt: handlePromptChange,
+    textareaRef,
+    isComposingRef,
+  });
 
   useEffect(() => {
     return () => {
@@ -877,6 +899,8 @@ export function ChatView() {
 
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    // 提交即收起斜杠菜单（prompt 清空后派生状态也会关闭，这里是双保险）
+    slashMenu.close();
 
     // Get value from ref to handle both controlled and uncontrolled cases
     const currentPrompt = textareaRef.current?.value || prompt;
@@ -987,6 +1011,18 @@ export function ChatView() {
     }
   };
 
+  const handleResume = useCallback(async () => {
+    if (!activeSessionId || canStop || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      // 无痕续写：不产生用户气泡，主进程直接用上一轮上下文继续生成，
+      // 历史里已落库的半截回复会被自动带上，模型从断点往下写。
+      await continueSession(activeSessionId, ' ', { silentUserMessage: true });
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [activeSessionId, canStop, isSubmitting, continueSession]);
+
   if (!activeSession) {
     return (
       <div className="flex-1 flex items-center justify-center bg-background px-5">
@@ -1066,6 +1102,16 @@ export function ChatView() {
                     <Plus className="w-5 h-5" />
                   </button>
 
+                  {/* "/" 斜杠技能选择器（向上弹出，容器已 relative） */}
+                  {slashMenu.open && (
+                    <SlashSkillMenu
+                      items={slashMenu.items}
+                      activeIndex={slashMenu.activeIndex}
+                      onSelect={slashMenu.select}
+                      onActiveChange={slashMenu.setActiveIndex}
+                    />
+                  )}
+
                   <textarea
                     ref={textareaRef}
                     value={prompt}
@@ -1079,6 +1125,7 @@ export function ChatView() {
                     }}
                     onPaste={handlePaste}
                     onKeyDown={(e) => {
+                      if (slashMenu.handleKeyDown(e)) return;
                       if (e.key === 'Enter' && !e.shiftKey) {
                         if (e.nativeEvent.isComposing || isComposingRef.current) return;
                         e.preventDefault();
@@ -1473,6 +1520,16 @@ export function ChatView() {
                 <Plus className="w-5 h-5" />
               </button>
 
+              {/* "/" 斜杠技能选择器（向上弹出，容器已 relative） */}
+              {slashMenu.open && (
+                <SlashSkillMenu
+                  items={slashMenu.items}
+                  activeIndex={slashMenu.activeIndex}
+                  onSelect={slashMenu.select}
+                  onActiveChange={slashMenu.setActiveIndex}
+                />
+              )}
+
               <textarea
                 ref={textareaRef}
                 value={prompt}
@@ -1486,6 +1543,7 @@ export function ChatView() {
                 }}
                 onPaste={handlePaste}
                 onKeyDown={(e) => {
+                  if (slashMenu.handleKeyDown(e)) return;
                   // Enter to send, Shift+Enter for new line
                   if (e.key === 'Enter' && !e.shiftKey) {
                     if (e.nativeEvent.isComposing || isComposingRef.current) {
@@ -1564,6 +1622,16 @@ export function ChatView() {
                     title={t('chat.stop')}
                   >
                     <Square className="w-4 h-4" />
+                  </button>
+                )}
+                {canResume && (
+                  <button
+                    type="button"
+                    onClick={handleResume}
+                    className="w-9 h-9 rounded-2xl flex items-center justify-center bg-success/10 text-success hover:bg-success/20 transition-colors"
+                    title={t('chat.resume')}
+                  >
+                    <Play className="w-4 h-4" />
                   </button>
                 )}
                 <button

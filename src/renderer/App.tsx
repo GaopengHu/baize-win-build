@@ -92,6 +92,24 @@ function App() {
 
     if (isElectron) {
       listSessions();
+
+      // Preload heavy markdown rendering chunk when idle to speed up first
+      // history session click. This chunk contains react-markdown, remark-gfm,
+      // remark-math, rehype-sanitize, and rehype-katex.
+      if ('requestIdleCallback' in window) {
+        (
+          window as Window & { requestIdleCallback: (cb: () => void) => number }
+        ).requestIdleCallback(() => {
+          import('./components/MessageMarkdown').catch(() => {
+            // Ignore preload failures - chunk will still load on demand
+          });
+        });
+      } else {
+        // Fallback: preload after 3 seconds
+        setTimeout(() => {
+          import('./components/MessageMarkdown').catch(() => {});
+        }, 3000);
+      }
     }
   }, []); // Empty deps - run once
 
