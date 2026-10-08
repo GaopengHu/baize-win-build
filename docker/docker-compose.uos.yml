@@ -39,6 +39,8 @@ services:
       - ~/.cache/electron-builder:/home/builder/.cache/electron-builder
       # vite 构建缓存（renderer/main bundle 增量）
       - zhinengti-uos-vite-cache:/app/node_modules/.vite-build
+      # node headers 缓存（cross-compile-better-sqlite3.mjs --nodedir 用，跨构建复用）
+      - zhinengti-uos-node-gyp-cache:/home/builder/.cache/node-gyp
     environment:
       - INSIDE_DOCKER=true
       # root 运行时 HOME 默认 /root，指向 /home/builder 才能命中缓存卷
@@ -71,9 +73,7 @@ services:
         fi &&
         if [ \"$$NEED_REBUILD\" = \"1\" ] || [ \"$$FORCE_REBUILD\" = \"1\" ]; then
           echo 'Rebuilding better-sqlite3' &&
-          cd /app/node_modules/better-sqlite3 &&
-          npx node-gyp rebuild --runtime=electron --target=22.3.27 --arch=x64 --disturl=$${ELECTRON_MIRROR:-https://npmmirror.com/mirrors/electron/} &&
-          cd /app;
+          node scripts/cross-compile-better-sqlite3.mjs --arch=x64;
         fi &&
         echo 'Step 5: Build .deb' &&
         node scripts/build-linux-deb.mjs
@@ -83,4 +83,5 @@ volumes:
   zhinengti-uos-node-modules:
   zhinengti-uos-node-resources:
   zhinengti-uos-vite-cache:
+  zhinengti-uos-node-gyp-cache:
 

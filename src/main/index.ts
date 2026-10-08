@@ -72,7 +72,7 @@ import {
   buildScheduledTaskFallbackTitle,
   buildScheduledTaskTitle,
 } from '../shared/schedule/task-title';
-import { CompanyMarketplaceService } from './skills/company-marketplace-service';
+import { CompanyMarketplaceService, toMarketplaceAuthToken } from './skills/company-marketplace-service';
 import { MarketplaceRatingStore } from './skills/marketplace-rating-store';
 import { createHash } from 'node:crypto';
 import {
@@ -2071,7 +2071,8 @@ function getMarketplaceService(): CompanyMarketplaceService {
  */
 function getMarketplaceAuthToken(): string {
   try {
-    return configStore.getAll().apiKey?.trim() || '';
+    // 服务端只认 sk- 开头且本体不含 - 的令牌，其余直接匿名（见 toMarketplaceAuthToken）
+    return toMarketplaceAuthToken(configStore.getAll().apiKey);
   } catch (error) {
     logWarn('[Marketplace] Failed to read active apiKey:', error);
     return '';
