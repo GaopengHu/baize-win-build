@@ -95,6 +95,7 @@ import {
   setDevLogsEnabled,
   isDevLogsEnabled,
 } from './utils/logger';
+import { listRecentWorkspaceFiles } from './utils/recent-workspace-files';
 import { buildDiagnosticsSummary } from './utils/diagnostics-summary';
 
 // Current working directory (persisted between sessions)
@@ -1516,21 +1517,24 @@ ipcMain.handle('shell.saveFileToDownloads', async (_event, filePath: string, cwd
   return saveFileToDownloads(filePath, cwd);
 });
 
+ipcMain.handle(
+  'artifacts.listRecentFiles',
+  async (_event, cwd: string, sinceMs: number, limit: number = 50) => {
+    if (!cwd || !isAbsolute(cwd)) {
+      return [];
+    }
+    return listRecentWorkspaceFiles(cwd, sinceMs, limit);
+  }
+);
+
 ipcMain.handle('artifacts.checkPaths', async (_event, paths: string[], cwd?: string) => {
   if (!Array.isArray(paths) || paths.length === 0) {
     return [];
   }
 
-  // Return a boolean array aligned 1:1 with the input so the renderer can
-  // match by index. The previous `string[]` of existing paths forced the
-  // renderer to do a set lookup against its own (potentially differently
-  // normalised) candidates, which silently dropped entries when the main
-  // process' `path.resolve()` produced a different separator / case than the
-  // renderer's `resolvePathAgainstWorkspace` (Windows: `\` vs `/`,
-  // `C:` vs `c:`).
-  const checks = paths.map(async (raw): Promise<boolean> => {
+  const checks = paths.map(async (raw): Promise<string | null> => {
     if (typeof raw !== 'string' || !raw.trim()) {
-      return false;
+      return null;
     }
     // 与 revealFileInFolder 同一套归一化（嵌套默认目录回收 + /workspace 映射）。
     const normalized = resolveArtifactCandidate(raw, cwd);
@@ -1540,14 +1544,15 @@ ipcMain.handle('artifacts.checkPaths', async (_event, paths: string[], cwd?: str
       // synchronous variant blocked the main event loop (shared with token
       // streaming) once per path.
       const stat = await fs.promises.stat(normalized);
-      return stat.isFile();
+      return stat.isFile() ? normalized : null;
     } catch {
       // Path does not exist — not a deliverable, skip.
-      return false;
+      return null;
     }
   });
 
-  return Promise.all(checks);
+  const results = await Promise.all(checks);
+  return results.filter((p): p is string => p !== null);
 });
 
 ipcMain.handle('dialog.selectFiles', async () => {
@@ -2162,8 +2167,10 @@ ipcMain.handle('marketplace.getIcon', async (_event, appId: number) => {
 });
 
 ipcMain.handle(
-  'marketplace.installSkill',
-  async (_event, input: { appId: number; packageId: number; skillName?: string }) => {
+  'marketplace.installSkill',  async (
+    _event,
+    input: { appId: number; packageId: number; skillName?: string }
+  ) => {
     try {
       if (!pluginRuntimeService) {
         throw new Error('PluginRuntimeService not initialized');
@@ -2225,7 +2232,10 @@ ipcMain.handle('marketplace.markDownloaded', (_event, input: { appId: number }) 
 
 ipcMain.handle('marketplace.recordRating', (_event, input: { appId: number }) => {
   try {
-    return getMarketplaceRatingStore().recordRating(Number(input?.appId), getApiKeyFingerprint());
+    return getMarketplaceRatingStore().recordRating(
+      Number(input?.appId),
+      getApiKeyFingerprint()
+    );
   } catch (error) {
     logError('[Marketplace] Error recording rating:', error);
     throw error;

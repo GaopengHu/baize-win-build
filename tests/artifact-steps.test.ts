@@ -274,7 +274,7 @@ describe('getArtifactSteps', () => {
     expect(displayArtifactSteps).toHaveLength(0);
   });
 
-  it('excludes Bash tool from file steps when only the stdout mentions a path', () => {
+  it('excludes Bash tool from file steps (relies on recent-files fallback)', () => {
     const steps: TraceStep[] = [
       {
         id: 'call_bash_create',
@@ -300,63 +300,9 @@ describe('getArtifactSteps', () => {
 
     const { fileSteps, displayArtifactSteps } = getArtifactSteps(steps);
 
-    // Neither Bash step exposes a redirect target in toolInput, and stdout
-    // mentions are too noisy to act on. Such Bash steps simply don't claim
-    // a file — earlier we leaned on a CWD mtime scan, but that leaks
-    // session-external files into the panel.
+    // Bash outputs are unpredictable — file display relies on recent-files scan
     expect(fileSteps).toHaveLength(0);
     expect(displayArtifactSteps).toHaveLength(0);
-  });
-
-  it('captures Bash redirect targets in toolInput as file steps', () => {
-    const steps: TraceStep[] = [
-      {
-        id: 'bash_redirect',
-        type: 'tool_call',
-        status: 'completed',
-        title: 'Bash',
-        toolName: 'Bash',
-        toolInput: { command: 'python3 gen.py > /tmp/report.html' },
-        toolOutput: '',
-        timestamp: Date.now(),
-      },
-    ];
-
-    const { fileSteps, displayArtifactSteps } = getArtifactSteps(steps);
-
-    expect(fileSteps).toHaveLength(1);
-    expect(displayArtifactSteps).toHaveLength(1);
-    expect(fileSteps[0].toolName).toBe('Bash');
-    expect(displayArtifactSteps[0].id).toBe('bash_redirect');
-  });
-
-  it('captures bash `tee` and `>>` append targets as file steps', () => {
-    const steps: TraceStep[] = [
-      {
-        id: 'bash_tee',
-        type: 'tool_call',
-        status: 'completed',
-        title: 'Bash',
-        toolName: 'Bash',
-        toolInput: { command: 'echo "data" | tee -a /tmp/log.txt' },
-        timestamp: Date.now(),
-      },
-      {
-        id: 'bash_append',
-        type: 'tool_call',
-        status: 'completed',
-        title: 'Bash',
-        toolName: 'bash',
-        toolInput: { command: 'cat /etc/hosts >> /tmp/hosts.txt' },
-        timestamp: Date.now(),
-      },
-    ];
-
-    const { fileSteps } = getArtifactSteps(steps);
-
-    const paths = fileSteps.map((s) => s.id);
-    expect(paths).toContain('bash_tee');
-    expect(paths).toContain('bash_append');
   });
 
   it('formats label from full path', () => {
@@ -372,8 +318,6 @@ describe('getArtifactSteps', () => {
   });
 
   it('prefers basename over translated name', () => {
-    expect(getArtifactLabel('/Users/haoqing/tmp/simple.pptx', '简单PPT演示文稿')).toBe(
-      'simple.pptx'
-    );
+    expect(getArtifactLabel('/Users/haoqing/tmp/simple.pptx', '简单PPT演示文稿')).toBe('simple.pptx');
   });
 });
