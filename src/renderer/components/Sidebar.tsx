@@ -274,7 +274,7 @@ export function Sidebar() {
         try {
           const [messagesResult, traceStepsResult] = await Promise.all([
             needMessages
-              ? getSessionMessagesPaginated(sessionId, 50, 0).catch((error) => {
+              ? getSessionMessagesPaginated(sessionId, 200, 0).catch((error) => {
                   console.error('[Sidebar] Failed to load messages:', error);
                   return null;
                 })

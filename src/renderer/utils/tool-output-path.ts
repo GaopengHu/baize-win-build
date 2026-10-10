@@ -23,12 +23,26 @@ export function normalizeArtifactPathValue(value: string): string {
   if (/^file:\/\//i.test(decoded)) {
     decoded = localPathFromFileUrl(decoded) ?? decoded;
   }
-  return decodeCjkPercentEncoding(decoded)
+  decoded = decodeCjkPercentEncoding(decoded)
     .replace(/^[\s>*\-•`"']+/, '')
-    .replace(/^[\[](.+)[\]]$/, '$1')
+    // ASCII wrappers
+    .replace(/^\[(.+)\]$/, '$1')
     .replace(/^\((.+)\)$/, '$1')
     .replace(/^\*\*(.+)\*\*$/, '$1')
+    // Full-width paired wrappers commonly used around Chinese filenames
+    // (《报告》,【要点】,（文件）,「内文」,『引用』). Strip when they wrap
+    // the entire value so the inner filename becomes the candidate.
+    .replace(/^《(.+)》$/, '$1')
+    .replace(/^【(.+)】$/, '$1')
+    .replace(/^（(.+)）$/, '$1')
+    .replace(/^「(.+)」$/, '$1')
+    .replace(/^『(.+)』$/, '$1')
+    .replace(/^〈(.+)〉$/, '$1')
+    .replace(/^〔(.+)〕$/, '$1')
+    .replace(/^〖(.+)〗$/, '$1')
+    .replace(/^［(.+)］$/, '$1')
     .replace(/[.,;:!?]+$/, '');
+  return decoded;
 }
 
 /**
@@ -47,7 +61,21 @@ function isInsideUrlToken(text: string, matchIndex: number, matchLength: number)
   if (schemeIdx === -1) {
     return false;
   }
-  const boundaryChars = [' ', '\n', '\r', '\t', '，', '。', '、', '；', '：', '（', '）', '【', '】'];
+  const boundaryChars = [
+    ' ',
+    '\n',
+    '\r',
+    '\t',
+    '，',
+    '。',
+    '、',
+    '；',
+    '：',
+    '（',
+    '）',
+    '【',
+    '】',
+  ];
   let lastBoundary = -1;
   for (const ch of boundaryChars) {
     const idx = before.lastIndexOf(ch);
@@ -126,9 +154,7 @@ export function extractFilePathCandidatesFromText(text: string): string[] {
   // file:// URLs are decoded to plain paths FIRST so downstream consumers
   // always see real filenames (never `…%E8%A5%BF…`). URLs on remote schemes
   // (https://host/README.md) are skipped by isInsideUrlToken.
-  const decodedForScan = /file:\/\//i.test(trimmed)
-    ? decodeCjkPercentEncoding(trimmed)
-    : trimmed;
+  const decodedForScan = /file:\/\//i.test(trimmed) ? decodeCjkPercentEncoding(trimmed) : trimmed;
   // Captures: optional root (drive letter or POSIX leading slash) + chained path
   // segments + filename with known extension. Each segment consumes its OWN
   // trailing separator so multi-segment paths match in full — the previous
@@ -141,7 +167,8 @@ export function extractFilePathCandidatesFromText(text: string): string[] {
   // merely wraps a path in outer parens ("(C:\out\a.docx)") is unwrapped by
   // normalizeArtifactPathValue, so including them nets far more true positives
   // than false ones.
-  const pathLikeRegex = /(?:[A-Za-z]:[\\/]|\/)?(?:[\w\u4e00-\u9fff.\-_()\[\]]+[\\/])*[\w\u4e00-\u9fff.\-_()\[\]]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz)/giu;
+  const pathLikeRegex =
+    /(?:[A-Za-z]:[\\/]|\/)?(?:[\]\w\u4e00-\u9fff.\-_()《》〈〉「」『』【】〔〕〖〗（）［］]+[\\/])*[\]\w\u4e00-\u9fff.\-_()《》〈〉「」『』【】〔〕〖〗（）［］]+\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|html?|json|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz)/giu;
   for (const found of decodedForScan.matchAll(pathLikeRegex)) {
     const index = typeof found.index === 'number' ? found.index : -1;
     // Skip matches that live inside a URL token (e.g. https://host/README.md),
@@ -158,9 +185,7 @@ export function extractFilePathCandidatesFromText(text: string): string[] {
   return Array.from(candidates);
 }
 
-export function extractFilePathFromToolInput(
-  toolInput?: Record<string, unknown>
-): string | null {
+export function extractFilePathFromToolInput(toolInput?: Record<string, unknown>): string | null {
   if (!toolInput || typeof toolInput !== 'object') {
     return null;
   }
@@ -177,21 +202,24 @@ export function extractFilePathFromToolInput(
 }
 
 function extractFilePathFromText(text: string): string | null {
-  const match = text.match(/File (?:written|edited):\s*(.+)$/i)
-    || text.match(/File created successfully at:?\s*(.+)$/i)
-    || text.match(/Successfully wrote \d+ bytes to ([^\r\n]+)/i)
-    || text.match(/The file (.+?) has been updated(?: successfully)?(?:\.|$)/i)
-    || text.match(/Saved screenshot to ([^\r\n]+)/i)
+  const match =
+    text.match(/File (?:written|edited):\s*(.+)$/i) ||
+    text.match(/File created successfully at:?\s*(.+)$/i) ||
+    text.match(/Successfully wrote \d+ bytes to ([^\r\n]+)/i) ||
+    text.match(/The file (.+?) has been updated(?: successfully)?(?:\.|$)/i) ||
+    text.match(/Saved screenshot to ([^\r\n]+)/i) ||
     // Chinese patterns: 文件已生成/已创建/已保存/已写入/路径
     // NOTE: 分隔符只认 [:：] 和空白，不认括号 —— 正文里
     // "交付文件（已收到…）" 这种“文件（…”不能误命中。路径必须紧跟分隔符。
-    || text.match(/(?:已生成|已创建|已保存|已写入|已导出|保存到|生成到|输出到|写入到|创建到)\s*[:：]?\s*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i)
-    || text.match(/(?:文件|报告|文档|演示文稿|表格|幻灯片)\s*[:：]\s*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i);
+    text.match(
+      /(?:已生成|已创建|已保存|已写入|已导出|保存到|生成到|输出到|写入到|创建到)\s*[:：]?\s*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|html?|json|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i
+    ) ||
+    text.match(
+      /(?:文件|报告|文档|演示文稿|表格|幻灯片)\s*[:：]\s*(.+?\.(?:docx?|pptx?|xlsx?|pdf|txt|md|markdown|rtf|odt|ods|odp|srt|vtt|html?|json|png|jpe?g|gif|webp|svg|mp3|wav|m4a|ogg|mp4|mov|mkv|webm|zip|rar|7z|tar|gz))/i
+    );
   if (!match || !match[1]) {
     return null;
   }
 
   return normalizeArtifactPathValue(match[1]);
 }
-
-

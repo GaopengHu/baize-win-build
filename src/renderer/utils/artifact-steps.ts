@@ -5,6 +5,7 @@ import {
   extractFilePathFromToolOutput,
   normalizeArtifactPathValue,
 } from './tool-output-path';
+import { pathToConsumedKey, stepProducesPaths } from '../../shared/consumed-paths';
 
 const FILE_TOOL_NAMES = new Set([
   'write_file',
@@ -20,15 +21,46 @@ const FILE_TOOL_NAMES = new Set([
 
 const FORMAT_KEYWORD_MAP: Array<{ keywords: string[]; extensions: string[] }> = [
   {
-    keywords: ['pptx', '.ppt', 'powerpoint', '幻灯片', '演示文稿', 'ppt格式', 'ppt报告', '转成ppt', '转为ppt', '生成ppt'],
+    keywords: [
+      'pptx',
+      '.ppt',
+      'powerpoint',
+      '幻灯片',
+      '演示文稿',
+      'ppt格式',
+      'ppt报告',
+      '转成ppt',
+      '转为ppt',
+      '生成ppt',
+    ],
     extensions: ['ppt', 'pptx'],
   },
   {
-    keywords: ['docx', '.doc', 'word文档', 'word格式', 'word报告', '转成word', '转为word', '生成word', 'word文件'],
+    keywords: [
+      'docx',
+      '.doc',
+      'word文档',
+      'word格式',
+      'word报告',
+      '转成word',
+      '转为word',
+      '生成word',
+      'word文件',
+    ],
     extensions: ['doc', 'docx'],
   },
   {
-    keywords: ['xlsx', '.xls', 'excel', '电子表格', 'spreadsheet', 'excel格式', '转成excel', '转为excel', '生成excel'],
+    keywords: [
+      'xlsx',
+      '.xls',
+      'excel',
+      '电子表格',
+      'spreadsheet',
+      'excel格式',
+      '转成excel',
+      '转为excel',
+      '生成excel',
+    ],
     extensions: ['xls', 'xlsx', 'csv'],
   },
   {
@@ -36,8 +68,44 @@ const FORMAT_KEYWORD_MAP: Array<{ keywords: string[]; extensions: string[] }> = 
     extensions: ['pdf'],
   },
   {
-    keywords: ['.html', '.htm', 'html格式', '网页', 'web page', 'webpage', '转成html', '转为html', '生成html'],
+    keywords: [
+      '.html',
+      '.htm',
+      'html格式',
+      'html 文件',
+      'html文件',
+      'html 报告',
+      'html报告',
+      'html 页面',
+      'html页面',
+      '网页',
+      'web page',
+      'webpage',
+      '转成html',
+      '转为html',
+      '生成html',
+      '生成 html',
+      '导出 html',
+      '输出 html',
+      '做成html',
+      '做成 html',
+    ],
     extensions: ['html', 'htm'],
+  },
+  {
+    keywords: [
+      'json',
+      'json格式',
+      '导出json',
+      '保存为json',
+      '转成json',
+      '生成json',
+      'json文件',
+      'json数据',
+      'json报告',
+      '.json',
+    ],
+    extensions: ['json'],
   },
   {
     keywords: ['.txt', 'txt格式', '纯文本', 'text file', '转成txt', '转为txt', '生成txt'],
@@ -48,7 +116,16 @@ const FORMAT_KEYWORD_MAP: Array<{ keywords: string[]; extensions: string[] }> = 
     extensions: ['md', 'markdown'],
   },
   {
-    keywords: ['png格式', 'jpg格式', 'jpeg格式', '图片格式', '转成png', '转成jpg', '生成图片', 'image format'],
+    keywords: [
+      'png格式',
+      'jpg格式',
+      'jpeg格式',
+      '图片格式',
+      '转成png',
+      '转成jpg',
+      '生成图片',
+      'image format',
+    ],
     extensions: ['png', 'jpg', 'jpeg'],
   },
   {
@@ -71,10 +148,12 @@ export function extractRequestedFormats(messages: Message[]): Set<string> {
     if (msg.role !== 'user') continue;
     const text = getMessageText(msg);
     if (!text) continue;
-    const lower = text.toLowerCase();
+    // Collapse runs of whitespace so a keyword like `html 报告` matches the
+    // user text "生成 html  报告" (double space, e.g. across punctuation).
+    const lower = text.toLowerCase().replace(/\s+/g, ' ');
     for (const entry of FORMAT_KEYWORD_MAP) {
       for (const kw of entry.keywords) {
-        if (lower.includes(kw.toLowerCase())) {
+        if (lower.includes(kw.toLowerCase().replace(/\s+/g, ' '))) {
           for (const ext of entry.extensions) {
             result.add(ext);
           }
@@ -147,6 +226,9 @@ const FINAL_DELIVERABLE_EXTENSIONS = new Set([
   'odp',
   'srt',
   'vtt',
+  'html',
+  'htm',
+  'json',
   'png',
   'jpg',
   'jpeg',
@@ -169,12 +251,17 @@ const FINAL_DELIVERABLE_EXTENSIONS = new Set([
 ]);
 
 // Patterns that indicate an automated/intermediate image (screenshots, renders, etc.).
-const SIDECAR_IMAGE_STEM_PREFIX = /^(slide|slides|chart|preview|tmp|temp|render|page|sheet|screenshot|screen|capture|snap)[-_\d]/i;
-const SIDECAR_IMAGE_STEM_SEGMENT = /(?:^|[-_])(slide|chart|preview|render|draft|temp|tmp|index|screenshot|screen|capture)(?:$|[-_])/i;
+const SIDECAR_IMAGE_STEM_PREFIX =
+  /^(slide|slides|chart|preview|tmp|temp|render|page|sheet|screenshot|screen|capture|snap)[-_\d]/i;
+const SIDECAR_IMAGE_STEM_SEGMENT =
+  /(?:^|[-_])(slide|chart|preview|render|draft|temp|tmp|index|screenshot|screen|capture)(?:$|[-_])/i;
 // Directories that are never deliverable output.
 const TEMP_PATH_PATTERNS = [
-  /(?:^|[/\\])tmp[/\\]/i,
-  /(?:^|[/\\])\.tmp[/\\]/i,   // .tmp/ — session-manager copies attachments here
+  // Only match the hidden `.tmp/` directory used internally by session-manager
+  // (where attachments are copied). A bare `tmp[/\]/` regex was here before
+  // and inadvertently killed every artefact under Linux's system `/tmp/`,
+  // e.g. `/tmp/report.html` written by `python3 gen.py > /tmp/report.html`.
+  /(?:^|[/\\])\.tmp[/\\]/i,
   /(?:^|[/\\])temp[/\\]/i,
   /AppData[/\\]Local[/\\]Temp/i,
   /node_modules[/\\]/i,
@@ -183,7 +270,7 @@ const TEMP_PATH_PATTERNS = [
   /\.cowork-user-data[/\\]/i,
 ];
 
-function isLikelySidecarArtifact(pathValue: string): boolean {
+function isLikelySidecarArtifact(pathValue: string, requestedFormats?: Set<string>): boolean {
   const ext = getFileExtension(pathValue);
   const stem = getFileStem(pathValue).toLowerCase();
   const normalized = pathValue.trim().replace(/\\/g, '/');
@@ -194,16 +281,20 @@ function isLikelySidecarArtifact(pathValue: string): boolean {
     return true;
   }
 
-  // Intermediate render files (html previews for slides/charts).
+  // Intermediate render files (html previews for slides/charts). When the
+  // user explicitly asked for the format, bypass the stem heuristic so a
+  // genuine `index.html` / `chart.html` deliverable still shows. Temp-dir
+  // matches (above) and the consumption gate (separate layer) still apply.
   if (ext === 'html' || ext === 'htm') {
-    return SIDECAR_IMAGE_STEM_PREFIX.test(stem)
-      || SIDECAR_IMAGE_STEM_SEGMENT.test(stem);
+    if (requestedFormats?.has('html') || requestedFormats?.has('htm')) {
+      return false;
+    }
+    return SIDECAR_IMAGE_STEM_PREFIX.test(stem) || SIDECAR_IMAGE_STEM_SEGMENT.test(stem);
   }
 
   // Automated screenshots / render outputs for images.
   if (ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'svg' || ext === 'webp') {
-    return SIDECAR_IMAGE_STEM_PREFIX.test(stem)
-      || SIDECAR_IMAGE_STEM_SEGMENT.test(stem);
+    return SIDECAR_IMAGE_STEM_PREFIX.test(stem) || SIDECAR_IMAGE_STEM_SEGMENT.test(stem);
   }
 
   return false;
@@ -212,8 +303,23 @@ function isLikelySidecarArtifact(pathValue: string): boolean {
 // Keep only final deliverables, but do not collapse different file extensions.
 // Example: .docx and .pptx should both remain visible if both exist.
 
+export type ShouldDisplayOptions = {
+  /** Formats the user explicitly requested (L4 intent gate). Bypasses
+   *  the html/htm sidecar stem heuristic when the user named that format. */
+  requestedFormats?: Set<string>;
+  /** Files already consumed by a later step (L2 consumption gate).
+   *  Membership keys are produced by `pathToConsumedKey`. */
+  consumedPaths?: Set<string>;
+  /** Skip the sidecar / temp stem heuristic entirely. Used for candidates
+   *  that come from a real file tool (Write/Edit/...) so an explicit
+   *  screenshot file produced by a `screenshot` tool isn't suppressed. */
+  bypassSidecar?: boolean;
+};
 
-export function shouldDisplayArtifactPath(pathValue: string): boolean {
+export function shouldDisplayArtifactPath(
+  pathValue: string,
+  options?: ShouldDisplayOptions
+): boolean {
   // Candidates may arrive as file:// URLs or percent-encoded mojibake —
   // normalize so the panel sees real filenames.
   const normalizedValue = normalizeArtifactPathValue(pathValue).trim();
@@ -235,8 +341,13 @@ export function shouldDisplayArtifactPath(pathValue: string): boolean {
   }
 
   // Filenames that contain CJK punctuation are almost certainly false
-  // positives from text scanning (e.g. "总结。docx").
-  if (/[\u3000-\u303f]/.test(trimmed)) {
+  // positives from text scanning (e.g. "总结。docx"). We allow the paired
+  // brackets commonly used in Chinese document titles (《》〈〉「」『』
+  // 【】〔〕〖〗（）［］) — these are legitimate filename characters, not
+  // sentence punctuation. Sentence punctuation (。！？；：，、…) and the
+  // ideographic space (U+3000) still kill the candidate.
+  const withoutAllowedBrackets = trimmed.replace(/[《》〈〉「」『』【】〔〕〖〗（）［］]/g, '');
+  if (/[\u3000-\u303f]/.test(withoutAllowedBrackets)) {
     return false;
   }
 
@@ -246,24 +357,20 @@ export function shouldDisplayArtifactPath(pathValue: string): boolean {
     return false;
   }
 
-  if (isLikelySidecarArtifact(trimmed)) {
+  // L2 consumption gate: file referenced by a later step → intermediate.
+  if (options?.consumedPaths) {
+    const key = pathToConsumedKey(trimmed);
+    if (options.consumedPaths.has(key)) {
+      return false;
+    }
+  }
+
+  // L3 sidecar / temp gate (with L4 intent bypass for html/htm).
+  if (!options?.bypassSidecar && isLikelySidecarArtifact(trimmed, options?.requestedFormats)) {
     return false;
   }
 
   return true;
-}
-
-/**
- * Given all artifact candidates, return only the ones that should appear in
- * the right-side artifacts panel. Intermediate files (html, json, png, etc.)
- * are filtered out; all deliverable files (docx, pptx, xlsx, pdf, etc.) pass through.
- */
-export function filterPrimaryArtifacts(
-  paths: string[],
-  _requestedFormats?: Set<string>
-): string[] {
-  // Remove obviously invalid paths (non-deliverable extensions, sidecars, etc.)
-  return paths.filter((p) => shouldDisplayArtifactPath(p));
 }
 
 type ArtifactStepResult = {
@@ -423,46 +530,74 @@ function buildArtifactCandidateMap(
       return;
     }
 
-    if (!candidateMap.has(key)) {
+    const existing = candidateMap.get(key);
+    if (!existing) {
+      candidateMap.set(key, { path: key, source, step });
+      return;
+    }
+    // File-tool candidates (Write/Edit/NotebookEdit etc.) own the path —
+    // they were the actual file operations. Don't let a later text scan
+    // from an `artifact` step or an assistant message overwrite the owning
+    // step, or the panel would show the wrong step / drop the real one
+    // when deduping by path in `getArtifactSteps`.
+    if (existing.source === 'step' && source === 'text') {
+      return;
+    }
+    if (existing.source === 'text' && source === 'step') {
       candidateMap.set(key, { path: key, source, step });
     }
   };
 
+  // Round 1: precise paths extracted from toolInput. The `artifact` tool is
+  // excluded entirely here — its payload is declarative text and is handled
+  // by the Round 2 text scan, which must stay the sole owner of any path
+  // the artifact step surfaces.
   for (const step of steps) {
-    if (step.status !== 'completed') {
-      continue;
+    if (step.status !== 'completed') continue;
+    if (step.toolName === 'artifact') continue; // artifact is text-only (Round 2)
+
+    // (a) Produced paths straight from toolInput via `stepProducesPaths`:
+    // file-tool `path` fields, and — crucially — bash redirect targets
+    // (`python3 gen.py > report.html`). A redirect target appears nowhere
+    // else: not in toolOutput, and Bash is not a reliable-path tool, so
+    // (b) can never see it. File-tool paths land here too but the
+    // candidate-map key dedupes them against (b)'s extraction.
+    for (const p of stepProducesPaths(step)) {
+      addCandidate(p, 'step', step);
     }
+
+    // (b) Reliable file-tool paths from toolInput / toolOutput.
+    if (!isReliablePathToolName(step.toolName)) continue;
 
     const pathFromOutput = extractFilePathFromToolOutput(step.toolOutput);
     const pathFromInput = extractFilePathFromToolInput(step.toolInput);
-
-    if (isReliablePathToolName(step.toolName)) {
-      if (pathFromOutput) {
-        addCandidate(pathFromOutput, 'step', step);
-      }
-      if (pathFromInput) {
-        addCandidate(pathFromInput, 'step', step);
-      }
+    if (pathFromOutput) {
+      addCandidate(pathFromOutput, 'step', step);
     }
-
-    if (step.toolName === 'artifact' && step.toolOutput) {
-      for (const candidate of extractFilePathCandidatesFromText(step.toolOutput)) {
-        addCandidate(candidate, 'step', step);
-      }
+    if (pathFromInput && pathFromInput !== pathFromOutput) {
+      addCandidate(pathFromInput, 'step', step);
     }
   }
 
-  // Last-resort scan of assistant messages embedded in trace-like text is intentionally
-  // limited to concrete filename-like candidates to avoid false positives.
+  // Round 2: text scans for paths that the file-tool scan missed. This
+  // catches the `artifact` tool's payload and assistant messages that
+  // reference files not present as toolInput/toolOutput paths. The owning
+  // step is only set for artifact-step scans so the panel can later
+  // filter artifact-only entries (see `getArtifactSteps`).
+  for (const step of steps) {
+    if (step.status !== 'completed') continue;
+    if (step.toolName !== 'artifact') continue;
+    if (!step.toolOutput) continue;
+    for (const candidate of extractFilePathCandidatesFromText(step.toolOutput)) {
+      addCandidate(candidate, 'text', step);
+    }
+  }
+
   if (messages && messages.length > 0) {
     for (const msg of messages) {
-      if (msg.role !== 'assistant') {
-        continue;
-      }
+      if (msg.role !== 'assistant') continue;
       const text = getMessageText(msg);
-      if (!text) {
-        continue;
-      }
+      if (!text) continue;
       for (const candidate of extractFilePathCandidatesFromText(text)) {
         addCandidate(candidate, 'text');
       }
@@ -473,12 +608,15 @@ function buildArtifactCandidateMap(
 }
 
 export function collectArtifactPaths(steps: TraceStep[], messages?: Message[]): string[] {
-  return Array.from(buildArtifactCandidateMap(steps, messages).values()).map((candidate) => candidate.path);
+  return Array.from(buildArtifactCandidateMap(steps, messages).values()).map(
+    (candidate) => candidate.path
+  );
 }
 
 export function getArtifactSteps(
   steps: TraceStep[],
-  messages?: Message[]
+  messages?: Message[],
+  options?: ShouldDisplayOptions
 ): ArtifactStepResult {
   const artifactSteps = steps.filter(
     (step) => step.type === 'tool_result' && step.toolName === 'artifact'
@@ -490,11 +628,28 @@ export function getArtifactSteps(
 
   for (const candidate of candidateMap.values()) {
     const key = candidate.path;
-    if (seenPaths.has(key) || !shouldDisplayArtifactPath(key)) {
+    if (seenPaths.has(key)) continue;
+
+    // The `artifact` tool produces a *declarative* payload describing a
+    // generated file; the file itself was created by a separate file tool
+    // step elsewhere in the trace. Without this filter, an artifact-only
+    // trace (no Write/Edit for the same path) would surface a phantom
+    // file step in the panel.
+    const isArtifactOnly = candidate.step?.toolName === 'artifact';
+
+    const displayOptions: ShouldDisplayOptions = {
+      ...options,
+      // File-tool candidates own their own path — bypass the sidecar stem
+      // heuristic that was originally tuned to suppress auto-generated
+      // html previews / screenshot render outputs. Those intermediates
+      // appear via the `artifact` tool or text scans, never via Write.
+      bypassSidecar: candidate.source === 'step' && !isArtifactOnly ? true : options?.bypassSidecar,
+    };
+    if (!shouldDisplayArtifactPath(key, displayOptions)) {
       continue;
     }
     seenPaths.add(key);
-    if (candidate.step) {
+    if (candidate.step && !isArtifactOnly) {
       fileSteps.push(candidate.step);
     }
   }
