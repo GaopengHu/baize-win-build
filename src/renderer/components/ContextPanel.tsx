@@ -7,10 +7,8 @@ import {
   getArtifactLabel,
   getArtifactIconComponent,
   collectArtifactPaths,
-  extractRequestedFormats,
   shouldDisplayArtifactPath,
 } from '../utils/artifact-steps';
-import { computeConsumedPaths } from '../../shared/consumed-paths';
 import { useIPC } from '../hooks/useIPC';
 import {
   ChevronDown,
@@ -62,7 +60,8 @@ export function ContextPanel() {
   const appConfig = useAppStore((s) => s.appConfig);
   // 旧会话没有 live 值（session.contextInfo 只在运行中下发）：
   // 退到当前配置的窗口，再退到与主进程一致的 128000 默认值，保证切旧对话也有分母可算。
-  const contextWindow = liveContextWindow ?? appConfig?.contextWindow ?? 128000;
+  const contextWindow =
+    liveContextWindow ?? appConfig?.contextWindow ?? 128000;
   const contextPanelCollapsed = useAppStore((s) => s.contextPanelCollapsed);
   const toggleContextPanel = useAppStore((s) => s.toggleContextPanel);
   const workingDir = useAppStore((s) => s.workingDir);
@@ -73,6 +72,13 @@ export function ContextPanel() {
   const [mcpServers, setMcpServers] = useState<MCPServerInfo[]>([]);
   const [copiedPath, setCopiedPath] = useState(false);
   const [isChangingDir, setIsChangingDir] = useState(false);
+  const [, setRecentWorkspaceFiles] = useState<
+    Array<{
+      path: string;
+      modifiedAt: number;
+      size: number;
+    }>
+  >([]);
 
   const handleCopyPath = async (path: string) => {
     try {
@@ -99,11 +105,6 @@ export function ContextPanel() {
   // Session info computations
   const messages = sessionMessages ?? EMPTY_MESSAGES;
   const artifactPaths = useMemo(() => collectArtifactPaths(steps, messages), [steps, messages]);
-  // L2 consumption gate: files referenced by a later bash step are intermediates.
-  const consumedPaths = useMemo(() => computeConsumedPaths(steps), [steps]);
-  // L4 intent gate: formats the user explicitly named in their messages
-  // (e.g. "导出为 json" / "请把报告生成 html") so html/htm sidecars still show.
-  const requestedFormats = useMemo(() => extractRequestedFormats(messages), [messages]);
   const activeConfigSet = appConfig?.configSets?.find(
     (set) => set.id === appConfig.activeConfigSetId
   );
@@ -144,6 +145,11 @@ export function ContextPanel() {
     return { used: lastInput, total: contextWindow, percentage };
   }, [contextWindow, messages]);
 
+  const completedStepCount = useMemo(
+    () => steps.reduce((n, s) => n + (s.status === 'completed' ? 1 : 0), 0),
+    [steps]
+  );
+
   const mcpToolDisplayNames = useMemo(() => {
     const displayNames = new Map<string, string>();
 
@@ -179,6 +185,53 @@ export function ContextPanel() {
     return displayNames;
   }, [messages, steps]);
 
+  useEffect(() => {
+    if (contextPanelCollapsed) {
+      return;
+    }
+    if (
+      typeof window === 'undefined' ||
+      !window.electronAPI?.artifacts?.listRecentFiles ||
+      !currentWorkingDir ||
+      !activeSession?.createdAt
+    ) {
+      setRecentWorkspaceFiles([]);
+      return;
+    }
+
+    let cancelled = false;
+    // 2s debounce: each completed tool step used to retrigger a full recursive
+    // workspace scan in the main process; dense tool loops kept the scan hot.
+    const timer = setTimeout(async () => {
+      try {
+        const files = await window.electronAPI.artifacts.listRecentFiles(
+          currentWorkingDir,
+          activeSession.createdAt,
+          50
+        );
+        if (!cancelled) {
+          setRecentWorkspaceFiles(files || []);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error('Failed to load recent workspace files:', error);
+          setRecentWorkspaceFiles([]);
+        }
+      }
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    activeSession?.createdAt,
+    activeSessionId,
+    completedStepCount,
+    contextPanelCollapsed,
+    currentWorkingDir,
+  ]);
+
   const displayArtifacts = useMemo(() => {
     const allCandidates: string[] = [];
     const seenPaths = new Set<string>();
@@ -198,7 +251,7 @@ export function ContextPanel() {
     const dedupedByName = new Map<string, string>();
 
     for (const path of allCandidates) {
-      if (!shouldDisplayArtifactPath(path, { requestedFormats, consumedPaths })) continue;
+      if (!shouldDisplayArtifactPath(path)) continue;
       const normalized = normalizeArtifactPathValue(path).replace(/\\/g, '/');
       const nameKey = (normalized.split('/').pop() || normalized).toLowerCase();
       if (!dedupedByName.has(nameKey)) {
@@ -210,7 +263,7 @@ export function ContextPanel() {
       label: getArtifactLabel(path),
       path,
     }));
-  }, [artifactPaths, currentWorkingDir, requestedFormats, consumedPaths]);
+  }, [artifactPaths, currentWorkingDir]);
 
   // Only show artifacts that actually exist on disk. Text scans can produce
   // phantom candidates (URLs, code samples, example filenames); existence
@@ -228,19 +281,13 @@ export function ContextPanel() {
       }
       try {
         const paths = displayArtifacts.map((a) => a.path);
-        // The IPC returns a boolean[] aligned 1:1 with the input (see
-        // `artifacts.checkPaths` handler in main/index.ts). The previous
-        // `string[]`-of-existing-paths design forced an exact-string set
-        // lookup against renderer-resolved paths, which silently dropped
-        // entries on Windows when the main process' `path.resolve()`
-        // produced different separators / case than the renderer's
-        // `resolvePathAgainstWorkspace`.
         const existing = await window.electronAPI.artifacts.checkPaths(
           paths,
           currentWorkingDir ?? undefined
         );
         if (cancelled) return;
-        setExistingArtifacts(displayArtifacts.filter((_, i) => existing[i] === true));
+        const existingSet = new Set(existing);
+        setExistingArtifacts(displayArtifacts.filter((a) => existingSet.has(a.path)));
       } catch (error) {
         console.error('Failed to check artifact paths:', error);
         if (!cancelled) {
