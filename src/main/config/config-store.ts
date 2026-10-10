@@ -172,19 +172,10 @@ export interface MemoryRuntimeConfig {
  * 默认 'none'（fail-closed：涉密优先，联网需用户在设置里显式开启）；
  * 企业部署如需开放检索可在 config 文件预置引擎。
  */
-export type SearchEngine =
-  | 'bing-cn'
-  | 'sogou'
-  | 'chrome-mcp'
-  | 'bing-api'
-  | 'serper'
-  | 'duckduckgo'
-  | 'none';
+export type SearchEngine = 'bing-cn' | 'sogou' | 'chrome-mcp' | 'none';
 
 export interface SearchRuntimeConfig {
   engine: SearchEngine;
-  /** 仅 bing-api/serper 需要（企业部署在 config 文件预置，不要求终端用户申请）。 */
-  apiKey: string;
   timeoutMs: number;
 }
 
@@ -316,7 +307,6 @@ const defaultConfig: AppConfig = {
   },
   searchRuntime: {
     engine: 'none',
-    apiKey: '',
     timeoutMs: 10000,
   },
   enableThinking: false,
@@ -485,15 +475,7 @@ function normalizeMemoryRuntimeConfig(raw: unknown): MemoryRuntimeConfig {
   };
 }
 
-const SEARCH_ENGINES: SearchEngine[] = [
-  'bing-cn',
-  'sogou',
-  'chrome-mcp',
-  'bing-api',
-  'serper',
-  'duckduckgo',
-  'none',
-];
+const SEARCH_ENGINES: SearchEngine[] = ['bing-cn', 'sogou', 'chrome-mcp', 'none'];
 
 function normalizeSearchRuntimeConfig(raw: unknown): SearchRuntimeConfig {
   const value =
@@ -502,7 +484,6 @@ function normalizeSearchRuntimeConfig(raw: unknown): SearchRuntimeConfig {
     engine: SEARCH_ENGINES.includes(value.engine as SearchEngine)
       ? (value.engine as SearchEngine)
       : defaultConfig.searchRuntime.engine,
-    apiKey: typeof value.apiKey === 'string' ? value.apiKey : defaultConfig.searchRuntime.apiKey,
     timeoutMs:
       typeof value.timeoutMs === 'number' && Number.isFinite(value.timeoutMs)
         ? Math.max(3000, Math.min(60000, Math.round(value.timeoutMs)))

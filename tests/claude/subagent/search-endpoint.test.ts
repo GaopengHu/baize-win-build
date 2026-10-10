@@ -94,8 +94,8 @@ describe('search cache', () => {
 
 describe('resolveSearchEndpoint', () => {
   it('defaults to none with 10s timeout (fail-closed)', () => {
-    expect(resolveSearchEndpoint(undefined)).toEqual({ engine: 'none', apiKey: '', timeoutMs: 10000 });
-    expect(resolveSearchEndpoint({})).toEqual({ engine: 'none', apiKey: '', timeoutMs: 10000 });
+    expect(resolveSearchEndpoint(undefined)).toEqual({ engine: 'none', timeoutMs: 10000 });
+    expect(resolveSearchEndpoint({})).toEqual({ engine: 'none', timeoutMs: 10000 });
   });
 
   it('forces engine none for intranet model endpoints (fail-closed, no manual step)', () => {
@@ -110,14 +110,12 @@ describe('resolveSearchEndpoint', () => {
     ]) {
       expect(resolveSearchEndpoint({ baseUrl }).engine).toBe('none');
       // 显式选了引擎也照样强制禁用
-      expect(
-        resolveSearchEndpoint({ baseUrl, searchRuntime: { engine: 'bing-cn' } }).engine
-      ).toBe('none');
+      expect(resolveSearchEndpoint({ baseUrl, searchRuntime: { engine: 'bing-cn' } }).engine).toBe(
+        'none'
+      );
     }
     // 公网地址不受影响（默认仍为 none，需用户显式开启）
-    expect(resolveSearchEndpoint({ baseUrl: 'https://openrouter.ai/api/v1' }).engine).toBe(
-      'none'
-    );
+    expect(resolveSearchEndpoint({ baseUrl: 'https://openrouter.ai/api/v1' }).engine).toBe('none');
     // 用户显式选择的引擎在公网地址下生效
     expect(
       resolveSearchEndpoint({

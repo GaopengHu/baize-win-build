@@ -12,9 +12,6 @@
  * - `sogou`：备用爬取，实测 7s 偏慢，逼近超时上限。
  * - `chrome-mcp`：不注册 web_search，由 Chrome MCP 浏览工具充当联网入口
  *   （本文件不实现，由 profile 工具集层处理）。
- * - `bing-api` / `serper`：付费商业 API，key 由企业部署在 config 文件预置，
- *   不要求终端用户自行申请。
- * - `duckduckgo`：遗留选项（目标 UOS 环境实测不可达）。
  * - `none`：禁用搜索。
  *
  * 输出格式对齐 `tool-executor.webSearch()` 的 "Query/Source/Results" 文本结构，
@@ -70,7 +67,6 @@ export function clearSearchCache(): void {
 
 export interface ResolvedSearchEndpoint {
   engine: SearchEngine;
-  apiKey: string;
   timeoutMs: number;
 }
 
@@ -113,24 +109,13 @@ export function resolveSearchEndpoint(appConfig?: {
   const raw = appConfig?.searchRuntime;
   // fail-closed 默认：未配置/非法值一律 'none'（与 config-store normalize 一致，
   // 此处兜底仅防绕开 normalize 的直接调用）。
-  const VALID_ENGINES: SearchEngine[] = [
-    'bing-cn',
-    'sogou',
-    'chrome-mcp',
-    'bing-api',
-    'serper',
-    'duckduckgo',
-    'none',
-  ];
+  const VALID_ENGINES: SearchEngine[] = ['bing-cn', 'sogou', 'chrome-mcp', 'none'];
   const engine: SearchEngine =
     raw?.engine && VALID_ENGINES.includes(raw.engine) ? raw.engine : 'none';
   const configured: ResolvedSearchEndpoint = {
     engine,
-    apiKey: typeof raw?.apiKey === 'string' ? raw.apiKey : '',
     timeoutMs:
-      typeof raw?.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs)
-        ? raw.timeoutMs
-        : 10000,
+      typeof raw?.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs) ? raw.timeoutMs : 10000,
   };
   if (configured.engine !== 'none' && appConfig?.baseUrl && isIntranetEndpoint(appConfig.baseUrl)) {
     logWarn(
@@ -195,7 +180,8 @@ export function parseBingCnResults(html: string): SearchHit[] {
     const linkPattern = /<h2>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i;
     const link = linkPattern.exec(inner);
     if (!link) continue;
-    const snippetPattern = /<(?:p|div)[^>]*class="[^"]*\bb_caption\b[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/i;
+    const snippetPattern =
+      /<(?:p|div)[^>]*class="[^"]*\bb_caption\b[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/i;
     const snippet = snippetPattern.exec(inner);
     const title = stripHtml(link[2]);
     if (!title) continue;
@@ -244,7 +230,8 @@ export function parseSogouResults(html: string): SearchHit[] {
   while ((block = blockPattern.exec(html)) !== null && hits.length < 10) {
     const inner = block[1];
     const linkPattern = /<h3[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i;
-    const altPattern = /<a[^>]*class="[^"]*\bpt_tit\b[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i;
+    const altPattern =
+      /<a[^>]*class="[^"]*\bpt_tit\b[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i;
     const link = linkPattern.exec(inner) ?? altPattern.exec(inner);
     if (!link) continue;
     const title = stripHtml(link[2]);
@@ -307,73 +294,6 @@ async function callSogou(query: string, timeoutMs: number): Promise<string> {
   return formatHits(query, 'Sogou (www.sogou.com)', parseSogouResults(html));
 }
 
-async function callDuckDuckGo(query: string, timeoutMs: number): Promise<string> {
-  const searchUrl = new URL('https://api.duckduckgo.com/');
-  searchUrl.searchParams.set('q', query);
-  searchUrl.searchParams.set('format', 'json');
-  searchUrl.searchParams.set('no_redirect', '1');
-  searchUrl.searchParams.set('no_html', '1');
-  searchUrl.searchParams.set('skip_disambig', '1');
-  const response = await fetch(searchUrl.toString(), {
-    headers: { 'User-Agent': 'open-cowork' },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!response.ok) {
-    throw new Error(`Search request failed with status ${response.status}`);
-  }
-  const data = (await response.json()) as Record<string, unknown>;
-  const lines = [`Query: ${query}`, 'Source: DuckDuckGo Instant Answer'];
-  if (typeof data.Heading === 'string' && data.Heading) lines.push(`Heading: ${data.Heading}`);
-  if (typeof data.AbstractText === 'string' && data.AbstractText) {
-    lines.push(`Abstract: ${data.AbstractText}`);
-  }
-  const output = lines.join('\n');
-  return output.length > SEARCH_RESULT_CHAR_LIMIT
-    ? `${output.slice(0, SEARCH_RESULT_CHAR_LIMIT)}\n\n[Truncated ${output.length - SEARCH_RESULT_CHAR_LIMIT} chars]`
-    : output;
-}
-
-async function callBingApi(query: string, apiKey: string, timeoutMs: number): Promise<string> {
-  const url = `https://api.bing.microsoft.com/v7.0/search?${new URLSearchParams({ q: query, count: '10', mkt: 'zh-CN' })}`;
-  const response = await fetch(url, {
-    headers: { 'Ocp-Apim-Subscription-Key': apiKey },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!response.ok) {
-    throw new Error(`Search request failed with status ${response.status}`);
-  }
-  const data = (await response.json()) as {
-    webPages?: { value?: Array<{ name?: string; url?: string; snippet?: string }> };
-  };
-  const hits: SearchHit[] = (data.webPages?.value ?? []).slice(0, 10).map((item) => ({
-    title: item.name ?? '',
-    snippet: (item.snippet ?? '').slice(0, 300),
-    url: item.url ?? '',
-  }));
-  return formatHits(query, 'Bing Search API', hits);
-}
-
-async function callSerper(query: string, apiKey: string, timeoutMs: number): Promise<string> {
-  const response = await fetch('https://google.serper.dev/search', {
-    method: 'POST',
-    headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ q: query, num: 10, hl: 'zh-cn' }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!response.ok) {
-    throw new Error(`Search request failed with status ${response.status}`);
-  }
-  const data = (await response.json()) as {
-    organic?: Array<{ title?: string; link?: string; snippet?: string }>;
-  };
-  const hits: SearchHit[] = (data.organic ?? []).slice(0, 10).map((item) => ({
-    title: item.title ?? '',
-    snippet: (item.snippet ?? '').slice(0, 300),
-    url: item.link ?? '',
-  }));
-  return formatHits(query, 'Serper.dev', hits);
-}
-
 /**
  * 执行搜索并返回统一格式文本（带 24h 查询缓存）。
  * 错误透传给上层（dispatch_agent 的 execute 转为工具错误文本）。
@@ -403,17 +323,6 @@ export async function performSearch(
       case 'sogou':
         text = await callSogou(trimmed, timeoutMs);
         break;
-      case 'duckduckgo':
-        text = await callDuckDuckGo(trimmed, timeoutMs);
-        break;
-      case 'bing-api':
-        if (!cfg.apiKey) throw new Error('Bing Search API key not configured');
-        text = await callBingApi(trimmed, cfg.apiKey, timeoutMs);
-        break;
-      case 'serper':
-        if (!cfg.apiKey) throw new Error('Serper.dev API key not configured');
-        text = await callSerper(trimmed, cfg.apiKey, timeoutMs);
-        break;
       case 'chrome-mcp':
         throw new Error(
           'chrome-mcp engine does not provide web_search; use the Chrome MCP browsing tools instead'
@@ -433,5 +342,9 @@ export async function performSearch(
 /** 失败结果也缓存短时间，避免模型反复重试同一 query 触发风控。 */
 export function cacheSearchFailure(query: string, now = Date.now()): void {
   logWarn(`[SubagentSearch] caching failure marker for: ${query.slice(0, 80)}`);
-  setCachedSearchResult(query, 'Results: Search temporarily unavailable, please try again later.', now);
+  setCachedSearchResult(
+    query,
+    'Results: Search temporarily unavailable, please try again later.',
+    now
+  );
 }

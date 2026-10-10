@@ -86,11 +86,7 @@
     "searchEngine_bing_cn": "Bing China (free, zero-config)",
     "searchEngine_sogou": "Sogou (fallback)",
     "searchEngine_chrome_mcp": "Chrome browsing (needs connector)",
-    "searchEngine_bing_api": "Bing Search API (paid)",
-    "searchEngine_serper": "Serper.dev (paid)",
-    "searchEngine_duckduckgo": "DuckDuckGo (legacy)",
     "searchEngine_none": "Disabled (default)",
-    "searchApiKeyPlaceholder": "API key (preset by enterprise deployment)",
     "searchSaved": "Search engine settings saved"
   },
   "memory": {
