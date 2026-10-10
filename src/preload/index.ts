@@ -156,13 +156,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectFiles: (): Promise<string[]> => ipcRenderer.invoke('dialog.selectFiles'),
 
   artifacts: {
-    listRecentFiles: (
-      cwd: string,
-      sinceMs: number,
-      limit = 50
-    ): Promise<Array<{ path: string; modifiedAt: number; size: number }>> =>
-      ipcRenderer.invoke('artifacts.listRecentFiles', cwd, sinceMs, Math.min(limit, 500)),
-    checkPaths: (paths: string[], cwd?: string): Promise<string[]> =>
+    checkPaths: (paths: string[], cwd?: string): Promise<boolean[]> =>
       ipcRenderer.invoke('artifacts.checkPaths', paths, cwd),
   },
 
@@ -508,12 +502,7 @@ declare global {
       ) => Promise<{ success: boolean; savedPath?: string; error?: string }>;
       selectFiles: () => Promise<string[]>;
       artifacts: {
-        listRecentFiles: (
-          cwd: string,
-          sinceMs: number,
-          limit?: number
-        ) => Promise<Array<{ path: string; modifiedAt: number; size: number }>>;
-        checkPaths: (paths: string[], cwd?: string) => Promise<string[]>;
+        checkPaths: (paths: string[], cwd?: string) => Promise<boolean[]>;
       };
       config: {
         get: () => Promise<AppConfig>;
