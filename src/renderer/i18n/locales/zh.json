@@ -377,6 +377,8 @@
     "limaDesc": "在 Lima 虚拟机中运行命令，在 macOS 上提供更好的隔离和安全性。",
     "nativeDesc": "命令直接在系统上运行（Linux 原生模式）。",
     "enableSandbox": "启用沙盒模式",
+    "enableHint": "开启后命令将在隔离沙盒中运行，首次启用需要配置环境。",
+    "disableHint": "关闭后命令将直接在系统上运行，不再使用沙盒隔离。",
     "comingSoon": "功能开发中，敬请期待",
     "readyStatus": "沙盒已就绪并运行中",
     "notReadyStatus": "沙盒已启用但未完全配置",

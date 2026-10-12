@@ -377,6 +377,8 @@
     "limaDesc": "Run commands in Lima VM for better isolation and security on macOS.",
     "nativeDesc": "Commands run directly on your system (Linux native mode).",
     "enableSandbox": "Enable Sandbox Mode",
+    "enableHint": "When on, commands run in an isolated sandbox. First enable requires environment setup.",
+    "disableHint": "When off, commands run directly on your system without sandbox isolation.",
     "comingSoon": "Coming soon — under development",
     "readyStatus": "Sandbox ready and running",
     "notReadyStatus": "Sandbox enabled but not fully configured",
