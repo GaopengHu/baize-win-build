@@ -204,25 +204,26 @@ export class WSLBridge implements SandboxExecutor {
       }
       log('[WSL] Distro is responding');
 
-      // Check if Node.js is available in the distro
-      // Use -e to execute a simple command
-      let nodeAvailable = false;
-      let nodeVersion = '';
-      try {
+      // Probe Node.js / claude-code / Python / pip in parallel. Each probe
+      // spawns a wsl subprocess with a 10s timeout; running them serially
+      // made the status check take up to 40-50s on slow machines.
+      const checkNode = async (): Promise<{ nodeAvailable: boolean; nodeVersion: string }> => {
         // Use simpler command format without bash -c
-        const nodeResult = await execFileAsync(
-          'wsl',
-          ['-d', selectedDistro, '-e', 'node', '--version'],
-          { timeout: 10000, encoding: 'utf-8' }
-        );
-        const output = nodeResult.stdout.trim();
-        if (output.startsWith('v')) {
-          nodeAvailable = true;
-          nodeVersion = output;
-          log('[WSL] Node.js found:', nodeVersion);
+        try {
+          const nodeResult = await execFileAsync(
+            'wsl',
+            ['-d', selectedDistro, '-e', 'node', '--version'],
+            { timeout: 10000, encoding: 'utf-8' }
+          );
+          const output = nodeResult.stdout.trim();
+          if (output.startsWith('v')) {
+            log('[WSL] Node.js found:', output);
+            return { nodeAvailable: true, nodeVersion: output };
+          }
+        } catch {
+          // fall through to nvm check
         }
-      } catch (error) {
-        // Try alternative: check with nvm
+        // Alternative: check with nvm
         try {
           const nvmResult = await execFileAsync(
             'wsl',
@@ -238,19 +239,16 @@ export class WSLBridge implements SandboxExecutor {
           );
           const output = nvmResult.stdout.trim();
           if (output.startsWith('v')) {
-            nodeAvailable = true;
-            nodeVersion = output + ' (nvm)';
-            log('[WSL] Node.js found via nvm:', nodeVersion);
+            log('[WSL] Node.js found via nvm:', output);
+            return { nodeAvailable: true, nodeVersion: output + ' (nvm)' };
           }
         } catch {
           log('[WSL] Node.js not found');
-          nodeAvailable = false;
         }
-      }
+        return { nodeAvailable: false, nodeVersion: '' };
+      };
 
-      // Check if claude-code is available
-      let claudeCodeAvailable = false;
-      if (nodeAvailable) {
+      const checkClaude = async (): Promise<boolean> => {
         try {
           const claudeResult = await execFileAsync(
             'wsl',
@@ -266,49 +264,61 @@ export class WSLBridge implements SandboxExecutor {
           );
           const output = claudeResult.stdout.trim();
           if (output) {
-            claudeCodeAvailable = true;
             log('[WSL] claude-code found:', output);
+            return true;
           }
-        } catch (error) {
+        } catch {
           log('[WSL] claude-code not found');
-          claudeCodeAvailable = false;
         }
-      }
+        return false;
+      };
 
-      // Check if Python and pip are available
-      let pythonAvailable = false;
-      let pipAvailable = false;
-      let pythonVersion = '';
-      try {
-        const pythonResult = await execFileAsync(
-          'wsl',
-          ['-d', selectedDistro, '-e', 'python3', '--version'],
-          { timeout: 10000, encoding: 'utf-8' }
-        );
-        const output = pythonResult.stdout.trim();
-        if (output.startsWith('Python')) {
-          pythonAvailable = true;
-          pythonVersion = output;
-          log('[WSL] Python found:', pythonVersion);
+      const checkPython = async (): Promise<{
+        pythonAvailable: boolean;
+        pipAvailable: boolean;
+        pythonVersion: string;
+      }> => {
+        let pythonAvailable = false;
+        let pipAvailable = false;
+        let pythonVersion = '';
+        try {
+          const pythonResult = await execFileAsync(
+            'wsl',
+            ['-d', selectedDistro, '-e', 'python3', '--version'],
+            { timeout: 10000, encoding: 'utf-8' }
+          );
+          const output = pythonResult.stdout.trim();
+          if (output.startsWith('Python')) {
+            pythonAvailable = true;
+            pythonVersion = output;
+            log('[WSL] Python found:', pythonVersion);
 
-          // Also check if pip is available
-          try {
-            await execFileAsync(
-              'wsl',
-              ['-d', selectedDistro, '-e', 'python3', '-m', 'pip', '--version'],
-              { timeout: 10000, encoding: 'utf-8' }
-            );
-            pipAvailable = true;
-            log('[WSL] pip is available');
-          } catch {
-            log('[WSL] pip is NOT available (python3-pip not installed)');
-            pipAvailable = false;
+            // Also check if pip is available
+            try {
+              await execFileAsync(
+                'wsl',
+                ['-d', selectedDistro, '-e', 'python3', '-m', 'pip', '--version'],
+                { timeout: 10000, encoding: 'utf-8' }
+              );
+              pipAvailable = true;
+              log('[WSL] pip is available');
+            } catch {
+              log('[WSL] pip is NOT available (python3-pip not installed)');
+            }
           }
+        } catch {
+          log('[WSL] Python not found');
         }
-      } catch (error) {
-        log('[WSL] Python not found');
-        pythonAvailable = false;
-      }
+        return { pythonAvailable, pipAvailable, pythonVersion };
+      };
+
+      const [nodeProbe, claudeCodeAvailable, pythonProbe] = await Promise.all([
+        checkNode(),
+        checkClaude(),
+        checkPython(),
+      ]);
+      const { nodeAvailable, nodeVersion } = nodeProbe;
+      const { pythonAvailable, pipAvailable, pythonVersion } = pythonProbe;
 
       const status: WSLStatus = {
         available: true,
@@ -478,17 +488,40 @@ export class WSLBridge implements SandboxExecutor {
     log('[WSL] Installing Python in WSL...');
 
     try {
-      // Try apt installation (Python is usually pre-installed or easily installable)
-      // First check if we can run sudo
+      // apt installation requires passwordless sudo. Without it, `sudo
+      // apt-get` would hang waiting for a password prompt (there is no tty)
+      // or fail after the 180s timeout - so fail fast instead.
+      let sudoAvailable = false;
       try {
         await execFileAsync('wsl', ['-d', distro, '-e', 'sudo', '-n', 'true'], { timeout: 5000 });
+        sudoAvailable = true;
       } catch {
         log('[WSL] Passwordless sudo not available for Python install');
-        // Python might already be installed, just not python3
-        // Try to use python3.x directly
       }
 
-      // Install python3 and pip
+      if (!sudoAvailable) {
+        // Python might actually already be present (the earlier probe may
+        // have missed it); check before giving up.
+        try {
+          const existing = await execFileAsync(
+            'wsl',
+            ['-d', distro, '-e', 'python3', '--version'],
+            { timeout: 10000, encoding: 'utf-8' }
+          );
+          if (existing.stdout.trim().startsWith('Python')) {
+            log('[WSL] Python already present despite sudo unavailable:', existing.stdout.trim());
+            return true;
+          }
+        } catch {
+          // not present
+        }
+        logError(
+          '[WSL] Cannot install Python: passwordless sudo required. Please install python3 manually in WSL.'
+        );
+        return false;
+      }
+
+      // Install python3 and pip (sudo -n: never prompt for a password)
       log('[WSL] Installing python3 and pip via apt...');
       await execFileAsync(
         'wsl',
@@ -498,7 +531,7 @@ export class WSLBridge implements SandboxExecutor {
           '-e',
           'bash',
           '-c',
-          'sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv',
+          'sudo -n DEBIAN_FRONTEND=noninteractive apt-get update -y && sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv',
         ],
         { timeout: 180000, encoding: 'utf-8' }
       );
@@ -514,7 +547,7 @@ export class WSLBridge implements SandboxExecutor {
             '-e',
             'bash',
             '-c',
-            'sudo ln -sf /usr/bin/python3 /usr/bin/python 2>/dev/null || true',
+            'sudo -n ln -sf /usr/bin/python3 /usr/bin/python 2>/dev/null || true',
           ],
           { timeout: 10000, encoding: 'utf-8' }
         );
@@ -598,7 +631,7 @@ export class WSLBridge implements SandboxExecutor {
     log('[WSL] Installing pip in WSL...');
 
     try {
-      // Method 1: Try apt-get (requires sudo)
+      // Method 1: Try apt-get (requires passwordless sudo; sudo -n never prompts)
       try {
         await execFileAsync('wsl', ['-d', distro, '-e', 'sudo', '-n', 'true'], { timeout: 5000 });
         log('[WSL] Passwordless sudo available, installing python3-pip via apt...');
@@ -610,7 +643,7 @@ export class WSLBridge implements SandboxExecutor {
             '-e',
             'bash',
             '-c',
-            'sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip',
+            'sudo -n DEBIAN_FRONTEND=noninteractive apt-get update -y && sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip',
           ],
           { timeout: 180000, encoding: 'utf-8' }
         );
@@ -768,18 +801,14 @@ export class WSLBridge implements SandboxExecutor {
       }
     }
 
-    if (!status.pythonAvailable) {
-      log('[WSL] Python not found, installing...');
-      const installed = await WSLBridge.installPythonInWSL(this.distro);
-      if (!installed) {
-        log('[WSL] Failed to install Python in WSL (non-critical, continuing...)');
-      }
-    } else if (!status.pipAvailable) {
-      log('[WSL] pip not found, installing...');
-      const pipInstalled = await WSLBridge.installPipInWSL(this.distro);
-      if (!pipInstalled) {
-        log('[WSL] Failed to install pip in WSL (non-critical, continuing...)');
-      }
+    // Python/pip installation is handled exclusively by SandboxBootstrap
+    // (which owns the failure cooldown). Do NOT retry here - session
+    // initialization used to re-trigger a slow, usually doomed apt install.
+    if (!status.pythonAvailable || !status.pipAvailable) {
+      log(
+        '[WSL] Python/pip not available (document skills disabled). ' +
+          'Install is managed by bootstrap; use "retry setup" in Settings to retry.'
+      );
     }
 
     if (!status.claudeCodeAvailable) {

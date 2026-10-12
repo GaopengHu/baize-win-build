@@ -469,6 +469,7 @@
     "setupDetailStartLima": "虚拟机启动可能需要几分钟",
     "setupDetailInstallNodeLima": "正在 Lima 虚拟机中安装 Node.js 运行时",
     "setupDetailInstallPythonLima": "正在 Lima 虚拟机中安装 Python 运行时",
+    "pythonSkippedNote": "Python 环境不可用，文档类技能已停用；可在设置页点击“重试设置”重新安装",
     "syncingFilesMessage": "正在同步文件到沙盒...",
     "syncingSkillsMessage": "正在配置技能...",
     "syncReadyMessage": "沙盒已就绪",

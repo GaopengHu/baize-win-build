@@ -54,6 +54,8 @@ function translateSetupDetail(t: TFunction, detail?: string): string | undefined
     'VM startup may take a few minutes': 'sandbox.setupDetailStartLima',
     'Installing Node.js runtime in Lima VM': 'sandbox.setupDetailInstallNodeLima',
     'Installing Python runtime in Lima VM': 'sandbox.setupDetailInstallPythonLima',
+    'Python unavailable - document skills disabled, retry from Settings':
+      'sandbox.pythonSkippedNote',
   };
   const key = map[detail];
   return key ? t(key) : detail;

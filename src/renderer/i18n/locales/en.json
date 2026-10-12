@@ -469,6 +469,7 @@
     "setupDetailStartLima": "VM startup may take a few minutes",
     "setupDetailInstallNodeLima": "Installing Node.js runtime in Lima VM",
     "setupDetailInstallPythonLima": "Installing Python runtime in Lima VM",
+    "pythonSkippedNote": "Python is unavailable - document skills disabled. Use \"Retry setup\" in Settings to reinstall",
     "syncingFilesMessage": "Syncing files to sandbox...",
     "syncingSkillsMessage": "Configuring skills...",
     "syncReadyMessage": "Sandbox ready",

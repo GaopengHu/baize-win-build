@@ -63,24 +63,31 @@ interface SandboxCacheEntry {
   wslStatus?: WSLStatus | null;
   limaStatus?: LimaStatus | null;
   verifiedAt: number;
+  /**
+   * Timestamp of the last failed Python auto-install. Used to avoid
+   * retrying a doomed installation (e.g. no passwordless sudo) on every
+   * launch. Cleared on success or by reset() / manual retry.
+   */
+  pythonInstallFailedAt?: number;
 }
 
 const SANDBOX_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+const PYTHON_INSTALL_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+/**
+ * The sandbox is usable for command execution as soon as the platform
+ * (WSL/Lima) is available and Node.js is present. Python/pip only power the
+ * optional document skills and are explicitly non-critical, so they must NOT
+ * gate cache acceptance - otherwise a machine where Python cannot be
+ * installed (e.g. no passwordless sudo) would re-run the full slow bootstrap
+ * on every single launch.
+ */
 function isWSLReady(status: WSLStatus | null | undefined): boolean {
-  return Boolean(
-    status?.available && status.nodeAvailable && status.pythonAvailable && status.pipAvailable
-  );
+  return Boolean(status?.available && status.nodeAvailable);
 }
 
 function isLimaReady(status: LimaStatus | null | undefined): boolean {
-  return Boolean(
-    status?.available &&
-      status.instanceRunning &&
-      status.nodeAvailable &&
-      status.pythonAvailable &&
-      status.pipAvailable
-  );
+  return Boolean(status?.available && status.instanceRunning && status.nodeAvailable);
 }
 
 /**
@@ -97,6 +104,11 @@ export class SandboxBootstrap {
   // Cached status for quick access by SandboxAdapter
   private cachedWSLStatus: WSLStatus | null = null;
   private cachedLimaStatus: LimaStatus | null = null;
+
+  // Timestamp of the last failed Python auto-install, loaded from the
+  // persisted cache so it survives across launches. Used to skip the
+  // doomed install during the cooldown window.
+  private pythonInstallFailedAt: number | null = null;
 
   static getInstance(): SandboxBootstrap {
     if (!SandboxBootstrap.instance) {
@@ -258,7 +270,22 @@ export class SandboxBootstrap {
     this.result = null;
     this.cachedWSLStatus = null;
     this.cachedLimaStatus = null;
+    // Manual retry (via "retry setup" in settings) must bypass the Python
+    // install failure cooldown.
+    this.pythonInstallFailedAt = null;
     this.clearCache();
+  }
+
+  /**
+   * Whether automatic Python installation should be skipped because the
+   * last attempt failed recently (within the cooldown window). Prevents
+   * retrying a doomed install (e.g. no passwordless sudo) on every launch.
+   */
+  private isPythonInstallOnCooldown(): boolean {
+    return (
+      this.pythonInstallFailedAt !== null &&
+      Date.now() - this.pythonInstallFailedAt < PYTHON_INSTALL_COOLDOWN_MS
+    );
   }
 
   /**
@@ -310,6 +337,13 @@ export class SandboxBootstrap {
       return cached;
     }
 
+    // Cache was rejected (first run / expired / stale), but the Python
+    // install failure timestamp is still relevant for the cooldown check.
+    const previousCache = this.loadCache();
+    if (previousCache && previousCache.platform === process.platform) {
+      this.pythonInstallFailedAt = previousCache.pythonInstallFailedAt ?? null;
+    }
+
     try {
       let result: SandboxBootstrapResult;
       if (platform === 'win32') {
@@ -335,6 +369,10 @@ export class SandboxBootstrap {
           wslStatus: result.wslStatus || null,
           limaStatus: result.limaStatus || null,
           verifiedAt: Date.now(),
+          // Keep the failure timestamp so the cooldown survives across launches
+          ...(this.pythonInstallFailedAt !== null
+            ? { pythonInstallFailedAt: this.pythonInstallFailedAt }
+            : {}),
         });
       }
       return result;
@@ -401,8 +439,14 @@ export class SandboxBootstrap {
       wslStatus.nodeAvailable = true;
     }
 
-    // Phase 3: Install Python if needed
-    if (!wslStatus.pythonAvailable) {
+    // Phase 3: Install Python if needed (non-critical - only powers the
+    // optional document skills). If the last auto-install failed recently,
+    // skip it to avoid a doomed 3-5 minute retry on every launch.
+    if (!wslStatus.pythonAvailable && this.isPythonInstallOnCooldown()) {
+      log(
+        '[SandboxBootstrap] Skipping Python auto-install (previous attempt failed, cooldown active)'
+      );
+    } else if (!wslStatus.pythonAvailable) {
       this.reportProgress({
         phase: 'installing_python',
         message: 'Installing Python...',
@@ -414,6 +458,7 @@ export class SandboxBootstrap {
       if (pythonInstalled) {
         wslStatus.pythonAvailable = true;
         wslStatus.pipAvailable = true;
+        this.pythonInstallFailedAt = null;
 
         // Python install also installs skill deps, so report progress
         this.reportProgress({
@@ -424,7 +469,12 @@ export class SandboxBootstrap {
         });
       } else {
         log('[SandboxBootstrap] Python installation failed (non-critical)');
+        this.pythonInstallFailedAt = Date.now();
       }
+    } else if (!wslStatus.pipAvailable && this.isPythonInstallOnCooldown()) {
+      log(
+        '[SandboxBootstrap] Skipping pip auto-install (previous attempt failed, cooldown active)'
+      );
     } else if (!wslStatus.pipAvailable) {
       // Python available but pip is not
       this.reportProgress({
@@ -437,6 +487,7 @@ export class SandboxBootstrap {
       const pipInstalled = await WSLBridge.installPipInWSL(wslStatus.distro!);
       if (pipInstalled) {
         wslStatus.pipAvailable = true;
+        this.pythonInstallFailedAt = null;
 
         // After pip install, also install skill dependencies
         this.reportProgress({
@@ -446,11 +497,24 @@ export class SandboxBootstrap {
           progress: 80,
         });
         await WSLBridge.installSkillDependencies(wslStatus.distro!);
+      } else {
+        this.pythonInstallFailedAt = Date.now();
       }
     }
 
     // Ready - update cached status
     this.cachedWSLStatus = wslStatus;
+
+    if (!wslStatus.pythonAvailable) {
+      // Informational note before the final ready event; the renderer maps
+      // this exact detail string to an i18n key (sandbox.pythonSkippedNote).
+      this.reportProgress({
+        phase: 'ready',
+        message: 'WSL2 sandbox ready',
+        detail: 'Python unavailable - document skills disabled, retry from Settings',
+        progress: 95,
+      });
+    }
 
     this.reportProgress({
       phase: 'ready',
@@ -561,8 +625,13 @@ export class SandboxBootstrap {
       limaStatus.nodeAvailable = true;
     }
 
-    // Phase 5: Install Python if needed
-    if (!limaStatus.pythonAvailable) {
+    // Phase 5: Install Python if needed (non-critical). Skip within the
+    // failure cooldown so a doomed install is not retried on every launch.
+    if (!limaStatus.pythonAvailable && this.isPythonInstallOnCooldown()) {
+      log(
+        '[SandboxBootstrap] Skipping Python auto-install in Lima (previous attempt failed, cooldown active)'
+      );
+    } else if (!limaStatus.pythonAvailable) {
       this.reportProgress({
         phase: 'installing_python',
         message: 'Installing Python...',
@@ -574,6 +643,7 @@ export class SandboxBootstrap {
       if (pythonInstalled) {
         limaStatus.pythonAvailable = true;
         limaStatus.pipAvailable = true;
+        this.pythonInstallFailedAt = null;
 
         // Python install also installs skill deps, so report progress
         this.reportProgress({
@@ -582,11 +652,25 @@ export class SandboxBootstrap {
           detail: 'Installing markitdown, pypdf, pdfplumber for PDF/PPTX skills',
           progress: 90,
         });
+      } else {
+        log('[SandboxBootstrap] Python installation failed in Lima (non-critical)');
+        this.pythonInstallFailedAt = Date.now();
       }
     }
 
     // Ready - update cached status
     this.cachedLimaStatus = limaStatus;
+
+    if (!limaStatus.pythonAvailable) {
+      // Informational note before the final ready event; the renderer maps
+      // this exact detail string to an i18n key (sandbox.pythonSkippedNote).
+      this.reportProgress({
+        phase: 'ready',
+        message: 'Lima sandbox ready',
+        detail: 'Python unavailable - document skills disabled, retry from Settings',
+        progress: 95,
+      });
+    }
 
     this.reportProgress({
       phase: 'ready',
