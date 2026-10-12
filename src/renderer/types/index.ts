@@ -750,18 +750,10 @@ export interface MemoryRuntimeConfig {
   promptIterationRounds?: number;
 }
 
-export type SearchEngine =
-  | 'bing-cn'
-  | 'sogou'
-  | 'chrome-mcp'
-  | 'bing-api'
-  | 'serper'
-  | 'duckduckgo'
-  | 'none';
+export type SearchEngine = 'bing-cn' | 'sogou' | 'chrome-mcp' | 'none';
 
 export interface SearchRuntimeConfig {
   engine: SearchEngine;
-  apiKey?: string;
   timeoutMs?: number;
 }
 
