@@ -23,26 +23,16 @@ function formatScale(scale: number): string {
   return `${Math.round(scale * 100)}%`;
 }
 
-const SEARCH_ENGINES: SearchEngine[] = [
-  'none',
-  'bing-cn',
-  'sogou',
-  'chrome-mcp',
-  'bing-api',
-  'serper',
-  'duckduckgo',
-];
+const SEARCH_ENGINES: SearchEngine[] = ['none', 'bing-cn', 'sogou', 'chrome-mcp'];
 
 const DEFAULT_SEARCH_RUNTIME: SearchRuntimeConfig = {
   engine: 'none',
-  apiKey: '',
   timeoutMs: 10000,
 };
 
 function cloneSearchRuntime(runtime?: SearchRuntimeConfig): SearchRuntimeConfig {
   return {
     engine: runtime?.engine ?? DEFAULT_SEARCH_RUNTIME.engine,
-    apiKey: runtime?.apiKey ?? '',
     timeoutMs: runtime?.timeoutMs ?? DEFAULT_SEARCH_RUNTIME.timeoutMs,
   };
 }
@@ -120,7 +110,9 @@ export function SettingsGeneral() {
       {/* Font size */}
       <div className="space-y-3">
         <div className="flex items-center justify-between gap-3">
-          <h4 className="text-sm font-medium text-text-primary">{t('general.fontSize', '字体大小')}</h4>
+          <h4 className="text-sm font-medium text-text-primary">
+            {t('general.fontSize', '字体大小')}
+          </h4>
           <span className="text-xs font-medium text-text-muted">{formatScale(draftScale)}</span>
         </div>
 
@@ -133,7 +125,10 @@ export function SettingsGeneral() {
               {isDraggingScale && (
                 <div
                   className="absolute -top-1 left-0 z-20 -translate-y-full rounded-full bg-black px-2.5 py-1 text-[11px] font-semibold text-white shadow-elevated"
-                  style={{ left: `${sliderProgress}%`, transform: 'translateX(-50%) translateY(-6px)' }}
+                  style={{
+                    left: `${sliderProgress}%`,
+                    transform: 'translateX(-50%) translateY(-6px)',
+                  }}
                 >
                   {formatScale(draftScale)}
                 </div>
@@ -167,7 +162,8 @@ export function SettingsGeneral() {
               <div className="pointer-events-none absolute inset-x-0 top-1/2 flex -translate-y-1/2 items-center">
                 <div className="relative h-1 w-full rounded-full bg-border/70">
                   {FONT_SCALE_MARKS.map((mark) => {
-                    const left = ((mark.scale - FONT_SCALE_MIN) / (FONT_SCALE_MAX - FONT_SCALE_MIN)) * 100;
+                    const left =
+                      ((mark.scale - FONT_SCALE_MIN) / (FONT_SCALE_MAX - FONT_SCALE_MIN)) * 100;
                     return (
                       <span
                         key={mark.scale}
@@ -195,12 +191,11 @@ export function SettingsGeneral() {
               <span className="text-[10px] font-medium uppercase tracking-wide text-text-muted">
                 {t('general.fontSizePreview', '预览')}
               </span>
-              <span className="text-[11px] font-semibold text-accent">{formatScale(draftScale)}</span>
+              <span className="text-[11px] font-semibold text-accent">
+                {formatScale(draftScale)}
+              </span>
             </div>
-            <div
-              className="px-4 pb-3.5"
-              style={{ fontSize: `${Math.round(16 * draftScale)}px` }}
-            >
+            <div className="px-4 pb-3.5" style={{ fontSize: `${Math.round(16 * draftScale)}px` }}>
               <p className="font-semibold text-text-primary" style={{ fontSize: '1.25em' }}>
                 今点通 NowLink
               </p>
@@ -246,7 +241,7 @@ export function SettingsGeneral() {
 /**
  * Phase 7.1.2：搜索引擎切换（子 agent 联网检索端点）。
  * 默认禁用（fail-closed，涉密优先）；用户显式开启后 research 子任务才可联网。
- * 付费引擎（bing-api/serper）的 key 由企业部署预置，此处仅提供输入口。
+ * 保留的引擎（bing-cn/sogou）均为免费、免配置，无需用户填 Key。
  */
 function SearchEngineSection() {
   const { t } = useTranslation();
@@ -261,10 +256,8 @@ function SearchEngineSection() {
     setDraft(cloneSearchRuntime(appConfig?.searchRuntime));
   }, [appConfig?.searchRuntime]);
 
-  const needsKey = draft.engine === 'bing-api' || draft.engine === 'serper';
   const dirty =
     draft.engine !== (appConfig?.searchRuntime?.engine ?? DEFAULT_SEARCH_RUNTIME.engine) ||
-    (draft.apiKey ?? '') !== (appConfig?.searchRuntime?.apiKey ?? '') ||
     draft.timeoutMs !== (appConfig?.searchRuntime?.timeoutMs ?? DEFAULT_SEARCH_RUNTIME.timeoutMs);
 
   const handleSave = async () => {
@@ -288,7 +281,7 @@ function SearchEngineSection() {
       <p className="text-xs leading-5 text-text-muted">
         {t(
           'general.searchEngineDesc',
-          '子 agent 联网检索的搜索引擎。默认 Bing 国内版（免费、免配置）；企业部署如需付费端点可在此填入 Key。'
+          '子 agent 联网检索的搜索引擎。默认 Bing 国内版（免费、免配置）。'
         )}
       </p>
       <select
@@ -302,15 +295,6 @@ function SearchEngineSection() {
           </option>
         ))}
       </select>
-      {needsKey && (
-        <input
-          type="password"
-          value={draft.apiKey ?? ''}
-          onChange={(e) => setDraft((prev) => ({ ...prev, apiKey: e.target.value }))}
-          placeholder={t('general.searchApiKeyPlaceholder', 'API Key（企业部署预置）')}
-          className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-text-primary outline-none focus:border-accent"
-        />
-      )}
       <div className="flex items-center gap-2">
         <button
           onClick={handleSave}

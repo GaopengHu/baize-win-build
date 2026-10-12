@@ -62,7 +62,6 @@ function makeConfig(): AppConfig {
     },
     searchRuntime: {
       engine: 'none',
-      apiKey: '',
       timeoutMs: 10000,
     },
     enableThinking: false,

@@ -86,11 +86,7 @@
     "searchEngine_bing_cn": "Bing 国内版（免费、免配置）",
     "searchEngine_sogou": "搜狗（备用）",
     "searchEngine_chrome_mcp": "Chrome 浏览（需配置连接器）",
-    "searchEngine_bing_api": "Bing Search API（付费）",
-    "searchEngine_serper": "Serper.dev（付费）",
-    "searchEngine_duckduckgo": "DuckDuckGo（遗留）",
     "searchEngine_none": "禁用（默认）",
-    "searchApiKeyPlaceholder": "API Key（企业部署预置）",
     "searchSaved": "搜索引擎配置已保存"
   },
   "memory": {
