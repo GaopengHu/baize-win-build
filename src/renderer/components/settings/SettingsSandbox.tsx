@@ -45,6 +45,7 @@ export function SettingsSandbox() {
   const [error, setError] = useState<LocalizedBanner | null>(null);
   const [success, setSuccess] = useState<LocalizedBanner | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
+  const [isToggling, setIsToggling] = useState(false);
 
   const platform = window.electronAPI?.platform || 'unknown';
   const isWindows = platform === 'win32';
@@ -103,8 +104,40 @@ export function SettingsSandbox() {
     }
   }
 
-  // TODO: Re-enable when sandbox debugging is complete
-  // async function handleToggleSandbox() { ... }
+  async function handleToggleSandbox() {
+    if (isToggling || isInstalling !== null || isChecking) return;
+
+    const nextEnabled = !sandboxEnabled;
+    setIsToggling(true);
+    setError(null);
+    setSuccess(null);
+
+    // Optimistically reflect the new state so the UI stays responsive while
+    // the main process reloads the sandbox.
+    setSandboxEnabled(nextEnabled);
+
+    try {
+      const result = await window.electronAPI.config.save({ sandboxEnabled: nextEnabled });
+      if (!result?.success) {
+        throw new Error(t('sandbox.failedToSave'));
+      }
+      setSandboxEnabled(result.config.sandboxEnabled !== false);
+      setSuccess({
+        text: nextEnabled ? t('sandbox.enabledWillSetup') : t('sandbox.disabledStatus'),
+      });
+      // Refresh status so the environment panel reflects the new mode.
+      await loadStatus();
+      setTimeout(() => setSuccess(null), 3000);
+    } catch (err) {
+      // Revert on failure so the switch never lies about the persisted value.
+      setSandboxEnabled(!nextEnabled);
+      setError({
+        text: err instanceof Error && err.message ? err.message : t('sandbox.failedToSave'),
+      });
+    } finally {
+      setIsToggling(false);
+    }
+  }
 
   async function handleCheckStatus() {
     if (isChecking) return; // Prevent double-click
@@ -343,6 +376,37 @@ export function SettingsSandbox() {
           )}
           <span>{sandboxStatusText}</span>
         </div>
+
+        {/* Enable/Disable toggle */}
+        <button
+          type="button"
+          role="switch"
+          aria-checked={sandboxEnabled}
+          aria-label={t('sandbox.enableSandbox')}
+          onClick={handleToggleSandbox}
+          disabled={isToggling || isChecking || isInstalling !== null}
+          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors mx-auto focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+            sandboxEnabled ? 'bg-accent' : 'bg-surface-muted'
+          }`}
+        >
+          <span
+            className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+              sandboxEnabled ? 'translate-x-6' : 'translate-x-1'
+            }`}
+          />
+          {isToggling && (
+            <Loader2
+              className={`absolute w-3 h-3 animate-spin ${
+                sandboxEnabled ? 'left-1.5 text-white' : 'right-1.5 text-text-muted'
+              }`}
+              aria-hidden="true"
+            />
+          )}
+        </button>
+        <p className="text-xs text-text-muted">
+          {sandboxEnabled ? t('sandbox.disableHint') : t('sandbox.enableHint')}
+        </p>
+
         <p className="text-xs text-text-muted max-w-sm mx-auto">
           {t('sandbox.helpText1')} {t('sandbox.helpText2')}
         </p>

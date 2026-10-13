@@ -69,6 +69,8 @@ services:
         node scripts/download-mac-better-sqlite3.mjs &&
         echo 'Step 4: Create dmg-license stub (native macOS module, cannot compile on Linux)' &&
         mkdir -p /app/node_modules/dmg-license && echo '{\"main\":\"index.js\"}' > /app/node_modules/dmg-license/package.json && echo 'exports.dmgLicenseFromJSON = async () => {};' > /app/node_modules/dmg-license/index.js &&
+        echo 'Step 4.5: Clean stale mac unpack leftovers (avoids EACCES rename errors on bind mounts)' &&
+        (rm -rf /app/release/mac-arm64 /app/release/mac || true) &&
         echo 'Step 5: Build .dmg package' &&
         node scripts/build-macos.mjs &&
         echo 'Done! Package at release/今点通-*-mac-*.dmg'

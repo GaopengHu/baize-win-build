@@ -16,7 +16,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { log } from '../utils/logger';
+import { log, logWarn } from '../utils/logger';
 
 const DEFAULT_BASE_URL = 'http://172.31.30.155:3000';
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -72,6 +72,20 @@ export class MarketplaceHttpError extends Error {
   }
 }
 
+/**
+ * 服务端凭证规则（对照 app-rating-curl.md §2.4）：
+ * - 必须 `sk-` 开头，否则被当成网页 access token；
+ * - key 本体不能含 `-`（服务端按第一个 `-` 截取，含 `-` 直接判无效）。
+ * 不满足的 key 还不如不带：带了会被 401，还不如直接匿名走 IP 桶。
+ */
+export function toMarketplaceAuthToken(rawKey: string): string {
+  const key = (rawKey || '').trim();
+  if (!/^sk-[A-Za-z0-9]+$/.test(key)) {
+    return '';
+  }
+  return key;
+}
+
 export class CompanyMarketplaceService {
   private baseUrl: string;
   private accessToken: string;
@@ -111,7 +125,7 @@ export class CompanyMarketplaceService {
 
     for (const url of candidates) {
       try {
-        const payload = await this.requestJson<MarketplaceEnvelope>(url);
+        const payload = await this.requestJsonWithAuthFallback<MarketplaceEnvelope>(url);
         if (!payload?.success) {
           throw new MarketplaceHttpError(200, payload?.message || 'Marketplace request failed');
         }
@@ -405,6 +419,41 @@ export class CompanyMarketplaceService {
       throw error;
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 401 匿名重试：身份头被服务端拒绝（过期/吊销/非市场 key）时，
+   * 去掉头再试一次，退化为匿名（IP 桶）而不是直接报错。
+   * 两次都 401 说明服务端要求登录，给出明确指引。
+   */
+  private async requestJsonWithAuthFallback<T>(url: string): Promise<T> {
+    try {
+      return await this.requestJson<T>(url);
+    } catch (error) {
+      if (
+        error instanceof MarketplaceHttpError &&
+        error.status === 401 &&
+        this.hasAccessToken()
+      ) {
+        logWarn('[Marketplace] access token rejected (401), retrying anonymously');
+        const saved = this.accessToken;
+        this.accessToken = '';
+        try {
+          return await this.requestJson<T>(url);
+        } catch (retryError) {
+          if (retryError instanceof MarketplaceHttpError && retryError.status === 401) {
+            throw new MarketplaceHttpError(
+              401,
+              '技能市场身份校验失败（401）。请检查模型设置中的 API 密钥是否为公司发放的 sk- 令牌'
+            );
+          }
+          throw retryError;
+        } finally {
+          this.accessToken = saved;
+        }
+      }
+      throw error;
     }
   }
 
