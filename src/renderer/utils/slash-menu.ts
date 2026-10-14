@@ -42,13 +42,17 @@ export function parseSlashQuery(prompt: string): { active: boolean; query: strin
  * 2. name 包含 query
  * 3. description 包含 query
  *
- * 空 query → 返回前 limit 项（全量展示的截断）。
+ * 返回**全部**匹配项，不做数据层截断——菜单容器自身可滚动
+ * （max-h-64 overflow-y-auto），截断会导致列表尾部技能"看不见也不可达"，
+ * 用户无法感知加载不全。可选传入 limit 仅用于特殊调用方自行截断。
  */
-export function filterSkills(skills: Skill[], query: string, limit = 8): Skill[] {
+export function filterSkills(skills: Skill[], query: string, limit?: number): Skill[] {
   const q = query.toLowerCase();
-  if (!q) {
-    return skills.slice(0, limit);
-  }
+  const matched = q ? sortSkillMatches(skills, q) : skills;
+  return limit === undefined ? matched : matched.slice(0, limit);
+}
+
+function sortSkillMatches(skills: Skill[], q: string): Skill[] {
   const namePrefix: Skill[] = [];
   const nameSubstr: Skill[] = [];
   const descSubstr: Skill[] = [];
@@ -62,7 +66,7 @@ export function filterSkills(skills: Skill[], query: string, limit = 8): Skill[]
       descSubstr.push(skill);
     }
   }
-  return [...namePrefix, ...nameSubstr, ...descSubstr].slice(0, limit);
+  return [...namePrefix, ...nameSubstr, ...descSubstr];
 }
 
 /** 选中技能后插入的命令文本；尾随空格供用户继续输入 args。 */

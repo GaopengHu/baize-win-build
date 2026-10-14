@@ -598,7 +598,9 @@
     "failedToLoad": "加载技能失败",
     "failedToInstall": "安装技能失败",
     "failedToDelete": "删除技能失败",
-    "failedToToggle": "切换技能失败"
+    "failedToToggle": "切换技能失败",
+    "diagnosticsTitle": "技能加载问题",
+    "diagnosticsDesc": "以下技能目录解析失败或 frontmatter 不完整，相关技能可能不会出现在斜杠菜单中，请检查后重试。"
   },
   "logs": {
     "actionsTitle": "日志操作",
@@ -674,7 +676,8 @@
     "slashMenu": {
       "empty": "没有匹配的技能",
       "ariaLabel": "技能命令列表",
-      "hint": "按 Enter 插入"
+      "hint": "按 Enter 插入",
+      "countHint": "共 {{count}} 项 · 继续输入过滤"
     },
     "lowMemoryAsrWarning": "检测到设备内存较低（总计 {{totalGB}} GB，可用 {{freeGB}} GB）。本地语音转写非常吃内存，运行中可能出现界面白屏或卡死。建议：1) 先关闭其他大内存程序；2) 长录音先剪短再转写。"
   },

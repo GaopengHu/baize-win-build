@@ -72,7 +72,10 @@ import {
   buildScheduledTaskFallbackTitle,
   buildScheduledTaskTitle,
 } from '../shared/schedule/task-title';
-import { CompanyMarketplaceService, toMarketplaceAuthToken } from './skills/company-marketplace-service';
+import {
+  CompanyMarketplaceService,
+  toMarketplaceAuthToken,
+} from './skills/company-marketplace-service';
 import { MarketplaceRatingStore } from './skills/marketplace-rating-store';
 import { createHash } from 'node:crypto';
 import {
@@ -126,6 +129,39 @@ let mainWindow: BrowserWindow | null = null;
 let sessionManager: SessionManager | null = null;
 let skillsManager: SkillsManager | null = null;
 let pluginRuntimeService: PluginRuntimeService | null = null;
+
+// SkillsManager 在 whenReady 内构造，而渲染进程的 IPC（如 skills.getAll）
+// 可能在构造完成前到达。用就绪 Promise 门控这些 handler：等待初始化完成，
+// 而不是直接抛 "still starting"（渲染层静默 catch 会把它当成"无技能"）。
+// 超时保护避免启动异常时 IPC 永久悬挂。
+let resolveSkillsManagerReady: (() => void) | null = null;
+const skillsManagerReady: Promise<void> = new Promise<void>((resolve) => {
+  resolveSkillsManagerReady = resolve;
+});
+const SKILLS_MANAGER_READY_TIMEOUT_MS = 30_000;
+
+async function getSkillsManagerOrThrow(label: string): Promise<SkillsManager> {
+  if (!skillsManager) {
+    await Promise.race([
+      skillsManagerReady,
+      new Promise<void>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                `Skills manager not initialized within ${SKILLS_MANAGER_READY_TIMEOUT_MS}ms`
+              )
+            ),
+          SKILLS_MANAGER_READY_TIMEOUT_MS
+        )
+      ),
+    ]);
+  }
+  if (!skillsManager) {
+    throw new Error(`SkillsManager not initialized (${label})`);
+  }
+  return skillsManager;
+}
 let memoryService: MemoryService | null = null;
 let scheduledTaskManager: ScheduledTaskManager | null = null;
 
@@ -889,6 +925,8 @@ app
         configStore.update({ globalSkillsPath: nextPath });
       },
       watchStorage: true,
+      // 菜单枚举需要覆盖插件技能（与 resolveSkillPaths 同一过滤条件）
+      pluginProvider: pluginRuntimeService,
     });
     skillsManager.onStorageChanged((event) => {
       sendToRenderer({
@@ -896,6 +934,8 @@ app
         payload: event,
       });
     });
+    resolveSkillsManagerReady?.();
+    resolveSkillsManagerReady = null;
     pluginRuntimeService.setSkillsManager(skillsManager);
     sessionManager = new SessionManager(
       db,
@@ -1853,10 +1893,10 @@ ipcMain.handle('mcp.getPresets', () => {
 // Skills API handlers
 ipcMain.handle('skills.getAll', async () => {
   try {
-    if (!skillsManager) {
-      throw new Error('Skills manager is still starting');
-    }
-    return await skillsManager.listSkills();
+    const manager = await getSkillsManagerOrThrow('skills.getAll');
+    // 单一真相源：菜单枚举与 /skill: 展开共享 collectSkillCandidates，
+    // 覆盖 builtin + global + plugin + SDK 自动发现（project/user）目录。
+    return await manager.getAvailableSkills(currentWorkingDir ?? undefined);
   } catch (error) {
     logError('[Skills] Error getting skills:', error);
     throw error;
@@ -1865,10 +1905,8 @@ ipcMain.handle('skills.getAll', async () => {
 
 ipcMain.handle('skills.install', async (_event, skillPath: string) => {
   try {
-    if (!skillsManager) {
-      throw new Error('SkillsManager not initialized');
-    }
-    const skill = await skillsManager.installSkill(skillPath);
+    const manager = await getSkillsManagerOrThrow('skills.install');
+    const skill = await manager.installSkill(skillPath);
     sessionManager?.invalidateSkillsSetup();
     return { success: true, skill };
   } catch (error) {
@@ -1879,10 +1917,8 @@ ipcMain.handle('skills.install', async (_event, skillPath: string) => {
 
 ipcMain.handle('skills.delete', async (_event, skillId: string) => {
   try {
-    if (!skillsManager) {
-      throw new Error('SkillsManager not initialized');
-    }
-    await skillsManager.uninstallSkill(skillId);
+    const manager = await getSkillsManagerOrThrow('skills.delete');
+    await manager.uninstallSkill(skillId);
     sessionManager?.invalidateSkillsSetup();
     return { success: true };
   } catch (error) {
@@ -1893,10 +1929,8 @@ ipcMain.handle('skills.delete', async (_event, skillId: string) => {
 
 ipcMain.handle('skills.setEnabled', async (_event, skillId: string, enabled: boolean) => {
   try {
-    if (!skillsManager) {
-      throw new Error('SkillsManager not initialized');
-    }
-    skillsManager.setSkillEnabled(skillId, enabled);
+    const manager = await getSkillsManagerOrThrow('skills.setEnabled');
+    manager.setSkillEnabled(skillId, enabled);
     sessionManager?.invalidateSkillsSetup();
     return { success: true };
   } catch (error) {
@@ -1907,10 +1941,8 @@ ipcMain.handle('skills.setEnabled', async (_event, skillId: string, enabled: boo
 
 ipcMain.handle('skills.validate', async (_event, skillPath: string) => {
   try {
-    if (!skillsManager) {
-      return { valid: false, errors: ['SkillsManager not initialized'] };
-    }
-    const result = await skillsManager.validateSkillFolder(skillPath);
+    const manager = await getSkillsManagerOrThrow('skills.validate');
+    const result = await manager.validateSkillFolder(skillPath);
     return result;
   } catch (error) {
     logError('[Skills] Error validating skill:', error);
@@ -1920,10 +1952,8 @@ ipcMain.handle('skills.validate', async (_event, skillPath: string) => {
 
 ipcMain.handle('skills.getStoragePath', async () => {
   try {
-    if (!skillsManager) {
-      return null;
-    }
-    return skillsManager.getGlobalSkillsPath();
+    const manager = await getSkillsManagerOrThrow('skills.getStoragePath');
+    return manager.getGlobalSkillsPath();
   } catch (error) {
     logError('[Skills] Error getting storage path:', error);
     return null;
@@ -1931,10 +1961,8 @@ ipcMain.handle('skills.getStoragePath', async () => {
 });
 
 ipcMain.handle('skills.setStoragePath', async (_event, targetPath: string, migrate = true) => {
-  if (!skillsManager) {
-    throw new Error('SkillsManager not initialized');
-  }
-  const result = await skillsManager.setGlobalSkillsPath(targetPath, migrate !== false);
+  const manager = await getSkillsManagerOrThrow('skills.setStoragePath');
+  const result = await manager.setGlobalSkillsPath(targetPath, migrate !== false);
   sendToRenderer({
     type: 'config.status',
     payload: {
@@ -1946,15 +1974,18 @@ ipcMain.handle('skills.setStoragePath', async (_event, targetPath: string, migra
 });
 
 ipcMain.handle('skills.openStoragePath', async () => {
-  if (!skillsManager) {
-    throw new Error('SkillsManager not initialized');
-  }
-  const storagePath = skillsManager.getGlobalSkillsPath();
+  const manager = await getSkillsManagerOrThrow('skills.openStoragePath');
+  const storagePath = manager.getGlobalSkillsPath();
   const openResult = await shell.openPath(storagePath);
   if (openResult) {
     return { success: false, path: storagePath, error: openResult };
   }
   return { success: true, path: storagePath };
+});
+
+ipcMain.handle('skills.getDiagnostics', async () => {
+  const manager = await getSkillsManagerOrThrow('skills.getDiagnostics');
+  return manager.getLoadDiagnostics();
 });
 
 ipcMain.handle('plugins.listCatalog', async (_event, options?: { installableOnly?: boolean }) => {
@@ -2167,10 +2198,8 @@ ipcMain.handle('marketplace.getIcon', async (_event, appId: number) => {
 });
 
 ipcMain.handle(
-  'marketplace.installSkill',  async (
-    _event,
-    input: { appId: number; packageId: number; skillName?: string }
-  ) => {
+  'marketplace.installSkill',
+  async (_event, input: { appId: number; packageId: number; skillName?: string }) => {
     try {
       if (!pluginRuntimeService) {
         throw new Error('PluginRuntimeService not initialized');
@@ -2232,10 +2261,7 @@ ipcMain.handle('marketplace.markDownloaded', (_event, input: { appId: number }) 
 
 ipcMain.handle('marketplace.recordRating', (_event, input: { appId: number }) => {
   try {
-    return getMarketplaceRatingStore().recordRating(
-      Number(input?.appId),
-      getApiKeyFingerprint()
-    );
+    return getMarketplaceRatingStore().recordRating(Number(input?.appId), getApiKeyFingerprint());
   } catch (error) {
     logError('[Marketplace] Error recording rating:', error);
     throw error;

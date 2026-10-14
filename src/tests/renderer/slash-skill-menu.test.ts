@@ -58,7 +58,7 @@ describe('filterSkills', () => {
     makeSkill('asr-transcribe', 'Speech to text'),
   ];
 
-  it('returns first `limit` skills for an empty query', () => {
+  it('returns all skills in order for an empty query (limit optional)', () => {
     expect(filterSkills(skills, '').map((s) => s.name)).toEqual([
       'pdf-summary',
       'translator',
@@ -93,9 +93,14 @@ describe('filterSkills', () => {
     expect(filterSkills(many, 'aa').map((s) => s.name)).toEqual(['aa-one', 'aa-two', 'aa-three']);
   });
 
-  it('caps results at limit (default 8)', () => {
+  it('returns ALL matches by default (no data-layer truncation)', () => {
     const many = Array.from({ length: 20 }, (_, i) => makeSkill(`skill-${i}`));
-    expect(filterSkills(many, 'skill')).toHaveLength(8);
+    expect(filterSkills(many, 'skill')).toHaveLength(20);
+    expect(filterSkills(many, '')).toHaveLength(20);
+  });
+
+  it('honors an explicit limit when provided', () => {
+    const many = Array.from({ length: 20 }, (_, i) => makeSkill(`skill-${i}`));
     expect(filterSkills(many, 'skill', 3)).toHaveLength(3);
   });
 

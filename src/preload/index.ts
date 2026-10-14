@@ -6,6 +6,7 @@ import type {
   CreateSetPayload,
   ProviderPresets,
   Skill,
+  SkillLoadDiagnostic,
   ApiTestInput,
   ApiTestResult,
   PluginCatalogItemV2,
@@ -242,6 +243,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }> => ipcRenderer.invoke('skills.setStoragePath', targetPath, migrate),
     openStoragePath: (): Promise<{ success: boolean; path: string; error?: string }> =>
       ipcRenderer.invoke('skills.openStoragePath'),
+    getDiagnostics: (): Promise<SkillLoadDiagnostic[]> =>
+      ipcRenderer.invoke('skills.getDiagnostics'),
   },
 
   plugins: {
@@ -568,6 +571,7 @@ declare global {
           error?: string;
         }>;
         openStoragePath: () => Promise<{ success: boolean; path: string; error?: string }>;
+        getDiagnostics: () => Promise<SkillLoadDiagnostic[]>;
       };
       plugins: {
         listCatalog: (options?: { installableOnly?: boolean }) => Promise<PluginCatalogItemV2[]>;

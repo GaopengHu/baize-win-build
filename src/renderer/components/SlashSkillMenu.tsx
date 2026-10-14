@@ -82,8 +82,9 @@ export function SlashSkillMenu({
               </span>
             </button>
           ))}
-          <div className="px-3 pt-1 pb-0.5 text-[10px] text-text-muted">
-            {t('chat.slashMenu.hint')}
+          <div className="px-3 pt-1 pb-0.5 text-[10px] text-text-muted flex items-center justify-between gap-2">
+            <span>{t('chat.slashMenu.hint')}</span>
+            <span>{t('chat.slashMenu.countHint', { count: items.length })}</span>
           </div>
         </div>
       )}

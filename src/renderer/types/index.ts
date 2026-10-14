@@ -219,6 +219,12 @@ export interface Skill {
 
 export type SkillType = 'builtin' | 'mcp' | 'custom';
 
+/** 技能加载诊断（解析失败/frontmatter 缺字段/目录读取失败），设置页展示用。 */
+export interface SkillLoadDiagnostic {
+  path: string;
+  reason: string;
+}
+
 export type PluginComponentKind = 'skills' | 'commands' | 'agents' | 'hooks' | 'mcp';
 
 export interface PluginComponentCounts {

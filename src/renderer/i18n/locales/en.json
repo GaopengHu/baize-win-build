@@ -598,7 +598,9 @@
     "failedToLoad": "Failed to load skills",
     "failedToInstall": "Failed to install skill",
     "failedToDelete": "Failed to delete skill",
-    "failedToToggle": "Failed to toggle skill"
+    "failedToToggle": "Failed to toggle skill",
+    "diagnosticsTitle": "Skill Load Issues",
+    "diagnosticsDesc": "The following skill directories failed to parse or have incomplete frontmatter. Affected skills may not appear in the slash menu. Review and retry."
   },
   "logs": {
     "actionsTitle": "Log Actions",
@@ -674,7 +676,8 @@
     "slashMenu": {
       "empty": "No matching skills",
       "ariaLabel": "Skill commands",
-      "hint": "Enter to insert"
+      "hint": "Enter to insert",
+      "countHint": "{{count}} skills · keep typing to filter"
     },
     "lowMemoryAsrWarning": "Low memory detected ({{totalGB}} GB total, {{freeGB}} GB free). Local ASR transcription is memory-intensive and may cause white screen or freeze. Suggestions: 1) Close other memory-heavy apps; 2) Split long audio beforehand."
   },

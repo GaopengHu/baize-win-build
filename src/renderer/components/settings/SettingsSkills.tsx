@@ -11,7 +11,7 @@ import {
   Globe,
   RefreshCw,
 } from 'lucide-react';
-import type { Skill } from '../../types';
+import type { Skill, SkillLoadDiagnostic } from '../../types';
 import { useAppStore } from '../../store';
 import { SettingsContentSection } from './shared';
 import type { LocalizedBanner } from './shared';
@@ -28,6 +28,7 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
   const skillsStorageChangeEvent = useAppStore((state) => state.skillsStorageChangeEvent);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [storagePath, setStoragePath] = useState('');
+  const [diagnostics, setDiagnostics] = useState<SkillLoadDiagnostic[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<LocalizedBanner | null>(null);
   const [success, setSuccess] = useState<LocalizedBanner | null>(null);
@@ -51,9 +52,10 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
 
   const loadSkills = useCallback(async (silent = false) => {
     try {
-      const [skillsResult, storagePathResult] = await Promise.allSettled([
+      const [skillsResult, storagePathResult, diagnosticsResult] = await Promise.allSettled([
         window.electronAPI.skills.getAll(),
         window.electronAPI.skills.getStoragePath(),
+        window.electronAPI.skills.getDiagnostics(),
       ]);
       const errors: string[] = [];
 
@@ -74,6 +76,12 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
             ? storagePathResult.reason.message
             : tRef.current('skills.storagePathUnavailable')
         );
+      }
+      // 诊断获取失败不算错误（旧主进程无此 handler 时静默降级）
+      if (diagnosticsResult.status === 'fulfilled') {
+        setDiagnostics(diagnosticsResult.value || []);
+      } else {
+        setDiagnostics([]);
       }
 
       if (errors.length > 0) {
@@ -269,12 +277,38 @@ export function SettingsSkills({ isActive }: { isActive: boolean }) {
               key={skill.id}
               skill={skill}
               onToggleEnabled={() => handleToggleEnabled(skill)}
-              onDelete={() => handleDelete(skill.id, skill.name)}
+              // 插件技能随插件生命周期管理，不支持单独删除
+              onDelete={
+                skill.id.startsWith('plugin-') ? null : () => handleDelete(skill.id, skill.name)
+              }
               isLoading={isLoading}
             />
           ))
         )}
       </SettingsContentSection>
+
+      {/* 技能加载诊断：解析失败/缺 frontmatter 的技能目录不再静默跳过 */}
+      {diagnostics.length > 0 && (
+        <SettingsContentSection
+          title={t('skills.diagnosticsTitle')}
+          description={t('skills.diagnosticsDesc')}
+        >
+          <div className="space-y-2">
+            {diagnostics.map((diag, index) => (
+              <div
+                key={`${diag.path}-${index}`}
+                className="flex items-start gap-2 px-3 py-2 rounded-lg bg-error/5 border border-error/20 text-sm"
+              >
+                <AlertCircle className="w-4 h-4 text-error shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <div className="text-text-primary break-all font-mono text-xs">{diag.path}</div>
+                  <div className="text-text-muted text-xs mt-0.5">{diag.reason}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </SettingsContentSection>
+      )}
 
       <SettingsContentSection
         title={t('skills.pluginsTitle')}
@@ -315,9 +349,7 @@ function SkillCard({
             <div
               className={`w-3 h-3 rounded-full ${skill.enabled ? 'bg-success' : 'bg-text-muted'}`}
             />
-            <h3 className="font-medium text-text-primary">
-              {skill.displayName || skill.name}
-            </h3>
+            <h3 className="font-medium text-text-primary">{skill.displayName || skill.name}</h3>
             {skill.displayName && skill.displayName !== skill.name && (
               <span className="text-xs text-text-muted font-mono">{skill.name}</span>
             )}
