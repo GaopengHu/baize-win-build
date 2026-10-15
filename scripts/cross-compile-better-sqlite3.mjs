@@ -35,7 +35,7 @@ if (ARCH !== 'arm64' && ARCH !== 'x64') {
 // Node 16 headers（与 Electron 22 内嵌 Node 同大版本；N-API ABI 稳定， patch 版本不敏感）
 const NODE_HEADERS_VERSION = process.env.NODE_HEADERS_VERSION?.trim() || 'v16.20.2';
 const NODE_HEADERS_MIRROR =
-  process.env.NODE_HEADERS_MIRROR?.trim() || 'https://npmmirror.com/mirrors/node/';
+  process.env.NODE_HEADERS_MIRROR?.trim() || 'https://artifacts.electronjs.org/headers/dist/';
 // headers 解包目录放在 node-gyp 缓存卷下，跨构建复用（compose 已挂载该卷）。
 // 注意 tar 包顶层目录是 node-<ver>/，HEADERS_DIR 必须含这层，否则 marker 对不上。
 const HEADERS_ROOT = join(homedir(), '.cache', 'node-gyp', 'node-headers');
