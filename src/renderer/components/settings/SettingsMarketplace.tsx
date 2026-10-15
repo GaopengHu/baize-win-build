@@ -1,8 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertCircle, CheckCircle, Loader2, Package, RefreshCw, X } from 'lucide-react';
+import { AlertCircle, CheckCircle, Loader2, Package, RefreshCw, Search, X } from 'lucide-react';
 import type { MarketplaceSkillApp } from '../../types';
-import { useAppStore } from '../../store';
 import type { LocalizedBanner } from './shared';
 import { StarDisplay, StarRatingInput } from './MarketplaceRating';
 import {
@@ -22,6 +21,17 @@ const isElectron = typeof window !== 'undefined' && window.electronAPI !== undef
 // 列表渐进渲染步长（见 visibleCount 注释）
 const MARKETPLACE_PAGE_SIZE = 12;
 
+// 分类过滤：后端把分类信息塞在 tags 数组里（值就是这 5 个字符串之一），
+// 这里用精确 includes 匹配。一个 skill 可能命中多个分类，也可能一个都没命中。
+// 顺序就是 UI 上 chip 的展示顺序。
+const MARKETPLACE_CATEGORIES = [
+  '合规风控',
+  '办公协同',
+  '软件研发',
+  '低代码平台建设',
+  '数据与金融分析',
+] as const;
+
 /**
  * 技能市场（与"技能"平级的设置面板 Tab）。
  *
@@ -37,10 +47,12 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
     tRef.current = t;
   }, [t]);
   const [marketplaceApps, setMarketplaceApps] = useState<MarketplaceSkillApp[]>([]);
-  const [marketplaceIconCache, setMarketplaceIconCache] = useState<Record<number, string | null>>({});
-  const [marketplaceBaseUrl, setMarketplaceBaseUrl] = useState('');
-  const [marketplaceBaseUrlDraft, setMarketplaceBaseUrlDraft] = useState('');
-  const [isMarketplaceSavingUrl, setIsMarketplaceSavingUrl] = useState(false);
+  const [marketplaceIconCache, setMarketplaceIconCache] = useState<Record<number, string | null>>(
+    {}
+  );
+  const [searchKeyword, setSearchKeyword] = useState('');
+  // 当前选中的分类：空串 = 全部
+  const [activeCategory, setActiveCategory] = useState<string>('');
   const [isMarketplaceLoading, setIsMarketplaceLoading] = useState(false);
   const [pluginActionKey, setPluginActionKey] = useState<string | null>(null);
   const [pluginToastMessage, setPluginToastMessage] = useState('');
@@ -87,10 +99,7 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
     }
     setIsMarketplaceLoading(true);
     try {
-      const [apps, baseUrl] = await Promise.all([
-        window.electronAPI.marketplace.listSkillApps(),
-        window.electronAPI.marketplace.getBaseUrl().catch(() => ''),
-      ]);
+      const apps = await window.electronAPI.marketplace.listSkillApps();
       setMarketplaceApps(apps || []);
       // 新数据到达即重置可见数，避免旧 visibleCount 越界或直接全量
       setVisibleCount(MARKETPLACE_PAGE_SIZE);
@@ -106,8 +115,6 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
       } catch {
         // 校准失败不阻塞列表展示
       }
-      setMarketplaceBaseUrl(baseUrl || '');
-      setMarketplaceBaseUrlDraft(baseUrl || '');
       setError(null);
       // Fetch icons lazily; missing icons resolve to null and fall back to the
       // default glyph in the UI.
@@ -126,8 +133,7 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
       // 主进程缺 handler = 客户端版本早于市场 IPC（2026-09-18 落码）：
       // 直说升级，别把 IPC 原文甩给办公用户。
       const outdated =
-        rawMessage.includes('No handler registered') &&
-        rawMessage.includes('marketplace.');
+        rawMessage.includes('No handler registered') && rawMessage.includes('marketplace.');
       setError({
         text: outdated
           ? t('skills.marketplaceClientOutdated')
@@ -161,9 +167,34 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
     };
   }, [isActive]);
 
+  // 客户端搜索过滤：服务端一次性返回全量，端侧先按分类、再按名称 / 标签做不区分大小写的子串匹配。
+  // 分类信息在 tags 里（后端没单独给 category），按精确 includes 匹配；
+  // 一个 skill 可能在多个分类下，未命中任何分类的 skill 仅在「全部」下出现。
+  // 不动 marketplaceApps 本体（评分回写仍基于原数组），仅在展示层裁剪。
+  const filteredApps = useMemo(() => {
+    const kw = searchKeyword.trim().toLowerCase();
+    return marketplaceApps.filter((app) => {
+      if (activeCategory && !app.tags.includes(activeCategory)) {
+        return false;
+      }
+      if (!kw) {
+        return true;
+      }
+      if (app.name.toLowerCase().includes(kw)) {
+        return true;
+      }
+      return app.tags.some((tag) => tag.toLowerCase().includes(kw));
+    });
+  }, [marketplaceApps, searchKeyword, activeCategory]);
+
+  // 搜索词 / 分类变化即把分页重置到第一页，避免哨兵计数越界或少量结果直接全量。
+  useEffect(() => {
+    setVisibleCount(MARKETPLACE_PAGE_SIZE);
+  }, [searchKeyword, activeCategory]);
+
   // 滚动到底自动追加：哨兵 div 进入视口即 +PAGE_SIZE
   useEffect(() => {
-    if (isMarketplaceLoading || marketplaceApps.length === 0) {
+    if (isMarketplaceLoading || filteredApps.length === 0) {
       return;
     }
     const sentinel = loadMoreSentinelRef.current;
@@ -173,9 +204,7 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) {
-          setVisibleCount((prev) =>
-            Math.min(prev + MARKETPLACE_PAGE_SIZE, marketplaceApps.length)
-          );
+          setVisibleCount((prev) => Math.min(prev + MARKETPLACE_PAGE_SIZE, filteredApps.length));
         }
       },
       // Tab 布局下滚动发生在设置面板容器（页面级），
@@ -184,42 +213,7 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [isMarketplaceLoading, marketplaceApps.length, visibleCount]);
-
-  async function handleMarketplaceBaseUrlBlur() {
-    const next = marketplaceBaseUrlDraft.trim().replace(/\/+$/, '');
-    // Unchanged or empty: revert the input display without touching config.
-    if (!next || next === marketplaceBaseUrl) {
-      setMarketplaceBaseUrlDraft(marketplaceBaseUrl);
-      return;
-    }
-    // Basic sanity check before persisting.
-    if (!/^https?:\/\/.+/.test(next)) {
-      setError({ text: t('skills.marketplaceInvalidUrl') });
-      setMarketplaceBaseUrlDraft(marketplaceBaseUrl);
-      return;
-    }
-    setIsMarketplaceSavingUrl(true);
-    try {
-      const result = await window.electronAPI.config.save({ marketplaceBaseUrl: next });
-      if (result?.success) {
-        useAppStore.getState().setAppConfig(result.config);
-      }
-      setMarketplaceBaseUrl(next);
-      setMarketplaceBaseUrlDraft(next);
-      await loadMarketplaceApps();
-    } catch (err) {
-      setError({
-        text:
-          err instanceof Error && err.message
-            ? `${t('skills.marketplaceSaveUrlFailed')}: ${err.message}`
-            : t('skills.marketplaceSaveUrlFailed'),
-      });
-      setMarketplaceBaseUrlDraft(marketplaceBaseUrl);
-    } finally {
-      setIsMarketplaceSavingUrl(false);
-    }
-  }
+  }, [isMarketplaceLoading, filteredApps.length, visibleCount]);
 
   async function handleInstallMarketplaceSkill(app: MarketplaceSkillApp) {
     const pkg = pickPreferredPackage(app);
@@ -336,9 +330,7 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
       return null;
     }
     // Prefer x64, then the first package by server sort order (already sorted).
-    return (
-      app.packages.find((pkg) => pkg.arch.toLowerCase() === 'x64') ?? app.packages[0]
-    );
+    return app.packages.find((pkg) => pkg.arch.toLowerCase() === 'x64') ?? app.packages[0];
   }
 
   function formatBytes(size: number): string {
@@ -369,7 +361,7 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
         </div>
       )}
 
-      {/* 工具栏：标题 + 刷新 + 市场地址输入框 */}
+      {/* 工具栏：标题 + 刷新 + 搜索框（按名称 / 分类 / 标签过滤） */}
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <h3 className="text-base font-semibold text-text-primary whitespace-nowrap">
           {t('skills.marketplaceTitle')}
@@ -385,25 +377,58 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
           />
         </button>
       </div>
-      <input
-        value={marketplaceBaseUrlDraft}
-        onChange={(e) => setMarketplaceBaseUrlDraft(e.target.value)}
-        onBlur={() => void handleMarketplaceBaseUrlBlur()}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            (e.target as HTMLInputElement).blur();
-          }
-          if (e.key === 'Escape') {
-            setMarketplaceBaseUrlDraft(marketplaceBaseUrl);
-            (e.target as HTMLInputElement).blur();
-          }
-        }}
-        disabled={isMarketplaceLoading || isMarketplaceSavingUrl}
-        spellCheck={false}
-        placeholder="http://host:3000"
-        title={t('skills.marketplaceUrlHint')}
-        className="w-full px-2.5 py-1.5 text-xs rounded border border-border bg-surface-hover text-text-secondary focus:text-text-primary focus:border-accent focus:outline-none disabled:opacity-60"
-      />
+      <div className="relative">
+        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-muted pointer-events-none" />
+        <input
+          value={searchKeyword}
+          onChange={(e) => setSearchKeyword(e.target.value)}
+          spellCheck={false}
+          placeholder={t('skills.marketplaceSearchPlaceholder')}
+          className="w-full pl-8 pr-8 py-1.5 text-xs rounded border border-border bg-surface-hover text-text-secondary focus:text-text-primary focus:border-accent focus:outline-none"
+        />
+        {searchKeyword && (
+          <button
+            type="button"
+            onClick={() => setSearchKeyword('')}
+            title={t('skills.marketplaceClearSearch')}
+            className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 rounded hover:bg-surface text-text-muted hover:text-text-primary"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+
+      {/* 分类筛选 chip 行：第一个是「全部」，后面 5 个分类常量顺序排列；和搜索框是 AND 关系 */}
+      <div className="flex flex-wrap gap-1.5">
+        <button
+          type="button"
+          onClick={() => setActiveCategory('')}
+          className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+            activeCategory === ''
+              ? 'bg-accent text-white border-accent'
+              : 'border-border text-text-secondary hover:border-accent hover:text-accent'
+          }`}
+        >
+          {t('skills.marketplaceAllCategory')}
+        </button>
+        {MARKETPLACE_CATEGORIES.map((category) => {
+          const isActive = activeCategory === category;
+          return (
+            <button
+              key={category}
+              type="button"
+              onClick={() => setActiveCategory(isActive ? '' : category)}
+              className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+                isActive
+                  ? 'bg-accent text-white border-accent'
+                  : 'border-border text-text-secondary hover:border-accent hover:text-accent'
+              }`}
+            >
+              {category}
+            </button>
+          );
+        })}
+      </div>
 
       {/* 技能列表 */}
       {isMarketplaceLoading ? (
@@ -413,21 +438,32 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
         </div>
       ) : marketplaceApps.length === 0 ? (
         <div className="py-8 text-center text-text-muted">{t('skills.marketplaceEmpty')}</div>
+      ) : filteredApps.length === 0 ? (
+        <div className="py-8 text-center text-text-muted space-y-2">
+          <div>{t('skills.marketplaceNoMatch')}</div>
+          <button
+            type="button"
+            onClick={() => setSearchKeyword('')}
+            className="text-xs text-accent hover:text-accent-hover hover:underline"
+          >
+            {t('skills.marketplaceClearSearch')}
+          </button>
+        </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-          {marketplaceApps.slice(0, visibleCount).map((app) => {
-          const iconSrc = marketplaceIconCache[app.appId] || null;
-          const pkg = pickPreferredPackage(app);
-          const installTarget = `marketplace:${app.appId}`;
-          const isInstalling = pluginActionKey === installTarget;
-          const sizeLabel = pkg ? formatBytes(pkg.fileSize) : '';
-          const noPackage = !pkg;
-          return (
-            <div
-              key={app.appId}
-              className="rounded-lg border border-border bg-surface-hover p-4 flex flex-col"
-            >
-              <div className="flex items-start gap-3 flex-1 min-w-0">
+          {filteredApps.slice(0, visibleCount).map((app) => {
+            const iconSrc = marketplaceIconCache[app.appId] || null;
+            const pkg = pickPreferredPackage(app);
+            const installTarget = `marketplace:${app.appId}`;
+            const isInstalling = pluginActionKey === installTarget;
+            const sizeLabel = pkg ? formatBytes(pkg.fileSize) : '';
+            const noPackage = !pkg;
+            return (
+              <div
+                key={app.appId}
+                className="rounded-lg border border-border bg-surface-hover p-4 flex flex-col"
+              >
+                <div className="flex items-start gap-3 flex-1 min-w-0">
                   {iconSrc ? (
                     <img
                       src={iconSrc}
@@ -466,10 +502,7 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
                       {sizeLabel ? ` · ${sizeLabel}` : ''}
                       {pkg && pkg.arch ? ` · ${pkg.arch}` : ''}
                       {noPackage ? (
-                        <span className="text-warning">
-                          {' '}
-                          · {t('skills.marketplaceNoPackage')}
-                        </span>
+                        <span className="text-warning"> · {t('skills.marketplaceNoPackage')}</span>
                       ) : (
                         ''
                       )}
@@ -524,26 +557,26 @@ export function SettingsMarketplace({ isActive }: { isActive: boolean }) {
                     t('skills.marketplaceInstall')
                   )}
                 </button>
-            </div>
-          );
-        })}
+              </div>
+            );
+          })}
         </div>
       )}
 
       {/* 无限滚动哨兵：进入视口自动追加下一页；到底时显示收尾行 */}
-      {!isMarketplaceLoading && marketplaceApps.length > 0 && (
+      {!isMarketplaceLoading && filteredApps.length > 0 && (
         <div ref={loadMoreSentinelRef} className="py-3 text-center text-xs text-text-muted">
-          {visibleCount < marketplaceApps.length ? (
+          {visibleCount < filteredApps.length ? (
             <span className="inline-flex items-center gap-2">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
               {t('skills.marketplaceLoadingMore', {
-                shown: Math.min(visibleCount, marketplaceApps.length),
-                total: marketplaceApps.length,
+                shown: Math.min(visibleCount, filteredApps.length),
+                total: filteredApps.length,
               })}
             </span>
           ) : (
-            marketplaceApps.length > MARKETPLACE_PAGE_SIZE &&
-            t('skills.marketplaceAllShown', { total: marketplaceApps.length })
+            filteredApps.length > MARKETPLACE_PAGE_SIZE &&
+            t('skills.marketplaceAllShown', { total: filteredApps.length })
           )}
         </div>
       )}
