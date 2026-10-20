@@ -271,6 +271,9 @@ export class PiSessionFactory {
     const { DefaultResourceLoader } = await import('@mariozechner/pi-coding-agent');
     const resourceLoader = new DefaultResourceLoader({
       cwd: effectiveCwd,
+      // 全面安装制：关闭 SDK skills 自动发现（.pi/skills、.agents/skills、
+      // ~/.claude/skills 等），只使用 additionalSkillPaths（全局目录启用项）。
+      noSkills: true,
       additionalSkillPaths: skillPaths,
       appendSystemPromptOverride: () => (appendPrompt.current ? [appendPrompt.current] : []),
       agentsFilesOverride: () => ({

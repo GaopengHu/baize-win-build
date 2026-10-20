@@ -925,8 +925,6 @@ app
         configStore.update({ globalSkillsPath: nextPath });
       },
       watchStorage: true,
-      // 菜单枚举需要覆盖插件技能（与 resolveSkillPaths 同一过滤条件）
-      pluginProvider: pluginRuntimeService,
     });
     skillsManager.onStorageChanged((event) => {
       sendToRenderer({
@@ -937,13 +935,7 @@ app
     resolveSkillsManagerReady?.();
     resolveSkillsManagerReady = null;
     pluginRuntimeService.setSkillsManager(skillsManager);
-    sessionManager = new SessionManager(
-      db,
-      sendToRenderer,
-      pluginRuntimeService,
-      extensionManager,
-      skillsManager
-    );
+    sessionManager = new SessionManager(db, sendToRenderer, extensionManager, skillsManager);
     // pi-ai handles model routing natively — no proxy warmup needed
 
     // macOS: application menu, dock menu, tray icon
@@ -1895,7 +1887,7 @@ ipcMain.handle('skills.getAll', async () => {
   try {
     const manager = await getSkillsManagerOrThrow('skills.getAll');
     // 单一真相源：菜单枚举与 /skill: 展开共享 collectSkillCandidates，
-    // 覆盖 builtin + global + plugin + SDK 自动发现（project/user）目录。
+    // 全面安装制下仅覆盖全局技能目录（市场/本地安装的技能）。
     return await manager.getAvailableSkills(currentWorkingDir ?? undefined);
   } catch (error) {
     logError('[Skills] Error getting skills:', error);
@@ -1903,17 +1895,22 @@ ipcMain.handle('skills.getAll', async () => {
   }
 });
 
-ipcMain.handle('skills.install', async (_event, skillPath: string) => {
-  try {
-    const manager = await getSkillsManagerOrThrow('skills.install');
-    const skill = await manager.installSkill(skillPath);
-    sessionManager?.invalidateSkillsSetup();
-    return { success: true, skill };
-  } catch (error) {
-    logError('[Skills] Error installing skill:', error);
-    throw error;
+ipcMain.handle(
+  'skills.install',
+  async (_event, skillPath: string, options?: { enabled?: boolean }) => {
+    try {
+      const manager = await getSkillsManagerOrThrow('skills.install');
+      // 本地安装默认 enabled:true + {source:'local'} sidecar（installSkill 内置默认）；
+      // options 仅供程序化调用方（测试/深链）覆盖。市场安装走 marketplace.installSkill。
+      const skill = await manager.installSkill(skillPath, options);
+      sessionManager?.invalidateSkillsSetup();
+      return { success: true, skill };
+    } catch (error) {
+      logError('[Skills] Error installing skill:', error);
+      throw error;
+    }
   }
-});
+);
 
 ipcMain.handle('skills.delete', async (_event, skillId: string) => {
   try {
@@ -2199,7 +2196,10 @@ ipcMain.handle('marketplace.getIcon', async (_event, appId: number) => {
 
 ipcMain.handle(
   'marketplace.installSkill',
-  async (_event, input: { appId: number; packageId: number; skillName?: string }) => {
+  async (
+    _event,
+    input: { appId: number; packageId: number; skillName?: string; version?: string }
+  ) => {
     try {
       if (!pluginRuntimeService) {
         throw new Error('PluginRuntimeService not initialized');

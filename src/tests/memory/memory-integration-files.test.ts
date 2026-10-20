@@ -17,13 +17,15 @@ describe('memory integration wiring', () => {
     expect(mainIndex).toContain("ipcMain.handle('memory.setEnabled'");
   });
 
-  it('injects runtime plugin skill paths and extension hooks into the agent runner', () => {
+  it('injects extension hooks into the agent runner without merging plugin skill paths', () => {
     const runner = readProjectFile('src/main/claude/agent-runner.ts');
-    // Phase 2 迁移：plugin skill 路径合并逻辑移入 skills-runtime.ts
+    // 全面安装制：resolveSkillPaths 只覆盖全局目录启用技能，
+    // 不再合并插件 runtimePath/skills 目录（插件工具/扩展不受影响）
     const skillsRuntime = readProjectFile('src/main/claude/skills-runtime.ts');
     const memoryExtension = readProjectFile('src/main/memory/memory-extension.ts');
     expect(runner).toContain('resolveSkillPaths(session.id)');
-    expect(skillsRuntime).toContain("path.join(plugin.runtimePath, 'skills')");
+    expect(skillsRuntime).not.toContain("path.join(plugin.runtimePath, 'skills')");
+    expect(skillsRuntime).not.toContain('getEnabledRuntimePlugins');
     expect(runner).toContain('this.extensionManager.beforeSessionRun');
     expect(runner).toContain('skillsSignature');
     expect(memoryExtension).not.toContain('customTools: this.memoryService.getTools()');

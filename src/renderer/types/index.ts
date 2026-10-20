@@ -215,9 +215,17 @@ export interface Skill {
   enabled: boolean;
   config?: Record<string, unknown>;
   createdAt: number;
+  /** 安装时记录的市场版本号（sidecar，仅市场安装有） */
+  version?: string;
+  /** 安装来源（sidecar）；无 sidecar 的存量目录按 'local' 展示 */
+  source?: 'marketplace' | 'local';
+  /** 安装时间戳（sidecar） */
+  installedAt?: number;
+  /** 市场应用 id（sidecar，用于市场列表已安装判定） */
+  appId?: number;
 }
 
-export type SkillType = 'builtin' | 'mcp' | 'custom';
+export type SkillType = 'mcp' | 'custom';
 
 /** 技能加载诊断（解析失败/frontmatter 缺字段/目录读取失败），设置页展示用。 */
 export interface SkillLoadDiagnostic {

@@ -18,12 +18,10 @@ import { isPathWithinRoot } from '../tools/path-containment';
 import { getDefaultShell } from '../utils/shell-resolver';
 import { withRetry } from '../utils/retry';
 import type { SkillsAdapter } from './skills-adapter';
+import type { SkillSidecar } from './skills-manager';
 import { pluginRegistryStore } from './plugin-registry-store';
 import { PluginCatalogService } from './plugin-catalog-service';
-import {
-  CompanyMarketplaceService,
-  MarketplaceHttpError,
-} from './company-marketplace-service';
+import { CompanyMarketplaceService, MarketplaceHttpError } from './company-marketplace-service';
 import type { MarketplaceSkillInstallResult } from '../../renderer/types';
 
 const execFileAsync = promisify(execFile);
@@ -96,7 +94,10 @@ export class PluginRuntimeService {
   private readonly catalogService: PluginCatalogService;
   private readonly commandRunner: CommandRunner;
   private skillsManager?: SkillsAdapter & {
-    installSkill: (skillPath: string, options?: { enabled?: boolean }) => Promise<{ name: string }>;
+    installSkill: (
+      skillPath: string,
+      options?: { enabled?: boolean; sidecar?: Partial<SkillSidecar> }
+    ) => Promise<{ name: string }>;
   };
 
   constructor(
@@ -312,6 +313,7 @@ export class PluginRuntimeService {
     appId: number;
     packageId: number;
     skillName?: string;
+    version?: string;
     baseUrl?: string;
     accessToken?: string;
   }): Promise<MarketplaceSkillInstallResult> {
@@ -330,29 +332,35 @@ export class PluginRuntimeService {
       try {
         const skillDirs = this.locateSkillDirectories(extractDir);
         if (skillDirs.length === 0) {
-          throw new Error('压缩包内未找到 SKILL.md（既没有 skills/<name>/SKILL.md，也没有顶层 SKILL.md）');
+          throw new Error(
+            '压缩包内未找到 SKILL.md（既没有 skills/<name>/SKILL.md，也没有顶层 SKILL.md）'
+          );
         }
 
         const installedNames: string[] = [];
         // 显示名与内部名分离：内部名保持包内英文（模型 Skill 工具可稳定调用），
-        // 市场中文展示名写 sidecar，列表页优先显示中文（见 displayName）。
+        // 市场中文展示名 + appId/version 写入 sidecar（由 installSkill 落盘），
+        // 列表页优先显示中文、市场视图按 appId/version 判定已安装与可更新。
         // 多 skill 包每个都写（展示名相同也无妨，显示层本来就允许重名）。
         const displayName = (input.skillName || '').trim();
+        const version = (input.version || '').trim() || undefined;
         for (const skillDir of skillDirs) {
           const manager = this.skillsManager;
           if (!manager) {
             throw new Error('Skills manager not initialized');
           }
-          if (displayName) {
-            fs.writeFileSync(
-              path.join(skillDir, '.nowlink-marketplace.json'),
-              JSON.stringify({ appId, displayName }),
-              'utf-8'
-            );
-          }
-          // Marketplace installs start DISABLED — the user explicitly opts in
-          // via the toggle in settings before the skill takes effect.
-          const skill = await manager.installSkill(skillDir, { enabled: false });
+          // 安装即启用（用户决策）：市场安装与本地安装均默认 enabled:true；
+          // 同名覆盖安装（更新）时 installSkill 内部保留旧的 enabled 状态。
+          const skill = await manager.installSkill(skillDir, {
+            enabled: true,
+            sidecar: {
+              appId,
+              ...(displayName ? { displayName } : {}),
+              ...(version ? { version } : {}),
+              installedAt: Date.now(),
+              source: 'marketplace' as const,
+            },
+          });
           installedNames.push(skill.name);
         }
         log(
@@ -410,9 +418,7 @@ export class PluginRuntimeService {
    */
   private async extractZipSafely(packageFile: string): Promise<string> {
     const AdmZipModule = await import('adm-zip');
-    const AdmZip = (AdmZipModule.default ?? AdmZipModule) as unknown as new (
-      file: string
-    ) => {
+    const AdmZip = (AdmZipModule.default ?? AdmZipModule) as unknown as new (file: string) => {
       getEntries: () => Array<{
         entryName: string;
         isDirectory: boolean;
@@ -466,8 +472,7 @@ export class PluginRuntimeService {
    * C) a plugin layout with skills/<name>/SKILL.md
    */
   private locateSkillDirectories(extractDir: string): string[] {
-    const skillMarker = (dir: string): boolean =>
-      fs.existsSync(path.join(dir, 'SKILL.md'));
+    const skillMarker = (dir: string): boolean => fs.existsSync(path.join(dir, 'SKILL.md'));
 
     if (skillMarker(extractDir)) {
       return [extractDir];

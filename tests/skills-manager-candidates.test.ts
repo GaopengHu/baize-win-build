@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 
 let testRoot = '';
-const originalEnv: Record<string, string | undefined> = {};
 
 vi.mock('electron', () => ({
   app: {
@@ -31,6 +30,7 @@ import type { DatabaseInstance } from '../src/main/db/database';
 function createDbMock(): DatabaseInstance {
   const rows = new Map<string, { enabled: number }>();
   const statement = {
+    all: vi.fn(() => []),
     run: vi.fn((...args: unknown[]) => {
       // INSERT OR INTO skills (id, name, description, type, enabled, ...)
       rows.set(String(args[0]), { enabled: Number(args[4]) });
@@ -73,10 +73,13 @@ function readSkillName(skillDir: string): string {
   return match ? match[1].trim() : '';
 }
 
-describe('SkillsManager single-source-of-truth enumeration', () => {
+/**
+ * 全面安装制：SkillsManager 枚举只覆盖全局技能目录。
+ * 插件 skills、项目 .pi/skills、用户 ~/.agents/skills 等自动发现目录一律不可见。
+ */
+describe('SkillsManager install-only enumeration', () => {
   let manager: SkillsManager;
   let globalRoot: string;
-  let pluginRoot: string;
   let projectCwd: string;
 
   beforeEach(() => {
@@ -84,68 +87,40 @@ describe('SkillsManager single-source-of-truth enumeration', () => {
     fs.mkdirSync(path.join(testRoot, 'userData'), { recursive: true });
     fs.mkdirSync(path.join(testRoot, 'home'), { recursive: true });
 
-    // 固定 SDK 自动发现目录（getAgentDir / ~/.agents），避免读到真实用户环境
-    originalEnv.HOME = process.env.HOME;
-    originalEnv.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
-    process.env.HOME = path.join(testRoot, 'home');
-    process.env.PI_CODING_AGENT_DIR = path.join(testRoot, 'agentdir');
-
-    manager = new SkillsManager(createDbMock(), {
-      pluginProvider: {
-        getEnabledRuntimePlugins: async () => [
-          {
-            name: 'plug',
-            runtimePath: path.join(testRoot, 'plugins', 'plug'),
-            componentsEnabled: { skills: true },
-            componentCounts: { skills: 1 },
-          },
-        ],
-      },
-    });
+    manager = new SkillsManager(createDbMock());
 
     // 全局技能：1 个正常 + 1 个缺 description
     globalRoot = manager.getGlobalSkillsPath();
     writeSkill(globalRoot, 'fixture-alpha');
     writeBrokenSkill(globalRoot, 'fixture-broken');
 
-    // 插件技能
-    pluginRoot = path.join(testRoot, 'plugins', 'plug', 'skills');
-    writeSkill(pluginRoot, 'fixture-plugskill');
-
-    // 项目级自动发现：<cwd>/.pi/skills（建 .git 截断祖先目录向上遍历）
+    // 项目级自动发现目录（应被忽略）
     projectCwd = path.join(testRoot, 'project');
     fs.mkdirSync(path.join(projectCwd, '.git'), { recursive: true });
     writeSkill(path.join(projectCwd, '.pi', 'skills'), 'fixture-proj');
 
-    // 用户级自动发现：getAgentDir()/skills 与 ~/.agents/skills
-    writeSkill(path.join(testRoot, 'agentdir', 'skills'), 'fixture-agent-skill');
+    // 用户级自动发现目录（应被忽略）
     writeSkill(path.join(testRoot, 'home', '.agents', 'skills'), 'fixture-home-skill');
+    writeSkill(path.join(testRoot, 'home', '.claude', 'skills'), 'fixture-claude-skill');
   });
 
   afterEach(() => {
-    for (const key of Object.keys(originalEnv)) {
-      if (originalEnv[key] === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = originalEnv[key];
-      }
-    }
     if (testRoot && fs.existsSync(testRoot)) {
       fs.rmSync(testRoot, { recursive: true, force: true });
     }
   });
 
-  it('menu covers global, plugin, project and user auto-discovered skills', async () => {
+  it('menu covers only installed global skills (no auto-discovery)', async () => {
     const menu = await manager.getAvailableSkills(projectCwd);
     const names = new Set(menu.map((s) => s.name));
 
     expect(names.has('fixture-alpha')).toBe(true);
-    expect(names.has('fixture-plugskill')).toBe(true);
-    expect(names.has('fixture-proj')).toBe(true);
-    expect(names.has('fixture-agent-skill')).toBe(true);
-    expect(names.has('fixture-home-skill')).toBe(true);
     // 缺 description 的技能被 SDK 拒绝，不进菜单
     expect(names.has('fixture-broken')).toBe(false);
+    // 自动发现目录一律不可见
+    expect(names.has('fixture-proj')).toBe(false);
+    expect(names.has('fixture-home-skill')).toBe(false);
+    expect(names.has('fixture-claude-skill')).toBe(false);
   });
 
   it('every expanded skill path corresponds to a menu entry (equivalence)', async () => {
@@ -161,28 +136,34 @@ describe('SkillsManager single-source-of-truth enumeration', () => {
       expect(menuNames.has(name), `expanded skill "${name}" missing from menu`).toBe(true);
     }
 
-    // 全局/插件技能（enabled 且有目录）必须进入展开集合
+    // 全局技能（enabled 且有目录）必须进入展开集合
     expect(expandedNames).toContain('fixture-alpha');
-    expect(expandedNames).toContain('fixture-plugskill');
     // 解析失败的技能不进入展开集合
     expect(expandedNames).not.toContain('fixture-broken');
-    // SDK 自动发现目录为名字占位（展开时由 SDK 按 cwd 自行加载），不进 skillPaths
-    expect(expandedNames).not.toContain('fixture-proj');
   });
 
-  it('disabled plugin skill disappears from expansion but stays visible in menu', async () => {
-    // 先枚举一次，让插件候选注册进 loadedSkills
+  it('disabled global skill disappears from expansion but stays visible in menu', async () => {
+    // 先枚举一次，让候选注册进 loadedSkills
     await manager.getAvailableSkills(projectCwd);
-    manager.setSkillEnabled('plugin-plug-fixture-plugskill', false);
+    manager.setSkillEnabled('global-fixture-alpha', false);
 
     const paths = await manager.getSkillPaths();
     const expandedNames = paths.map((p) => readSkillName(p));
-    expect(expandedNames).not.toContain('fixture-plugskill');
+    expect(expandedNames).not.toContain('fixture-alpha');
 
     const menu = await manager.getAvailableSkills(projectCwd);
-    const entry = menu.find((s) => s.name === 'fixture-plugskill');
+    const entry = menu.find((s) => s.name === 'fixture-alpha');
     expect(entry).toBeDefined();
     expect(entry!.enabled).toBe(false);
+  });
+
+  it('installed skills carry sidecar-derived metadata (default local)', async () => {
+    const menu = await manager.getAvailableSkills(projectCwd);
+    const entry = menu.find((s) => s.name === 'fixture-alpha');
+    expect(entry).toBeDefined();
+    expect(entry!.type).toBe('custom');
+    // 无 sidecar 的存量目录按本地展示
+    expect(entry!.source).toBe('local');
   });
 
   it('surfaces parse failures via getLoadDiagnostics', async () => {

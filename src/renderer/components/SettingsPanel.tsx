@@ -5,7 +5,6 @@ import {
   Plug,
   Shield,
   Package,
-  Store,
   Clock3,
   Wifi,
   AlertCircle,
@@ -21,7 +20,6 @@ import { SettingsAPI } from './settings/SettingsAPI';
 import { SettingsSandbox } from './settings/SettingsSandbox';
 import { SettingsConnectors } from './settings/SettingsConnectors';
 import { SettingsSkills } from './settings/SettingsSkills';
-import { SettingsMarketplace } from './settings/SettingsMarketplace';
 import { SettingsSchedule } from './settings/SettingsSchedule';
 import { SettingsGeneral } from './settings/SettingsGeneral';
 import { SettingsLogs } from './settings/SettingsLogs';
@@ -71,6 +69,17 @@ const VALID_TABS = new Set<TabId>([
   'general',
 ]);
 
+/**
+ * 'marketplace' 不再是独立 tab，而是统一「技能」页的导航别名。
+ * 技能页默认首页 = 技能市场（用户决策）：所有落到 skills tab 的入口
+ * （侧栏点击 / 深链 ?tab=marketplace / store.settingsTab / initialTab）
+ * 初始视图一律为 market。nav-server 的 VALID_TABS 不动。
+ */
+function normalizeTab(tab: TabId): { tab: TabId; skillsView: 'installed' | 'market' } {
+  // 'marketplace' 别名归一到 skills tab；技能页默认视图恒为市场首页
+  return { tab: tab === 'marketplace' ? 'skills' : tab, skillsView: 'market' };
+}
+
 export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProps) {
   const { t } = useTranslation();
   const { width } = useWindowSize();
@@ -81,15 +90,22 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
   const setSettingsTab = useAppStore((s) => s.setSettingsTab);
   const resolvedInitial =
     storeTab && VALID_TABS.has(storeTab as TabId) ? (storeTab as TabId) : initialTab;
+  const normalizedInitial = normalizeTab(resolvedInitial);
 
-  const [activeTab, setActiveTab] = useState<TabId>(resolvedInitial);
+  const [activeTab, setActiveTab] = useState<TabId>(normalizedInitial.tab);
+  // 统一技能页视图（'marketplace' 别名进入时 = market）
+  const [skillsView, setSkillsView] = useState<'installed' | 'market'>(
+    normalizedInitial.skillsView
+  );
   // Track which tabs have been viewed at least once (for lazy loading)
-  const [viewedTabs, setViewedTabs] = useState<Set<TabId>>(new Set([resolvedInitial]));
+  const [viewedTabs, setViewedTabs] = useState<Set<TabId>>(new Set([normalizedInitial.tab]));
 
   // Consume the store signal and apply tab in one effect
   useEffect(() => {
     if (storeTab && VALID_TABS.has(storeTab as TabId)) {
-      setActiveTab(storeTab as TabId);
+      const normalized = normalizeTab(storeTab as TabId);
+      setActiveTab(normalized.tab);
+      setSkillsView(normalized.skillsView);
       setSettingsTab(null);
     }
   }, [storeTab, setSettingsTab]);
@@ -125,12 +141,6 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
       label: t('settings.skills'),
       icon: Package,
       description: t('settings.skillsDesc'),
-    },
-    {
-      id: 'marketplace' as TabId,
-      label: t('settings.marketplace'),
-      icon: Store,
-      description: t('settings.marketplaceDesc'),
     },
     {
       id: 'memory' as TabId,
@@ -187,7 +197,13 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
           {visibleTabs.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => {
+                setActiveTab(tab.id);
+                // 侧栏点击技能 tab 回到市场首页（技能页默认视图 = market）
+                if (tab.id === 'skills') {
+                  setSkillsView('market');
+                }
+              }}
               title={compactSidebar ? tab.label : undefined}
               className={`w-full flex items-center ${compactSidebar ? 'justify-center p-2.5' : 'gap-3 px-3.5 py-3'} rounded-lg text-left transition-colors active:scale-[0.98] ${
                 activeTab === tab.id
@@ -219,9 +235,7 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
             {compactSidebar ? <X className="w-4 h-4 mx-auto" /> : t('common.close')}
           </button>
           {!compactSidebar && (
-            <p className="text-[10px] text-text-muted text-center mt-2 select-text">
-              v0.0.1
-            </p>
+            <p className="text-[10px] text-text-muted text-center mt-2 select-text">v0.0.1</p>
           )}
         </div>
       </div>
@@ -268,11 +282,8 @@ export function SettingsPanel({ onClose, initialTab = 'api' }: SettingsPanelProp
                 )}
               </div>
               <div className={activeTab === 'skills' ? '' : 'hidden'}>
-                {viewedTabs.has('skills') && <SettingsSkills isActive={activeTab === 'skills'} />}
-              </div>
-              <div className={activeTab === 'marketplace' ? '' : 'hidden'}>
-                {viewedTabs.has('marketplace') && (
-                  <SettingsMarketplace isActive={activeTab === 'marketplace'} />
+                {viewedTabs.has('skills') && (
+                  <SettingsSkills isActive={activeTab === 'skills'} initialView={skillsView} />
                 )}
               </div>
               <div className={activeTab === 'memory' ? '' : 'hidden'}>

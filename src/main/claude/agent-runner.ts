@@ -61,7 +61,6 @@ import { PromptStrategy, VIRTUAL_WORKSPACE_PATH } from './pipeline/prompt-strate
 import { ToolStrategy } from './pipeline/tool-strategy';
 import { ThinkingStrategy } from './pipeline/thinking-strategy';
 import type { ModelContext, PiThinkingLevel, TaskContext } from './pipeline/context-types';
-import { PluginRuntimeService } from '../skills/plugin-runtime-service';
 import type { SkillsAdapter } from '../skills/skills-adapter';
 import { SkillsRuntime } from './skills-runtime';
 import { AgentRuntimeExtensionManager } from '../extensions/agent-runtime-extension-manager';
@@ -114,10 +113,7 @@ import {
 import { expandSkillCommand } from './pipeline/skill-command';
 import { PiSessionFactory } from './pipeline/session-factory';
 import { buildMcpCustomTools } from './tools/mcp-tool-bridge';
-import {
-  buildDispatchAgentTool,
-  resetTurnBudget,
-} from './subagent/subagent-tool';
+import { buildDispatchAgentTool, resetTurnBudget } from './subagent/subagent-tool';
 import { resolveSearchEndpoint } from './subagent/search-endpoint';
 // bash 工具包装链（timeout/sudo）已迁至 pipeline/tool-strategy.ts（Phase 4）。
 // 冷启动历史序列化 + 组装已迁至 pipeline/cold-start-history.ts（Phase 1/5）；
@@ -231,7 +227,6 @@ export class ClaudeAgentRunner {
     options: AgentRunnerOptions,
     pathResolver: PathResolver,
     mcpManager?: MCPManager,
-    pluginRuntimeService?: PluginRuntimeService,
     skillsAdapter?: SkillsAdapter,
     extensionManager?: AgentRuntimeExtensionManager
   ) {
@@ -243,8 +238,6 @@ export class ClaudeAgentRunner {
     this.pathResolver = pathResolver;
     this.mcpManager = mcpManager;
     this.skillsRuntime = new SkillsRuntime({
-      sendToRenderer: options.sendToRenderer,
-      pluginRuntimeService,
       skillsAdapter,
     });
     this.extensionManager = extensionManager;
@@ -580,15 +573,14 @@ export class ClaudeAgentRunner {
                 sessionId: session.id,
                 phase: 'syncing_skills',
                 message: 'Configuring skills...',
-                detail: 'Copying built-in skills to sandbox',
+                detail: 'Copying installed skills to sandbox',
                 fileCount: syncResult.fileCount,
                 totalSize: syncResult.totalSize,
               },
             });
           }
 
-          // Copy skills to sandbox ~/.claude/skills/
-          const builtinSkillsPath = this.skillsRuntime.getBuiltinSkillsPath();
+          // Copy installed skills to sandbox ~/.claude/skills/
           try {
             const distro = sandbox.wslStatus!.distro!;
             const sandboxSkillsPath = `${sandboxPath}/.claude/skills`;
@@ -599,28 +591,10 @@ export class ClaudeAgentRunner {
               timeout: 10000,
             });
 
-            if (builtinSkillsPath && fs.existsSync(builtinSkillsPath)) {
-              // Use rsync via execFileSync with array args to avoid shell injection
-              const wslSourcePath = pathConverter.toWSL(builtinSkillsPath);
-              log(
-                `[ClaudeAgentRunner] Copying skills with rsync: ${wslSourcePath}/ -> ${sandboxSkillsPath}/`
-              );
-
-              execFileSync(
-                'wsl',
-                ['-d', distro, '-e', 'rsync', '-av', wslSourcePath + '/', sandboxSkillsPath + '/'],
-                {
-                  encoding: 'utf-8',
-                  timeout: 120000, // 2 min timeout for large skill directories
-                }
-              );
-            }
-
             const appSkillsDir = this.skillsRuntime.getRuntimeSkillsDir();
             if (!fs.existsSync(appSkillsDir)) {
               fs.mkdirSync(appSkillsDir, { recursive: true });
             }
-            this.skillsRuntime.syncUserSkillsToAppDir(appSkillsDir);
             this.skillsRuntime.syncConfiguredSkillsToRuntimeDir(appSkillsDir);
 
             if (fs.existsSync(appSkillsDir)) {
@@ -731,15 +705,14 @@ export class ClaudeAgentRunner {
                 sessionId: session.id,
                 phase: 'syncing_skills',
                 message: 'Configuring skills...',
-                detail: 'Copying built-in skills to sandbox',
+                detail: 'Copying installed skills to sandbox',
                 fileCount: syncResult.fileCount,
                 totalSize: syncResult.totalSize,
               },
             });
           }
 
-          // Copy skills to sandbox ~/.claude/skills/
-          const builtinSkillsPath = this.skillsRuntime.getBuiltinSkillsPath();
+          // Copy installed skills to sandbox ~/.claude/skills/
           try {
             const sandboxSkillsPath = `${sandboxPath}/.claude/skills`;
 
@@ -753,36 +726,10 @@ export class ClaudeAgentRunner {
               }
             );
 
-            if (builtinSkillsPath && fs.existsSync(builtinSkillsPath)) {
-              // Use rsync via execFileSync with array args to avoid shell injection
-              // Lima mounts /Users directly, so paths are the same
-              log(
-                `[ClaudeAgentRunner] Copying skills with rsync: ${builtinSkillsPath}/ -> ${sandboxSkillsPath}/`
-              );
-
-              execFileSync(
-                'limactl',
-                [
-                  'shell',
-                  'claude-sandbox',
-                  '--',
-                  'rsync',
-                  '-av',
-                  builtinSkillsPath + '/',
-                  sandboxSkillsPath + '/',
-                ],
-                {
-                  encoding: 'utf-8',
-                  timeout: 120000, // 2 min timeout for large skill directories
-                }
-              );
-            }
-
             const appSkillsDir = this.skillsRuntime.getRuntimeSkillsDir();
             if (!fs.existsSync(appSkillsDir)) {
               fs.mkdirSync(appSkillsDir, { recursive: true });
             }
-            this.skillsRuntime.syncUserSkillsToAppDir(appSkillsDir);
             this.skillsRuntime.syncConfiguredSkillsToRuntimeDir(appSkillsDir);
 
             if (fs.existsSync(appSkillsDir)) {
@@ -1158,11 +1105,9 @@ export class ClaudeAgentRunner {
           },
         },
       });
-      const customTools = this.toolStrategy.mergeCustomTools(
-        mcpCustomTools,
-        extensionCustomTools,
-        [dispatchAgentTool]
-      );
+      const customTools = this.toolStrategy.mergeCustomTools(mcpCustomTools, extensionCustomTools, [
+        dispatchAgentTool,
+      ]);
       if (mcpCustomTools.length > 0) {
         log(
           `[ClaudeAgentRunner] Registered ${mcpCustomTools.length} MCP tools as customTools:`,

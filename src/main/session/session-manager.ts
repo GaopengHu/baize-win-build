@@ -38,7 +38,6 @@ import { ClaudeAgentRunner } from '../claude/agent-runner';
 import { configStore } from '../config/config-store';
 import { MCPManager } from '../mcp/mcp-manager';
 import { mcpConfigStore } from '../mcp/mcp-config-store';
-import { PluginRuntimeService } from '../skills/plugin-runtime-service';
 import { SkillsAdapter } from '../skills/skills-adapter';
 import { AgentRuntimeExtensionManager } from '../extensions/agent-runtime-extension-manager';
 import { forgetSessionPermissions } from '../config/permission-rules-store';
@@ -72,8 +71,7 @@ const TITLE_GENERATION_TIMEOUT_MS = 20000;
 // Internal continuation prompt for silent resume (never persisted as a user
 // message, never displayed). Carries the intent to keep generating from the
 // existing context, which already holds the rescued partial reply.
-const RESUME_PROMPT =
-  '请从上次中断的地方继续输出，不要重复已经输出过的内容，不要解释，直接继续.';
+const RESUME_PROMPT = '请从上次中断的地方继续输出，不要重复已经输出过的内容，不要解释，直接继续.';
 
 /**
  * Windows 下同名附件反复上传时，<cwd>\.tmp\<原名> 经常被占用（上次拷贝句柄 /
@@ -124,12 +122,13 @@ export class SessionManager {
   private sandboxAdapter: SandboxAdapter;
   private agentRunner!: AgentRunner;
   private mcpManager: MCPManager;
-  private pluginRuntimeService?: PluginRuntimeService;
   private extensionManager?: AgentRuntimeExtensionManager;
   private skillsAdapter?: SkillsAdapter;
   private activeSessions: Map<string, AbortController> = new Map();
-  private promptQueues: Map<string, Array<{ prompt: string; content?: ContentBlock[]; silent?: boolean }>> =
-    new Map();
+  private promptQueues: Map<
+    string,
+    Array<{ prompt: string; content?: ContentBlock[]; silent?: boolean }>
+  > = new Map();
   private pendingPermissions: Map<
     string,
     {
@@ -176,7 +175,6 @@ export class SessionManager {
   constructor(
     db: DatabaseInstance,
     sendToRenderer: (event: ServerEvent) => void,
-    pluginRuntimeService?: PluginRuntimeService,
     extensionManager?: AgentRuntimeExtensionManager,
     skillsAdapter?: SkillsAdapter
   ) {
@@ -202,7 +200,6 @@ export class SessionManager {
     };
     this.pathResolver = new PathResolver();
     this.sandboxAdapter = getSandboxAdapter();
-    this.pluginRuntimeService = pluginRuntimeService;
     this.extensionManager = extensionManager;
     this.skillsAdapter = skillsAdapter;
 
@@ -243,7 +240,6 @@ export class SessionManager {
       },
       this.pathResolver,
       this.mcpManager,
-      this.pluginRuntimeService,
       this.skillsAdapter,
       this.extensionManager
     );

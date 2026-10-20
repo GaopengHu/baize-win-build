@@ -63,7 +63,7 @@
     "test:coverage": "vitest run --coverage",
     "bench": "vitest bench",
     "bench:api": "node scripts/bench-api.mjs",
-    "rebuild": "npx @electron/rebuild -v 22.3.27 --only better-sqlite3 --force",
+    "rebuild": "node scripts/rebuild-better-sqlite3.mjs",
     "typecheck": "tsc --noEmit",
     "pre-build-check": "node scripts/pre-build-check.js",
     "clean": "rimraf dist dist-electron dist-mcp dist-wsl-agent dist-lima-agent .bundle-resources release",

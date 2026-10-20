@@ -41,10 +41,7 @@ import type { AuthStorage } from '../shared-auth';
 import { log, logError, logWarn } from '../../utils/logger';
 import { installPermissionHook, type PermissionHookDeps } from '../tools/permission-hook';
 import { wrapBashToolWithDefaultTimeout } from '../tools/bash-tool-wrappers';
-import {
-  performSearch,
-  type ResolvedSearchEndpoint,
-} from './search-endpoint';
+import { performSearch, type ResolvedSearchEndpoint } from './search-endpoint';
 
 export type SubagentProfileName = 'research' | 'document' | 'general';
 
@@ -213,7 +210,9 @@ export interface SubagentRunResult {
   aborted: boolean;
 }
 
-function buildWebSearchTool(search: ResolvedSearchEndpoint): ToolDefinition<TSchema, unknown> | null {
+function buildWebSearchTool(
+  search: ResolvedSearchEndpoint
+): ToolDefinition<TSchema, unknown> | null {
   if (search.engine === 'none' || search.engine === 'chrome-mcp') {
     return null;
   }
@@ -259,12 +258,8 @@ export async function runSubagent(
   const webSearchTool = buildWebSearchTool(deps.search);
   // engine='none' = 彻底断网：连 Chrome MCP 浏览工具也不并入。
   // （'chrome-mcp' 引擎才用 Chrome 工具充当联网入口；'none' 必须是什么都不留。）
-  const browsingTools =
-    deps.search.engine === 'none' ? [] : (deps.chromeBrowsingTools ?? []);
-  const customTools = deps.mergeCustomTools(
-    webSearchTool ? [webSearchTool] : [],
-    browsingTools
-  );
+  const browsingTools = deps.search.engine === 'none' ? [] : (deps.chromeBrowsingTools ?? []);
+  const customTools = deps.mergeCustomTools(webSearchTool ? [webSearchTool] : [], browsingTools);
   log(
     `[SubagentRunner] child tools: ${(builtinTools as { name?: string }[]).map((t) => t.name ?? '?').join(',')} + custom: ${customTools.map((t) => t.name).join(',') || '(none)'}`
   );
@@ -280,6 +275,9 @@ export async function runSubagent(
           noThemes: true,
         }
       : {
+          // 全面安装制：关闭 SDK skills 自动发现，只加载父会话传入的
+          // additionalSkillPaths（全局目录启用项）。
+          noSkills: true,
           additionalSkillPaths: deps.skillPaths ?? [],
           noExtensions: true,
           noPromptTemplates: true,

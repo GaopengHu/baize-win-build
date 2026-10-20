@@ -222,8 +222,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Skills methods
   skills: {
     getAll: (): Promise<Skill[]> => ipcRenderer.invoke('skills.getAll'),
-    install: (skillPath: string): Promise<{ success: boolean; skill: Skill }> =>
-      ipcRenderer.invoke('skills.install', skillPath),
+    install: (
+      skillPath: string,
+      options?: { enabled?: boolean }
+    ): Promise<{ success: boolean; skill: Skill }> =>
+      ipcRenderer.invoke('skills.install', skillPath, options),
     delete: (skillId: string): Promise<{ success: boolean }> =>
       ipcRenderer.invoke('skills.delete', skillId),
     setEnabled: (skillId: string, enabled: boolean): Promise<{ success: boolean }> =>
@@ -276,6 +279,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       appId: number;
       packageId: number;
       skillName?: string;
+      version?: string;
     }): Promise<MarketplaceSkillInstallResult> =>
       ipcRenderer.invoke('marketplace.installSkill', input),
     submitRating: (input: {
@@ -555,7 +559,10 @@ declare global {
       };
       skills: {
         getAll: () => Promise<Skill[]>;
-        install: (skillPath: string) => Promise<{ success: boolean; skill: Skill }>;
+        install: (
+          skillPath: string,
+          options?: { enabled?: boolean }
+        ) => Promise<{ success: boolean; skill: Skill }>;
         delete: (skillId: string) => Promise<{ success: boolean }>;
         setEnabled: (skillId: string, enabled: boolean) => Promise<{ success: boolean }>;
         validate: (skillPath: string) => Promise<{ valid: boolean; errors: string[] }>;
@@ -593,6 +600,7 @@ declare global {
           appId: number;
           packageId: number;
           skillName?: string;
+          version?: string;
         }) => Promise<MarketplaceSkillInstallResult>;
         submitRating: (input: {
           appId: number;

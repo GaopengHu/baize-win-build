@@ -1,22 +1,23 @@
 /**
  * @module main/skills/skills-manager
  *
- * Skill discovery and lifecycle (999 lines).
+ * Skill lifecycle（全面安装制）.
  *
  * Responsibilities:
- * - Discovers built-in skills from .claude/skills/ directories
- * - Parses SKILL.md front-matter for metadata (name, description, triggers)
+ * - 枚举全局技能目录（<userData>/claude/skills 或用户配置路径）中已安装的技能
+ * - 技能只能通过公司技能市场安装或本地文件夹安装进入该目录——
+ *   不预置任何技能、不自动发现任何其他目录（SDK 发现目录、~/.claude/skills、插件 skills）
+ * - Parses SKILL.md front-matter for metadata (name, description)
+ * - 安装/卸载/启停持久化（SQLite skills 表）+ sidecar 来源元数据
  * - Hot-reload via chokidar file watcher
- * - Plugin install/uninstall from npm-style package specs
  *
  * Dependencies: config-store, database, chokidar
  */
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { app } from 'electron';
 import chokidar, { type FSWatcher } from 'chokidar';
-import { getAgentDir, loadSkillsFromDir } from '@mariozechner/pi-coding-agent';
+import { loadSkillsFromDir } from '@mariozechner/pi-coding-agent';
 import type { Skill, PluginInstallResult, SkillLoadDiagnostic } from '../../renderer/types';
 import type { DatabaseInstance } from '../db/database';
 import { log, logError, logWarn } from '../utils/logger';
@@ -24,41 +25,100 @@ import { isPathWithinRoot } from '../tools/path-containment';
 import type { SkillsAdapter } from './skills-adapter';
 
 /**
- * Built-in skills that are enabled by default on first run.
- * Any other skill dropped into the built-in skills directory
- * (e.g. `.claude/skills/<name>/SKILL.md`) defaults to disabled
- * until the user flips its power toggle in settings.
- */
-const DEFAULT_ENABLED_BUILTIN_SKILLS = new Set([
-  'docx',
-  'pdf',
-  'pptx',
-  'xlsx',
-  'skill-creator',
-  'gov-procurement-review',
-]);
-
-/**
  * Validate that a skill name is safe for use as a directory name.
  * Rejects names containing path separators or parent directory references.
  */
+/**
+ * 技能安装态元数据（`.nowlink-marketplace.json`，与技能目录同级存放）。
+ *
+ * 全面安装制下所有技能都来自「市场安装」或「本地文件夹安装」，sidecar 记录
+ * 其来源，用于：市场列表标记「已安装」、版本比较提示「更新」、UI 来源徽标。
+ * 无 sidecar 的存量目录（升级前的旧数据）按 'local' 展示。
+ */
+export interface SkillSidecar {
+  /** 公司技能市场应用 id（本地安装无） */
+  appId?: number;
+  /** 市场中文展示名（内部名/目录名保持包内英文，模型调用不受影响） */
+  displayName?: string;
+  /** 安装时记录的市场版本号 */
+  version?: string;
+  installedAt?: number;
+  source: 'marketplace' | 'local';
+}
+
+const SIDECAR_FILENAME = '.nowlink-marketplace.json';
+
+export function skillSidecarPath(skillDir: string): string {
+  return path.join(skillDir, SIDECAR_FILENAME);
+}
+
+/**
+ * 读取技能 sidecar。兼容旧格式 `{ appId, displayName }`（视为 marketplace）。
+ * 无文件或解析失败返回 null——调用方回退「本地」展示、显示内部名。
+ */
+export function readSkillSidecar(skillDir: string): SkillSidecar | null {
+  try {
+    const sidecar = skillSidecarPath(skillDir);
+    if (!fs.existsSync(sidecar)) return null;
+    const raw = JSON.parse(fs.readFileSync(sidecar, 'utf-8')) as Partial<SkillSidecar> & {
+      displayName?: unknown;
+      appId?: unknown;
+      version?: unknown;
+      installedAt?: unknown;
+      source?: unknown;
+    };
+    if (!raw || typeof raw !== 'object') return null;
+
+    const source: SkillSidecar['source'] = raw.source === 'local' ? 'local' : 'marketplace';
+    const result: SkillSidecar = { source };
+
+    if (typeof raw.appId === 'number' && Number.isFinite(raw.appId)) result.appId = raw.appId;
+    if (typeof raw.displayName === 'string' && raw.displayName.trim()) {
+      result.displayName = raw.displayName.trim();
+    }
+    if (typeof raw.version === 'string' && raw.version.trim()) {
+      result.version = raw.version.trim();
+    }
+    if (typeof raw.installedAt === 'number' && Number.isFinite(raw.installedAt)) {
+      result.installedAt = raw.installedAt;
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 写入技能 sidecar（安装/更新成功后调用）。写入失败不影响安装结果，
+ * 仅降级为「无来源信息」（UI 显示本地、市场列表不标记已安装）。
+ */
+export function writeSkillSidecar(
+  skillDir: string,
+  sidecar: Partial<SkillSidecar> & { source?: SkillSidecar['source'] }
+): void {
+  try {
+    const payload: SkillSidecar = {
+      ...sidecar,
+      source: sidecar.source === 'marketplace' ? 'marketplace' : 'local',
+      installedAt: sidecar.installedAt ?? Date.now(),
+    };
+    fs.writeFileSync(skillSidecarPath(skillDir), JSON.stringify(payload, null, 2), 'utf-8');
+  } catch (error) {
+    logWarn(
+      `[Skills] Failed to write sidecar for ${skillDir}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+}
+
 /**
  * 市场安装 sidecar（`.nowlink-marketplace.json`）读取：{ appId, displayName }。
  * 显示层用 displayName（中文），内部名/目录名保持包内英文，模型调用不受影响。
  * 无文件或解析失败返回 null，调用方回退显示内部名。
  */
 export function readMarketplaceDisplayName(skillDir: string): string | null {
-  try {
-    const sidecar = path.join(skillDir, '.nowlink-marketplace.json');
-    if (!fs.existsSync(sidecar)) return null;
-    const raw = JSON.parse(fs.readFileSync(sidecar, 'utf-8')) as {
-      displayName?: unknown;
-    };
-    const name = typeof raw.displayName === 'string' ? raw.displayName.trim() : '';
-    return name || null;
-  } catch {
-    return null;
-  }
+  return readSkillSidecar(skillDir)?.displayName ?? null;
 }
 
 function validateSkillName(name: string): void {
@@ -110,26 +170,6 @@ interface SkillsManagerOptions {
   getConfiguredGlobalSkillsPath?: () => string | undefined;
   setConfiguredGlobalSkillsPath?: (nextPath: string) => void;
   watchStorage?: boolean;
-  /**
-   * 插件运行时提供者（结构性 duck-type，避免与 PluginRuntimeService 的模块级
-   * 循环 import——与 setSkillsManager 相同的 late-binding 思路）。
-   */
-  pluginProvider?: RuntimePluginSkillsProvider;
-}
-
-/**
- * getEnabledRuntimePlugins() 的最小结构化视图（InstalledPlugin 的子集），
- * 只要求枚举插件技能目录所需的字段。
- */
-export interface RuntimePluginSkillsProvider {
-  getEnabledRuntimePlugins(): Promise<
-    Array<{
-      name: string;
-      runtimePath: string;
-      componentsEnabled: { skills?: boolean };
-      componentCounts: { skills?: number };
-    }>
-  >;
 }
 
 /**
@@ -138,16 +178,17 @@ export interface RuntimePluginSkillsProvider {
  * 只参与名字去重（如 legacy .json 条目），不会进入 skillPaths。
  */
 interface SkillCandidate {
-  /** 渲染层 Skill.id：builtin-<dir> / global-<dir> / plugin-<plugin>-<name> / project-<name> / user-<name> */
+  /** 渲染层 Skill.id：global-<dir>（目录技能）/ user-<n>（legacy .json 条目） */
   id: string;
   name: string;
   description: string;
   displayName?: string;
-  origin: 'builtin' | 'global' | 'plugin' | 'project' | 'user';
   /** 技能目录（SDK Skill.baseDir）；undefined = 仅名字占位（SDK 自动加载，不进 skillPaths） */
   path?: string;
   enabled: boolean;
   createdAt: number;
+  /** 安装态 sidecar 派生字段（版本/来源/市场 appId） */
+  sidecar?: SkillSidecar | null;
 }
 
 /** 技能加载诊断（解析失败/缺 frontmatter/插件目录缺失等），供设置页展示。 */
@@ -168,10 +209,9 @@ export interface SetGlobalSkillsPathResult {
 /**
  * SkillsManager - Manages skill loading and MCP server lifecycle
  *
- * Skills loading priority:
- * 1. Project-level: <project>/.skills/ or <project>/skills/
- * 2. Global: <userData>/claude/skills/ (includes ~/.claude/skills read-only)
- * 3. Built-in skills
+ * Skills loading（全面安装制）:
+ * - 仅枚举全局技能目录（<userData>/claude/skills 或用户配置路径）
+ * - 技能只能通过公司技能市场安装或本地文件夹安装；不预置、不自动发现
  */
 export class SkillsManager implements SkillsAdapter {
   private db: DatabaseInstance;
@@ -179,7 +219,6 @@ export class SkillsManager implements SkillsAdapter {
   private runningServers: Map<string, { process: unknown; skill: Skill }> = new Map();
   private getConfiguredGlobalSkillsPathFn?: () => string | undefined;
   private setConfiguredGlobalSkillsPathFn?: (nextPath: string) => void;
-  private pluginProvider?: RuntimePluginSkillsProvider;
   private watchStorageEnabled: boolean;
   private storageWatcher: FSWatcher | null = null;
   private storagePollingTimer: NodeJS.Timeout | null = null;
@@ -189,125 +228,69 @@ export class SkillsManager implements SkillsAdapter {
   private storageCallbacks = new Set<(event: SkillsStorageChangeEvent) => void>();
   /** 最近一次枚举收集的加载诊断（枚举期，每次 collectSkillCandidates 重置） */
   private lastLoadDiagnostics: SkillLoadDiagnostic[] = [];
-  /** 构造期/持久化加载路径记录的诊断（loadBuiltinSkills 等），跨枚举保留 */
+  /** 构造期记录的诊断（如迁移过程），跨枚举保留 */
   private pendingDiagnostics: SkillLoadDiagnostic[] = [];
 
   constructor(db: DatabaseInstance, options: SkillsManagerOptions = {}) {
     this.db = db;
     this.getConfiguredGlobalSkillsPathFn = options.getConfiguredGlobalSkillsPath;
     this.setConfiguredGlobalSkillsPathFn = options.setConfiguredGlobalSkillsPath;
-    this.pluginProvider = options.pluginProvider;
     this.watchStorageEnabled = options.watchStorage === true;
-    this.loadBuiltinSkills();
+    this.migrateLegacyBuiltinState();
     if (this.watchStorageEnabled) {
       this.startStorageWatcher();
     }
   }
 
-  /** PluginRuntimeService 的晚绑定入口（与 setSkillsManager 对称，避免循环依赖）。 */
-  setPluginProvider(provider: RuntimePluginSkillsProvider): void {
-    this.pluginProvider = provider;
-  }
-
   /**
-   * Load built-in skills
+   * 老版本升级迁移（幂等）：
+   * 1. SQLite 中 `builtin-<name>` 行的 enabled 状态继承给同名 `global-<name>` 行
+   *    （仅当全局目录存在同名技能目录且尚无 global 行时新建）；
+   * 2. 删除所有 `builtin-%` 行。
+   * 全新安装用户：无 builtin 行，本方法为空操作。
    */
-  private loadBuiltinSkills(): void {
-    // Load skills from .claude/skills directory (like pdf, xlsx, docx, pptx)
-    const builtinSkillsPath = this.getBuiltinSkillsPath();
-    if (builtinSkillsPath) {
-      try {
-        const skillDirs = fs.readdirSync(builtinSkillsPath);
-
-        for (const dir of skillDirs) {
-          const skillPath = path.join(builtinSkillsPath, dir);
-
-          if (isDanglingSymlink(skillPath)) {
-            logWarn(`[Skills] Skipping dangling symlink in built-in skills: ${skillPath}`);
-            continue;
-          }
-
-          let stat: fs.Stats;
-          try {
-            stat = fs.statSync(skillPath);
-          } catch {
-            continue;
-          }
-
-          if (!stat.isDirectory()) continue;
-
-          // Look for SKILL.md
-          const skillMdPath = path.join(skillPath, 'SKILL.md');
-          if (!fs.existsSync(skillMdPath)) continue;
-
-          // Parse metadata
-          const metadata = this.getSkillMetadata(skillPath);
-          if (!metadata) continue;
-
-          const existing = this.loadedSkills.get(`builtin-${dir}`);
-          const enabled = this.getPersistedEnabled(
-            `builtin-${dir}`,
-            DEFAULT_ENABLED_BUILTIN_SKILLS.has(dir.toLowerCase())
-          );
-
-          const skill: Skill = {
-            id: `builtin-${dir}`,
-            name: metadata.name,
-            description: metadata.description,
-            type: 'builtin',
-            enabled,
-            createdAt: existing?.createdAt ?? Date.now(),
-          };
-
-          this.loadedSkills.set(skill.id, skill);
-          log(`Loaded built-in skill: ${skill.name} (enabled=${enabled})`);
-        }
-      } catch (error) {
-        logError('Failed to load built-in skills from .claude/skills:', error);
-      }
-    }
-  }
-
-  /**
-   * Get the built-in skills directory path
-   */
-  private getBuiltinSkillsPath(): string {
-    const appPath = app.getAppPath();
-    const unpackedPath = appPath.replace(/\.asar$/, '.asar.unpacked');
-
-    const possiblePaths = [
-      // Development
-      path.join(__dirname, '..', '..', '..', '.claude', 'skills'),
-      // Production: extraResources extracts .claude/skills → resources/skills
-      path.join(process.resourcesPath || '', 'skills'),
-      // Legacy: in app.asar.unpacked (for older builds with asarUnpack)
-      ...(this.physicalDirExists(path.join(unpackedPath, '.claude', 'skills'))
-        ? [path.join(unpackedPath, '.claude', 'skills')]
-        : []),
-      // Last resort: read from inside the asar archive (Electron intercepts this)
-      path.join(appPath, '.claude', 'skills'),
-    ];
-
-    for (const p of possiblePaths) {
-      if (fs.existsSync(p)) {
-        return p;
-      }
-    }
-
-    return '';
-  }
-
-  /**
-   * Check if a directory physically exists on disk, bypassing Electron's
-   * asar interception. Uses try/catch with lstatSync on the real filesystem.
-   */
-  private physicalDirExists(dirPath: string): boolean {
+  private migrateLegacyBuiltinState(): void {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const originalFs = require('original-fs') as typeof import('fs');
-      return originalFs.existsSync(dirPath) && originalFs.statSync(dirPath).isDirectory();
-    } catch {
-      return false;
+      const rows = this.db
+        .prepare("SELECT id, name, enabled FROM skills WHERE id LIKE 'builtin-%'")
+        .all() as Array<{ id: string; name: string; enabled: number }>;
+      if (!rows || rows.length === 0) return;
+
+      let globalDir: string;
+      try {
+        globalDir = this.getGlobalSkillsPath();
+      } catch {
+        return;
+      }
+
+      let dirEntries: string[] = [];
+      try {
+        dirEntries = fs.readdirSync(globalDir);
+      } catch {
+        dirEntries = [];
+      }
+      const dirSet = new Set(dirEntries.map((entry) => entry.toLowerCase()));
+
+      for (const row of rows) {
+        const dirName = row.id.replace(/^builtin-/, '');
+        const globalId = `global-${dirName}`;
+        if (!dirSet.has(dirName.toLowerCase())) continue;
+        const existing = this.db.prepare('SELECT id FROM skills WHERE id = ?').get(globalId) as
+          | { id: string }
+          | undefined;
+        if (existing) continue;
+        this.db
+          .prepare(
+            'INSERT INTO skills (id, name, description, type, enabled, config, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          )
+          .run(globalId, row.name || dirName, '', 'custom', row.enabled ? 1 : 0, null, Date.now());
+        log(`[Skills] Migrated builtin enabled state to ${globalId} (enabled=${!!row.enabled})`);
+      }
+
+      this.db.prepare("DELETE FROM skills WHERE id LIKE 'builtin-%'").run();
+      log(`[Skills] Removed ${rows.length} legacy builtin skill row(s)`);
+    } catch (error) {
+      logWarn(`[Skills] Legacy builtin state migration failed: ${String(error)}`);
     }
   }
 
@@ -375,7 +358,7 @@ export class SkillsManager implements SkillsAdapter {
     }
   }
 
-  private clearSkillsBySource(source: 'project' | 'global'): void {
+  private clearSkillsBySource(source: 'global'): void {
     const prefix = `${source}-`;
     for (const key of Array.from(this.loadedSkills.keys())) {
       if (key.startsWith(prefix)) {
@@ -504,82 +487,6 @@ export class SkillsManager implements SkillsAdapter {
     }
   }
 
-  private getUserSkillsPath(): string {
-    return path.join(app.getPath('home'), '.claude', 'skills');
-  }
-
-  private async importUserSkills(globalSkillsPath: string): Promise<void> {
-    const userSkillsPath = this.getUserSkillsPath();
-    if (!fs.existsSync(userSkillsPath)) {
-      return;
-    }
-
-    const entries = fs.readdirSync(userSkillsPath, { withFileTypes: true });
-    for (const entry of entries) {
-      // Dirent.isDirectory() returns false for symlinks; check symlinks separately
-      const sourcePath = path.join(userSkillsPath, entry.name);
-      if (entry.isSymbolicLink()) {
-        if (isDanglingSymlink(sourcePath)) {
-          logWarn(`[Skills] Skipping dangling symlink in user skills: ${sourcePath}`);
-          continue;
-        }
-        // Valid symlink — resolve to check if it's a directory
-        try {
-          if (!fs.statSync(sourcePath).isDirectory()) continue;
-        } catch {
-          continue;
-        }
-      } else if (!entry.isDirectory()) {
-        continue;
-      }
-
-      const targetPath = path.join(globalSkillsPath, entry.name);
-
-      // Clean up dangling symlinks at the target before re-importing
-      if (isDanglingSymlink(targetPath)) {
-        try {
-          fs.unlinkSync(targetPath);
-          logWarn(`[Skills] Removed dangling symlink at target: ${targetPath}`);
-        } catch (unlinkErr) {
-          logError(`[Skills] Failed to remove dangling symlink: ${targetPath}`, unlinkErr);
-          continue;
-        }
-      } else if (fs.existsSync(targetPath)) {
-        continue;
-      }
-
-      try {
-        fs.symlinkSync(sourcePath, targetPath, 'dir');
-      } catch (err) {
-        try {
-          await this.copyDirectory(sourcePath, targetPath);
-        } catch (copyErr) {
-          logError(`Failed to import user skill from ${sourcePath}:`, copyErr);
-        }
-      }
-    }
-  }
-
-  /**
-   * Load skills from a project directory
-   */
-  async loadProjectSkills(projectPath: string): Promise<Skill[]> {
-    const skills: Skill[] = [];
-    this.clearSkillsBySource('project');
-
-    // Check for .skills/ or skills/ directory
-    const skillsDirs = [path.join(projectPath, '.skills'), path.join(projectPath, 'skills')];
-
-    for (const skillsDir of skillsDirs) {
-      if (fs.existsSync(skillsDir) && fs.statSync(skillsDir).isDirectory()) {
-        const loadedSkills = await this.loadSkillsFromDirectory(skillsDir, 'project');
-        skills.push(...loadedSkills);
-      }
-    }
-
-    return skills;
-  }
-
   /**
    * Load global skills from user config directory
    */
@@ -593,7 +500,6 @@ export class SkillsManager implements SkillsAdapter {
     // Proactively clean up dangling symlinks left by previous app versions
     this.cleanDanglingSymlinks(globalSkillsPath);
 
-    await this.importUserSkills(globalSkillsPath);
     const signature = this.computeStorageSignature(globalSkillsPath);
     if (this.globalSkillsLoaded && signature === this.loadedGlobalSkillsSignature) {
       return Array.from(this.loadedSkills.values()).filter((skill) =>
@@ -660,12 +566,9 @@ export class SkillsManager implements SkillsAdapter {
   }
 
   /**
-   * Load skills from a directory
+   * Load skills from the global storage directory
    */
-  private async loadSkillsFromDirectory(
-    dir: string,
-    source: 'project' | 'global'
-  ): Promise<Skill[]> {
+  private async loadSkillsFromDirectory(dir: string, source: 'global'): Promise<Skill[]> {
     const skills: Skill[] = [];
 
     try {
@@ -695,15 +598,22 @@ export class SkillsManager implements SkillsAdapter {
             const metadata = this.getSkillMetadata(entryPath);
             if (!metadata) continue;
 
+            // 安装态 sidecar：displayName（市场中文名）+ 版本/来源/appId。
+            // 无 sidecar 的存量目录回退「本地」展示（source: 'local'）。
+            const sidecar = readSkillSidecar(entryPath);
+
             const skill: Skill = {
               id: `${source}-${entry}`,
               name: metadata.name,
-              // 市场安装时写入的中文展示名（内部名保持包内英文，模型调用不受影响）
-              displayName: readMarketplaceDisplayName(entryPath) ?? undefined,
+              displayName: sidecar?.displayName ?? undefined,
               description: metadata.description,
               type: 'custom',
               enabled: this.getPersistedEnabled(`${source}-${entry}`, true),
               createdAt: Date.now(),
+              version: sidecar?.version,
+              source: sidecar?.source ?? 'local',
+              installedAt: sidecar?.installedAt,
+              appId: sidecar?.appId,
             };
 
             skills.push(skill);
@@ -745,71 +655,37 @@ export class SkillsManager implements SkillsAdapter {
 
   /**
    * Get all active skills for a session
+   *
+   * 全面安装制：仅全局技能目录中已安装且启用的技能。
    */
-  async getActiveSkills(_sessionId: string, projectPath?: string): Promise<Skill[]> {
-    const skills: Skill[] = [];
-
-    // 1. Add built-in skills
-    for (const skill of this.loadedSkills.values()) {
-      if (skill.type === 'builtin' && skill.enabled) {
-        skills.push(skill);
-      }
-    }
-
-    // 2. Add global skills
+  async getActiveSkills(_sessionId: string, _projectPath?: string): Promise<Skill[]> {
     const globalSkills = await this.loadGlobalSkills();
-    skills.push(...globalSkills.filter((s) => s.enabled));
-
-    // 3. Add project skills (highest priority, can override)
-    if (projectPath) {
-      const projectSkills = await this.loadProjectSkills(projectPath);
-
-      // Project skills can override global/builtin by name
-      for (const projectSkill of projectSkills) {
-        if (!projectSkill.enabled) continue;
-
-        const existingIndex = skills.findIndex((s) => s.name === projectSkill.name);
-        if (existingIndex >= 0) {
-          skills[existingIndex] = projectSkill;
-        } else {
-          skills.push(projectSkill);
-        }
-      }
-    }
-
-    return skills;
+    return globalSkills.filter((s) => s.enabled);
   }
 
   /**
    * 技能宇宙的唯一枚举入口（单一真相源）。
    *
-   * 覆盖四类来源，与 /skill:<name> 展开时 SDK 实际加载的集合对齐：
-   * - builtin：<.claude/skills> 根目录（本管理器存储）
-   * - global：<userData>/claude/skills（含 ~/.claude/skills 符号链接导入 + legacy .json）
-   * - plugin：插件运行时 <runtimePath>/skills（过滤条件与 skills-runtime.resolveSkillPaths 一致）
-   * - project/user：SDK 按会话 cwd 自动发现的目录（<cwd>/.pi/skills、祖先 .agents/skills、
-   *   getAgentDir()/skills、~/.agents/skills）——由 SDK packageManager 自行加载，
-   *   不经过 getSkillPaths，因此 path 为 undefined（仅名字占位，供菜单展示）。
+   * 全面安装制：仅枚举全局技能目录（<userData>/claude/skills 或用户配置路径）。
+   * 不预置内置技能、不自动发现任何其他目录（SDK 发现目录、~/.claude/skills、
+   * 插件 skills 一律不再扫描）。legacy .json 条目仅名字占位。
    *
    * frontmatter 解析统一走 SDK 的 loadSkillsFromDir（name 缺失时回退目录名、
    * description 必填、SKILL.md 目录不递归），保证菜单与展开的解析语义完全一致。
    *
-   * 名字去重（小写）：builtin 优先；其余先注册者优先——与原 getSkillPaths 语义一致。
+   * 名字去重（小写）：先注册者优先。
    * 解析失败/告警写入 lastLoadDiagnostics 供设置页展示。
    */
-  private async collectSkillCandidates(cwd?: string): Promise<SkillCandidate[]> {
+  private async collectSkillCandidates(_cwd?: string): Promise<SkillCandidate[]> {
     const diagnostics: SkillLoadDiagnostic[] = [];
     const byName = new Map<string, SkillCandidate>();
 
     const addCandidate = (candidate: SkillCandidate): void => {
       const key = candidate.name.toLowerCase();
-      const existing = byName.get(key);
-      if (existing && existing.origin === 'builtin') {
-        return; // builtin 已决定该名字
+      if (byName.has(key)) {
+        return; // 先注册者优先
       }
-      if (!existing || candidate.origin === 'builtin') {
-        byName.set(key, candidate);
-      }
+      byName.set(key, candidate);
     };
 
     /** 用 SDK 解析器枚举一个技能根目录，返回解析出的技能列表 */
@@ -831,31 +707,8 @@ export class SkillsManager implements SkillsAdapter {
       }
     };
 
-    // 1. 内置技能：以 SDK 解析为准（含 getSkillMetadata 会漏掉的宽松命名条目），
-    //    enabled 状态优先取内存中的 loadedSkills（反映本次运行内的开关操作）。
-    const builtinRoot = this.getBuiltinSkillsPath();
-    if (builtinRoot) {
-      for (const skill of enumerateDir(builtinRoot, 'builtin')) {
-        const dir = path.basename(skill.baseDir);
-        const id = `builtin-${dir}`;
-        const loaded = this.loadedSkills.get(id);
-        addCandidate({
-          id,
-          name: skill.name,
-          description: skill.description,
-          displayName: readMarketplaceDisplayName(skill.baseDir) ?? undefined,
-          origin: 'builtin',
-          path: skill.baseDir,
-          enabled:
-            loaded?.enabled ??
-            this.getPersistedEnabled(id, DEFAULT_ENABLED_BUILTIN_SKILLS.has(dir.toLowerCase())),
-          createdAt: loaded?.createdAt ?? Date.now(),
-        });
-      }
-    }
-
-    // 2. 全局技能：先走 loadGlobalSkills（符号链接导入 / 缓存 / legacy .json 注册），
-    //    再以 SDK 解析器枚举目录本身，enabled 取 loadedSkills 中的实时状态。
+    // 全局技能：先走 loadGlobalSkills（缓存 / legacy .json 注册），
+    // 再以 SDK 解析器枚举目录本身，enabled 取 loadedSkills 中的实时状态。
     const globalSkills = await this.loadGlobalSkills();
     const globalRoot = this.getGlobalSkillsPath();
     const seenGlobalIds = new Set<string>();
@@ -864,15 +717,16 @@ export class SkillsManager implements SkillsAdapter {
       const id = `global-${dir}`;
       seenGlobalIds.add(id);
       const loaded = this.loadedSkills.get(id);
+      const sidecar = readSkillSidecar(skill.baseDir);
       addCandidate({
         id,
         name: skill.name,
         description: skill.description,
-        displayName: readMarketplaceDisplayName(skill.baseDir) ?? undefined,
-        origin: 'global',
+        displayName: sidecar?.displayName ?? undefined,
         path: skill.baseDir,
         enabled: loaded?.enabled ?? this.getPersistedEnabled(id, true),
         createdAt: loaded?.createdAt ?? Date.now(),
+        sidecar,
       });
     }
     // legacy .json 条目（SDK 不识别）：仅名字占位，不进入 skillPaths
@@ -889,88 +743,14 @@ export class SkillsManager implements SkillsAdapter {
         name: skill.name,
         description: skill.description ?? '',
         displayName: skill.displayName,
-        origin: 'global',
         path: undefined,
         enabled: skill.enabled,
         createdAt: skill.createdAt,
       });
     }
 
-    // 3. 插件技能：过滤条件与 skills-runtime.resolveSkillPaths 保持一致
-    if (this.pluginProvider) {
-      try {
-        const plugins = await this.pluginProvider.getEnabledRuntimePlugins();
-        for (const plugin of plugins) {
-          if (!plugin.componentsEnabled.skills || (plugin.componentCounts.skills ?? 0) <= 0) {
-            continue;
-          }
-          const pluginSkillsDir = path.join(plugin.runtimePath, 'skills');
-          if (!fs.existsSync(pluginSkillsDir)) continue;
-          for (const skill of enumerateDir(pluginSkillsDir, `plugin:${plugin.name}`)) {
-            const id = `plugin-${plugin.name}-${skill.name}`;
-            addCandidate({
-              id,
-              name: skill.name,
-              description: skill.description,
-              displayName: readMarketplaceDisplayName(skill.baseDir) ?? undefined,
-              origin: 'plugin',
-              path: skill.baseDir,
-              enabled: this.getPersistedEnabled(id, true),
-              createdAt: Date.now(),
-            });
-          }
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        logWarn(`[Skills] Failed to enumerate plugin skills: ${reason}`);
-        diagnostics.push({ path: 'plugins', reason });
-      }
-    }
-
-    // 4. SDK 自动发现目录（project/user）：仅名字占位。
-    //    展开时由 SDK packageManager 按会话 cwd 自行加载（includeDefaults:false 时
-    //    resource-loader 将自动发现结果与 additionalSkillPaths 合并）。
-    const autoDirs: Array<{ dir: string; origin: 'project' | 'user' }> = [];
-    const userAgentsSkillsDir = path.join(process.env.HOME || os.homedir(), '.agents', 'skills');
-    if (cwd) {
-      // <cwd>/.pi/skills（CONFIG_DIR_NAME='.pi'，SDK 未导出该常量）
-      autoDirs.push({ dir: path.join(cwd, '.pi', 'skills'), origin: 'project' });
-      // 祖先 .agents/skills（向上直到 git 根或文件系统根，排除用户级目录）
-      // ——镜像 SDK collectAncestorAgentsSkillDirs/findGitRepoRoot
-      let dir = path.resolve(cwd);
-      const gitRoot = this.findGitRepoRoot(dir);
-      for (;;) {
-        const agentsDir = path.join(dir, '.agents', 'skills');
-        if (path.resolve(agentsDir) !== path.resolve(userAgentsSkillsDir)) {
-          autoDirs.push({ dir: agentsDir, origin: 'project' });
-        }
-        if (gitRoot && dir === gitRoot) break;
-        const parent = path.dirname(dir);
-        if (parent === dir) break;
-        dir = parent;
-      }
-    }
-    // getAgentDir()/skills（尊重 PI_CODING_AGENT_DIR）+ ~/.agents/skills
-    autoDirs.push({ dir: path.join(getAgentDir(), 'skills'), origin: 'user' });
-    autoDirs.push({ dir: userAgentsSkillsDir, origin: 'user' });
-
-    for (const { dir, origin } of autoDirs) {
-      if (!fs.existsSync(dir)) continue;
-      for (const skill of enumerateDir(dir, origin)) {
-        addCandidate({
-          id: `${origin}-${skill.name}`,
-          name: skill.name,
-          description: skill.description,
-          origin,
-          path: undefined,
-          enabled: true,
-          createdAt: Date.now(),
-        });
-      }
-    }
-
     this.lastLoadDiagnostics = diagnostics;
-    // 并入构造期/持久化加载路径记录的诊断（如 loadBuiltinSkills 的解析失败），并清空
+    // 并入构造期记录的诊断（如迁移过程），并清空
     if (this.pendingDiagnostics.length > 0) {
       this.lastLoadDiagnostics.push(...this.pendingDiagnostics);
       this.pendingDiagnostics = [];
@@ -978,39 +758,28 @@ export class SkillsManager implements SkillsAdapter {
     return Array.from(byName.values());
   }
 
-  /** 向上查找 git 仓库根（镜像 SDK findGitRepoRoot：检查 <dir>/.git 是否存在） */
-  private findGitRepoRoot(startDir: string): string | null {
-    let dir = path.resolve(startDir);
-    for (;;) {
-      if (fs.existsSync(path.join(dir, '.git'))) return dir;
-      const parent = path.dirname(dir);
-      if (parent === dir) return null;
-      dir = parent;
-    }
-  }
-
   /**
-   * 菜单数据源：返回全部可用技能（builtin + global + plugin + project/user），
+   * 菜单数据源：返回全部已安装技能（仅全局目录），
    * 与 /skill:<name> 展开时 SDK 实际可解析的技能集合保持一致。
-   * cwd 为会话工作目录时包含项目级/用户级自动发现技能。
    */
   async getAvailableSkills(cwd?: string): Promise<Skill[]> {
     const candidates = await this.collectSkillCandidates(cwd);
     return candidates.map((candidate) => {
+      const sidecar =
+        candidate.sidecar ?? (candidate.path ? readSkillSidecar(candidate.path) : null);
       const skill: Skill = {
         id: candidate.id,
         name: candidate.name,
         displayName: candidate.displayName,
         description: candidate.description,
-        type: candidate.origin === 'builtin' ? ('builtin' as const) : ('custom' as const),
+        type: 'custom',
         enabled: candidate.enabled,
         createdAt: candidate.createdAt,
+        version: sidecar?.version,
+        source: sidecar?.source ?? 'local',
+        installedAt: sidecar?.installedAt,
+        appId: sidecar?.appId,
       };
-      // 插件候选同步注册进 loadedSkills，使 setEnabled/uninstallSkill 能找到它
-      // （builtin/global 本就由 loadBuiltinSkills/loadGlobalSkills 注册）。
-      if (candidate.origin === 'plugin' && !this.loadedSkills.has(candidate.id)) {
-        this.loadedSkills.set(candidate.id, skill);
-      }
       return skill;
     });
   }
@@ -1027,13 +796,7 @@ export class SkillsManager implements SkillsAdapter {
    *
    * 与 getAvailableSkills 共享 collectSkillCandidates（单一真相源）：
    * 菜单里可见且启用的技能，展开时一定能被 SDK 加载。
-   * path 为 undefined 的候选（SDK 自动发现目录 / legacy .json）不进入
-   * skillPaths——前者由 SDK packageManager 自行加载，后者非 SKILL.md 形态。
-   *
-   * When the same skill name exists as both a builtin and a global entry
-   * (e.g. the app copies builtins into the global dir, or the user installed
-   * it before adding the builtin), the builtin entry takes precedence: its
-   * enabled state decides whether the skill is exposed at all.
+   * path 为 undefined 的候选（legacy .json 条目）不进入 skillPaths——非 SKILL.md 形态。
    */
   async getSkillPaths(): Promise<string[]> {
     const candidates = await this.collectSkillCandidates();
@@ -1100,9 +863,8 @@ export class SkillsManager implements SkillsAdapter {
   /**
    * Enable or disable a skill
    *
-   * 对不在 loadedSkills 中的 id（plugin-/project-/user- 前缀，来自
-   * getAvailableSkills 的插件/SDK 自动发现候选）也要持久化开关状态——
-   * collectSkillCandidates 枚举时通过 getPersistedEnabled 读回。
+   * 对不在 loadedSkills 中的 id（如 legacy user- 前缀条目）也要持久化
+   * 开关状态——collectSkillCandidates 枚举时通过 getPersistedEnabled 读回。
    */
   setSkillEnabled(skillId: string, enabled: boolean): void {
     const skill = this.loadedSkills.get(skillId);
@@ -1114,7 +876,7 @@ export class SkillsManager implements SkillsAdapter {
         this.stopMcpServer(skillId);
       }
 
-      // Persist toggle state so builtin/custom skills survive restarts.
+      // Persist toggle state so installed skills survive restarts.
       const stmt = this.db.prepare(`
         INSERT OR REPLACE INTO skills (id, name, description, type, enabled, config, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1131,7 +893,7 @@ export class SkillsManager implements SkillsAdapter {
       return;
     }
 
-    // 插件/项目/用户级候选：仅持久化开关（名字/描述留空，枚举时以磁盘为准）
+    // 不在 loadedSkills 的 id：仅持久化开关（名字/描述留空，枚举时以磁盘为准）
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO skills (id, name, description, type, enabled, config, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1167,15 +929,10 @@ export class SkillsManager implements SkillsAdapter {
   }
 
   /**
-   * Delete a skill
+   * Delete a skill (remove DB row + in-memory entry).
+   * 全面安装制：所有已安装技能均可删除，无内置守卫。
    */
   deleteSkill(skillId: string): void {
-    // Can't delete built-in skills
-    const skill = this.loadedSkills.get(skillId);
-    if (skill?.type === 'builtin') {
-      throw new Error('Cannot delete built-in skills');
-    }
-
     this.stopMcpServer(skillId);
     this.loadedSkills.delete(skillId);
 
@@ -1186,10 +943,7 @@ export class SkillsManager implements SkillsAdapter {
   /**
    * List all skills with optional filters
    */
-  async listSkills(filter?: {
-    type?: 'builtin' | 'mcp' | 'custom';
-    enabled?: boolean;
-  }): Promise<Skill[]> {
+  async listSkills(filter?: { type?: 'mcp' | 'custom'; enabled?: boolean }): Promise<Skill[]> {
     // Load global skills first to ensure they're in loadedSkills
     await this.loadGlobalSkills();
 
@@ -1396,8 +1150,15 @@ export class SkillsManager implements SkillsAdapter {
 
   /**
    * Install a skill from a directory
+   *
+   * options.sidecar：市场安装传入 `{appId, displayName, version, source:'marketplace'}`；
+   * 本地安装省略时写入 `{source:'local'}`。同名覆盖安装（更新）保留旧的 enabled 状态
+   * （loadGlobalSkills 经 getPersistedEnabled 从 DB 读回）。
    */
-  async installSkill(skillPath: string, options?: { enabled?: boolean }): Promise<Skill> {
+  async installSkill(
+    skillPath: string,
+    options?: { enabled?: boolean; sidecar?: Partial<SkillSidecar> }
+  ): Promise<Skill> {
     // Validate skill folder
     const validation = await this.validateSkillFolder(skillPath);
     if (!validation.valid) {
@@ -1446,6 +1207,10 @@ export class SkillsManager implements SkillsAdapter {
     // Copy skill to global directory
     await this.copySkillToGlobal(skillPath, metadata.name);
 
+    // 写入安装态 sidecar（市场安装携带 appId/version；本地安装记录来源与时间）。
+    // 注意：源目录若自带旧 sidecar，copyDirectory 已将其复制过来，这里覆盖写入。
+    writeSkillSidecar(targetPath, options?.sidecar ?? { source: 'local' });
+
     // Reload from global directory and return canonical global skill entry.
     this.invalidateGlobalSkillsCache();
     const globalSkills = await this.loadGlobalSkills();
@@ -1458,12 +1223,12 @@ export class SkillsManager implements SkillsAdapter {
     }
 
     // Save canonical skill entry (stable id: global-<folderName>).
-    // Callers (e.g. company marketplace installs) can request the skill to
-    // start disabled so the user explicitly opts in before it takes effect.
-    if (options?.enabled === false) {
-      installedSkill.enabled = false;
-      this.loadedSkills.set(installedSkill.id, installedSkill);
-    }
+    // 安装即启用（用户决策）：enabled 默认 true；调用方仅可显式关闭。
+    // 同名覆盖安装（更新）时保留此前的 enabled 状态——DB 行在覆盖前已存在，
+    // getPersistedEnabled 读回旧值；首次安装无 DB 行，按默认启用。
+    const previousEnabled = this.getPersistedEnabled(installedSkill.id, options?.enabled !== false);
+    installedSkill.enabled = previousEnabled;
+    this.loadedSkills.set(installedSkill.id, installedSkill);
     this.saveSkill(installedSkill);
 
     log(`Installed skill: ${installedSkill.name} (${installedSkill.id})`);
@@ -1589,7 +1354,8 @@ export class SkillsManager implements SkillsAdapter {
   }
 
   /**
-   * Uninstall a skill (delete from filesystem and database)
+   * Uninstall a skill (delete from filesystem and database).
+   * 全面安装制：所有已安装技能均可卸载，无内置守卫。
    */
   async uninstallSkill(skillId: string): Promise<void> {
     const skill = this.loadedSkills.get(skillId);
@@ -1598,13 +1364,7 @@ export class SkillsManager implements SkillsAdapter {
       throw new Error('Skill not found');
     }
 
-    // Can't delete built-in skills
-    if (skill.type === 'builtin') {
-      throw new Error('Cannot delete built-in skills');
-    }
-
-    // 插件技能随插件生命周期管理（插件设置页卸载/禁用），不支持单独删除——
-    // 否则会按名字误删全局目录中的同名技能。
+    // 防御性守卫：插件前缀 id 不属于全局目录管理范围，避免按名字误删同名技能
     if (skillId.startsWith('plugin-')) {
       throw new Error('Cannot delete plugin skills; manage them in plugin settings');
     }

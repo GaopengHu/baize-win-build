@@ -18,7 +18,6 @@ export interface SlashSkillMenuProps {
 }
 
 const TYPE_LABELS: Record<Skill['type'], string> = {
-  builtin: 'Built-in',
   mcp: 'MCP',
   custom: 'Custom',
 };

@@ -23,14 +23,15 @@ vi.mock('../../../src/main/utils/logger', () => ({
   logError: vi.fn(),
 }));
 
+const mockConfig = vi.hoisted(() => ({ globalSkillsPath: '' }));
+
 vi.mock('../../../src/main/config/config-store', () => ({
   configStore: {
-    get: vi.fn(() => ''),
+    get: vi.fn((key: string) => (key === 'globalSkillsPath' ? mockConfig.globalSkillsPath : '')),
   },
 }));
 
 import { SkillsRuntime } from '../../../src/main/claude/skills-runtime';
-import type { ServerEvent } from '../../../src/renderer/types';
 
 function makeSkillDir(root: string, name: string): string {
   const skillRoot = path.join(root, name);
@@ -39,15 +40,16 @@ function makeSkillDir(root: string, name: string): string {
   return skillRoot;
 }
 
-describe('SkillsRuntime (Phase 2, AGENT-RUNNER-REFACTOR-PLAN.md §3.7)', () => {
-  let builtinRoot: string;
-
+/**
+ * 全面安装制：SkillsRuntime 只准备目录并解析「全局技能目录启用项」路径。
+ * 不再播种内置技能、不再导入 ~/.claude/skills、不再合并插件 skills 目录。
+ */
+describe('SkillsRuntime (全面安装制)', () => {
   beforeEach(() => {
     testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skills-runtime-test-'));
     fs.mkdirSync(path.join(testRoot, 'userData'), { recursive: true });
     fs.mkdirSync(path.join(testRoot, 'home'), { recursive: true });
-    builtinRoot = path.join(testRoot, 'builtin-skills');
-    fs.mkdirSync(builtinRoot, { recursive: true });
+    mockConfig.globalSkillsPath = '';
   });
 
   afterEach(() => {
@@ -58,39 +60,30 @@ describe('SkillsRuntime (Phase 2, AGENT-RUNNER-REFACTOR-PLAN.md §3.7)', () => {
   });
 
   function createRuntime(overrides?: {
-    sendToRenderer?: (event: ServerEvent) => void;
     skillsAdapter?: { getSkillPaths: () => string[] | Promise<string[]> };
-    pluginRuntimeService?: unknown;
   }): SkillsRuntime {
-    const runtime = new SkillsRuntime({
-      sendToRenderer: overrides?.sendToRenderer ?? vi.fn(),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      pluginRuntimeService: overrides?.pluginRuntimeService as any,
+    return new SkillsRuntime({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       skillsAdapter: overrides?.skillsAdapter as any,
     });
-    // 固定 built-in 路径，隔离 __dirname/asar 探测逻辑（那部分依赖真实打包布局）
-    vi.spyOn(runtime, 'getBuiltinSkillsPath').mockReturnValue(builtinRoot);
-    return runtime;
   }
 
   describe('ensureSetup / invalidate', () => {
     it('runs setup only once until invalidated', () => {
-      makeSkillDir(builtinRoot, 'alpha');
       const runtime = createRuntime();
-      const spy = vi.spyOn(runtime, 'getBuiltinSkillsPath');
+      const spy = vi.spyOn(runtime, 'syncConfiguredSkillsToRuntimeDir');
 
       runtime.ensureSetup();
       runtime.ensureSetup();
       const callsAfterTwo = spy.mock.calls.length;
+      expect(callsAfterTwo).toBe(1);
 
       runtime.invalidate();
       runtime.ensureSetup();
       expect(spy.mock.calls.length).toBeGreaterThan(callsAfterTwo);
     });
 
-    it('creates app claude dirs and links built-in skills into runtime dir', () => {
-      makeSkillDir(builtinRoot, 'alpha');
+    it('creates app claude dirs without seeding any skill', () => {
       const runtime = createRuntime();
 
       runtime.ensureSetup();
@@ -99,81 +92,44 @@ describe('SkillsRuntime (Phase 2, AGENT-RUNNER-REFACTOR-PLAN.md §3.7)', () => {
       const appSkillsDir = path.join(appClaudeDir, 'skills');
       expect(fs.existsSync(appClaudeDir)).toBe(true);
       expect(fs.existsSync(appSkillsDir)).toBe(true);
-
-      const linked = path.join(appSkillsDir, 'alpha');
-      expect(fs.existsSync(linked)).toBe(true);
-      // 非 asar 源应为 symlink（空间效率），与迁移前行为一致
-      expect(fs.lstatSync(linked).isSymbolicLink()).toBe(true);
+      // 不预置任何技能：全新安装的运行时目录为空
+      expect(fs.readdirSync(appSkillsDir)).toEqual([]);
     });
 
-    it('does not overwrite an existing real directory skill', () => {
-      makeSkillDir(builtinRoot, 'alpha');
+    it('does not seed skills from the bundled resources dir', () => {
+      // 老版本会把捆绑技能 symlink 进运行时目录；全面安装制下不得发生
+      const bundled = path.join(testRoot, 'app', '.claude', 'skills');
+      makeSkillDir(bundled, 'alpha');
       const runtime = createRuntime();
+
+      runtime.ensureSetup();
+
       const appSkillsDir = path.join(testRoot, 'userData', 'claude', 'skills');
-      fs.mkdirSync(appSkillsDir, { recursive: true });
+      expect(fs.readdirSync(appSkillsDir)).toEqual([]);
+    });
+
+    it('does not import entries from ~/.claude/skills', () => {
+      const userSkills = path.join(testRoot, 'home', '.claude', 'skills');
+      makeSkillDir(userSkills, 'beta');
+      const runtime = createRuntime();
+
+      runtime.ensureSetup();
+
+      const appSkillsDir = path.join(testRoot, 'userData', 'claude', 'skills');
+      expect(fs.readdirSync(appSkillsDir)).toEqual([]);
+    });
+
+    it('preserves already-installed real directories', () => {
+      const appSkillsDir = path.join(testRoot, 'userData', 'claude', 'skills');
       const existing = path.join(appSkillsDir, 'alpha');
       fs.mkdirSync(existing, { recursive: true });
       fs.writeFileSync(path.join(existing, 'KEEP.md'), 'mine', 'utf8');
+      const runtime = createRuntime();
 
       runtime.ensureSetup();
 
       expect(fs.lstatSync(existing).isSymbolicLink()).toBe(false);
       expect(fs.existsSync(path.join(existing, 'KEEP.md'))).toBe(true);
-    });
-
-    it('removes broken asar symlinks left by previous versions', () => {
-      makeSkillDir(builtinRoot, 'alpha');
-      const runtime = createRuntime();
-      const appSkillsDir = path.join(testRoot, 'userData', 'claude', 'skills');
-      fs.mkdirSync(appSkillsDir, { recursive: true });
-      const stale = path.join(appSkillsDir, 'alpha');
-      fs.symlinkSync(path.join(testRoot, 'app.asar', '.claude', 'skills', 'alpha'), stale, 'dir');
-
-      runtime.ensureSetup();
-
-      // 旧 asar symlink 被清掉，替换为指向真实 builtin 目录的新链接
-      expect(fs.lstatSync(stale).isSymbolicLink()).toBe(true);
-      expect(fs.readlinkSync(stale)).toBe(path.join(builtinRoot, 'alpha'));
-    });
-  });
-
-  describe('syncUserSkillsToAppDir', () => {
-    it('imports user ~/.claude/skills entries as symlinks', () => {
-      const runtime = createRuntime();
-      const userSkills = path.join(testRoot, 'home', '.claude', 'skills');
-      makeSkillDir(userSkills, 'beta');
-      const appSkillsDir = path.join(testRoot, 'userData', 'claude', 'skills');
-      fs.mkdirSync(appSkillsDir, { recursive: true });
-
-      runtime.syncUserSkillsToAppDir(appSkillsDir);
-
-      const target = path.join(appSkillsDir, 'beta');
-      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
-      expect(fs.readlinkSync(target)).toBe(path.join(userSkills, 'beta'));
-    });
-
-    it('leaves existing real directories untouched', () => {
-      const runtime = createRuntime();
-      const userSkills = path.join(testRoot, 'home', '.claude', 'skills');
-      makeSkillDir(userSkills, 'beta');
-      const appSkillsDir = path.join(testRoot, 'userData', 'claude', 'skills');
-      const target = path.join(appSkillsDir, 'beta');
-      fs.mkdirSync(target, { recursive: true });
-      fs.writeFileSync(path.join(target, 'KEEP.md'), 'mine', 'utf8');
-
-      runtime.syncUserSkillsToAppDir(appSkillsDir);
-
-      expect(fs.lstatSync(target).isSymbolicLink()).toBe(false);
-      expect(fs.existsSync(path.join(target, 'KEEP.md'))).toBe(true);
-    });
-
-    it('is a no-op when the user skills dir does not exist', () => {
-      const runtime = createRuntime();
-      const appSkillsDir = path.join(testRoot, 'userData', 'claude', 'skills');
-      fs.mkdirSync(appSkillsDir, { recursive: true });
-
-      expect(() => runtime.syncUserSkillsToAppDir(appSkillsDir)).not.toThrow();
-      expect(fs.readdirSync(appSkillsDir)).toEqual([]);
     });
   });
 
@@ -190,89 +146,37 @@ describe('SkillsRuntime (Phase 2, AGENT-RUNNER-REFACTOR-PLAN.md §3.7)', () => {
       expect(paths).toEqual([realDir]);
     });
 
-    it('falls back to legacy builtin + configured global paths without an adapter', async () => {
-      makeSkillDir(builtinRoot, 'alpha');
+    it('falls back to the configured global dir without an adapter', async () => {
+      const configured = makeSkillDir(path.join(testRoot, 'configured-skills'), 'alpha');
+      mockConfig.globalSkillsPath = path.dirname(configured);
       const runtime = createRuntime();
-      runtime.ensureSetup();
 
       const paths = await runtime.resolveSkillPaths();
 
-      // legacy = builtin（存在）+ getConfiguredGlobalSkillsDir()（未配置 → runtime skills dir）
-      expect(paths).toContain(builtinRoot);
-      expect(paths).toContain(runtime.getRuntimeSkillsDir());
+      expect(paths).toEqual([path.dirname(configured)]);
     });
 
-    it('merges enabled runtime plugin skills and notifies the renderer', async () => {
+    it('never includes plugin runtime skills directories', async () => {
       const adapterDir = makeSkillDir(testRoot, 'adapter-skill');
       const pluginSkills = path.join(testRoot, 'plugin-runtime', 'skills');
       makeSkillDir(pluginSkills, 'plugin-skill');
-      const events: ServerEvent[] = [];
-      const runtime = createRuntime({
-        sendToRenderer: (event) => events.push(event),
-        skillsAdapter: { getSkillPaths: () => [adapterDir] },
-        pluginRuntimeService: {
-          getEnabledRuntimePlugins: async () => [
-            {
-              name: 'test-plugin',
-              runtimePath: path.join(testRoot, 'plugin-runtime'),
-              componentsEnabled: { skills: true },
-              componentCounts: { skills: 1 },
-            },
-          ],
-        },
-      });
-
-      const paths = await runtime.resolveSkillPaths('session-1');
-
-      expect(paths).toContain(adapterDir);
-      expect(paths).toContain(pluginSkills);
-      expect(events).toHaveLength(1);
-      expect(events[0].type).toBe('plugins.runtimeApplied');
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const payload = (events[0] as any).payload;
-      expect(payload.sessionId).toBe('session-1');
-      expect(payload.plugins).toEqual([{ name: 'test-plugin', path: pluginSkills }]);
-    });
-
-    it('skips plugins without skills and survives plugin service errors', async () => {
-      const adapterDir = makeSkillDir(testRoot, 'adapter-skill');
       const runtime = createRuntime({
         skillsAdapter: { getSkillPaths: () => [adapterDir] },
-        pluginRuntimeService: {
-          getEnabledRuntimePlugins: async () => {
-            throw new Error('boom');
-          },
-        },
       });
 
       const paths = await runtime.resolveSkillPaths('session-1');
 
       expect(paths).toEqual([adapterDir]);
+      expect(paths).not.toContain(pluginSkills);
     });
 
-    it('does not emit runtimeApplied without a sessionId', async () => {
-      const pluginSkills = path.join(testRoot, 'plugin-runtime', 'skills');
-      makeSkillDir(pluginSkills, 'plugin-skill');
-      const events: ServerEvent[] = [];
+    it('deduplicates repeated adapter paths', async () => {
+      const realDir = makeSkillDir(testRoot, 'adapter-skill');
       const runtime = createRuntime({
-        sendToRenderer: (event) => events.push(event),
-        skillsAdapter: { getSkillPaths: () => [] },
-        pluginRuntimeService: {
-          getEnabledRuntimePlugins: async () => [
-            {
-              name: 'test-plugin',
-              runtimePath: path.join(testRoot, 'plugin-runtime'),
-              componentsEnabled: { skills: true },
-              componentCounts: { skills: 1 },
-            },
-          ],
-        },
+        skillsAdapter: { getSkillPaths: () => [realDir, realDir] },
       });
 
-      const paths = await runtime.resolveSkillPaths();
-
-      expect(paths).toContain(pluginSkills);
-      expect(events).toHaveLength(0);
+      expect(await runtime.resolveSkillPaths()).toEqual([realDir]);
     });
   });
 

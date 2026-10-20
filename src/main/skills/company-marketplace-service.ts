@@ -121,6 +121,7 @@ export class CompanyMarketplaceService {
     // `/api/apps` returns the same apps without packages, so it can only serve
     // as a fallback (its results are then not installable).
     const candidates = [`${this.baseUrl}/api/apps/public?${query}`, `${this.baseUrl}/api/apps?${query}`];
+    console.log('[Marketplace] candidates:', JSON.stringify(candidates));
     let firstError: unknown = null;
 
     for (const url of candidates) {
@@ -139,6 +140,7 @@ export class CompanyMarketplaceService {
           // client-side guard so non-skill apps never leak into the UI.
           .filter((app) => !category || app.category.toLowerCase() === category.toLowerCase());
         if (apps.length > 0 || url === candidates[candidates.length - 1]) {
+          console.log('[Marketplace] returning apps:', JSON.stringify(apps));
           return apps;
         }
       } catch (error) {
